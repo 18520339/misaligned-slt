@@ -1,0 +1,29 @@
+# BACA (Boundary-Aware Context Adapter) Configuration
+
+# Context Encoder (Sub-module 2a)
+context_encoder:
+  hidden_dim: 256           # Projection output dimension
+  freeze_text_encoder: true # Reuse base model's text encoder (frozen)
+  pooling: mean             # Mean pooling over text encoder outputs
+
+# Visual Adapter (Sub-module 2b) - Gated Cross-Attention
+visual_adapter:
+  num_heads: 4
+  hidden_dim: 256
+  dropout: 0.1
+  gate_init: 0.0            # CRITICAL: alpha initialized to 0 (identity at start)
+
+# Boundary Embedding (Sub-module 2c)
+boundary_embedding:
+  embed_dim: 256             # Must match visual feature dimension
+  num_types: 4               # clean_start, truncated_start, clean_end, truncated_end
+
+# Training
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 5
+  total_epochs: 50
+  scheduler: cosine          # Cosine annealing with warmup
+  clean_ratio: 0.5           # Fraction of training that uses clean (no misalignment)
+  no_context_token: "[NO_CONTEXT]"

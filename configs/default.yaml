@@ -1,0 +1,27 @@
+# Misalignment Simulation Defaults
+misalignment:
+  max_ratio: 0.25          # Maximum offset as fraction of sentence duration T
+  max_frames: 50           # Absolute maximum offset in frames (~2s at 25fps)
+  severity_levels:         # Severity ratios for evaluation mode
+    - 0.05
+    - 0.10
+    - 0.15
+    - 0.20
+    - 0.25
+
+# Training Augmentation
+training:
+  p_aug: 0.5               # Probability of applying misalignment augmentation per sample
+  noisy_context_prob: 0.2   # Probability of injecting noise into context Y_{n-1}
+  noisy_context_drop_rate: 0.15  # Word drop rate for noisy context
+
+# Reproducibility
+seed: 42
+
+# Evaluation
+evaluation:
+  batch_size: 16
+  num_workers: 4
+  failure_analysis:
+    undergen_ratio: 0.5     # Under-generation threshold: output < 50% of ref length
+    bleu_acceptable: 0.15   # BLEU-4 threshold for "acceptable" classification

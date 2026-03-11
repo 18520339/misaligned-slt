@@ -1,0 +1,45 @@
+# PHOENIX14T Dataset Configuration
+dataset:
+  name: phoenix14t
+  root: data/phoenix14t                     # Root directory for PHOENIX14T data
+  frame_dir_pattern: "features/fullFrame-210x260px/{split}/{sample_id}"
+  frame_filename_pattern: "images{frame_num:04d}.png"
+  annotation_dir: "annotations"
+  annotation_file: "PHOENIX-2014-T.{split}.corpus.csv"
+  
+  # Splits
+  splits:
+    train: train
+    dev: dev
+    test: test
+
+  # Frame properties
+  frame:
+    height: 260
+    width: 210
+    fps: 25
+    channels: 3
+
+  # Counts (approximate, for reference)
+  counts:
+    train: 7096
+    dev: 519
+    test: 642
+    total: 8257
+
+# Text Processing (German)
+text:
+  language: de_DE
+  lowercase: true
+  # PHOENIX14T convention: lowercase everything for evaluation
+  # Tokenization follows sacrebleu default (13a tokenizer)
+  tokenizer: 13a
+
+# Evaluation conventions
+evaluation:
+  lowercase: true
+  # sacrebleu settings matching PHOENIX14T conventions
+  sacrebleu:
+    tokenize: 13a
+    smooth_method: exp
+    smooth_value: null
