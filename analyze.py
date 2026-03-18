@@ -15,16 +15,13 @@ Usage:
 
 import json
 import os
-import re
 import argparse
 import random
 import csv
 import numpy as np
-import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import seaborn as sns
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
