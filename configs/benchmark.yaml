@@ -8,25 +8,6 @@ mska:
   # Full SLT checkpoint (download from MSKA Google Drive)
   checkpoint: MSKA/pretrained_models/Phoenix-2014T_SLT/best.pth
 
-# Dataset (paths relative to MSKA/ directory, as MSKA config expects)
-data:
-  test_path: data/Phoenix-2014T/Phoenix-2014T.test
-  dataset_name: Phoenix-2014T
-
-# Benchmark parameters
-benchmark:
-  severity_levels: [10, 20, 30, 40, 50]
-  conditions:
-    - clean
-    - head_trunc
-    - tail_trunc
-    - head_contam
-    - tail_contam
-    - head_trunc_tail_trunc
-    - head_trunc_tail_contam
-    - head_contam_tail_trunc
-    - head_contam_tail_contam
-
 # Inference settings
 inference:
   batch_size: 8
