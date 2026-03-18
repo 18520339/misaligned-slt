@@ -69,7 +69,7 @@ def bleu4_matrix(metrics):
 
 def find_knee(x, y):
     """Detect knee point using the Kneedle algorithm (if kneed is installed)
-    or fall back to maximum-second-derivative heuristic."""
+    or fall back to a maximum-absolute-first-derivative (steepest-drop) heuristic."""
     try:
         from kneed import KneeLocator
         kl = KneeLocator(x, y, curve='convex', direction='decreasing',
