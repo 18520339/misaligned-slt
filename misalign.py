@@ -72,8 +72,17 @@ def apply_misalignment(keypoint, prev_keypoint, next_keypoint,
     max_trunc = T - min_frames
     if total_trunc > max_trunc and total_trunc > 0:
         scale = max_trunc / total_trunc
-        head_trunc = round(head_trunc * scale)
-        tail_trunc = round(tail_trunc * scale)
+        # int() floors toward zero — avoids round() overshooting past min_frames
+        head_trunc = int(head_trunc * scale)
+        tail_trunc = int(tail_trunc * scale)
+        # Final guard: rounding could still leave < min_frames in edge cases
+        while T - head_trunc - tail_trunc < min_frames:
+            if head_trunc >= tail_trunc and head_trunc > 0:
+                head_trunc -= 1
+            elif tail_trunc > 0:
+                tail_trunc -= 1
+            else:
+                break
 
     # --- apply truncation -------------------------------------------------
     start = head_trunc
@@ -107,6 +116,12 @@ def apply_misalignment(keypoint, prev_keypoint, next_keypoint,
         else:
             suffix = torch.zeros(C, tail_contam, V, device=device, dtype=dtype)
         result = torch.cat([result, suffix], dim=1)
+
+    # --- safety: MSKA needs length >= 4 (two stride-2 conv layers) --------
+    if result.shape[1] < 4:
+        pad_n = 4 - result.shape[1]
+        last = result[:, -1:, :].expand(C, pad_n, V)
+        result = torch.cat([result, last], dim=1)
 
     return result
 

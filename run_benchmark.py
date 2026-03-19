@@ -290,29 +290,28 @@ def check_sample_ordering(dataset):
 
 
 def print_summary(all_results):
-    """Print a compact summary table after the full run."""
+    """Print a compact summary table using pandas."""
+    import pandas as pd
+
     clean = all_results['metrics']['clean']['bleu4']
-    print(f"\n{'='*72}")
-    print(f"  Clean baseline BLEU-4: {clean:.2f}")
-    print(f"{'='*72}")
-    hdr = f"{'Condition':<32}"
-    for s in SEVERITY_LEVELS:
-        hdr += f"  {s:>3}%"
-    print(hdr)
-    print("-" * 72)
+    rows = []
     for cond in CONDITION_TYPES:
         if cond == 'clean':
             continue
-        row = f"{cond:<32}"
         scores = all_results['metrics'].get(cond, {})
+        row = {'condition': cond}
         for s in SEVERITY_LEVELS:
             b = scores.get(str(s), {}).get('bleu4')
             if b is not None:
                 drop = (clean - b) / clean * 100 if clean > 0 else 0
-                row += f"  {b:5.1f}"
+                row[f'{s}%'] = f"{b:.1f} ({drop:+.0f}%)"
             else:
-                row += f"  {'N/A':>5}"
-        print(row)
+                row[f'{s}%'] = 'N/A'
+        rows.append(row)
+
+    df = pd.DataFrame(rows).set_index('condition')
+    print(f"\nClean baseline BLEU-4: {clean:.2f}")
+    print(df.to_string())
 
 
 # ===================================================================
