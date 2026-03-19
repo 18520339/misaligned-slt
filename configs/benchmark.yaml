@@ -3,16 +3,16 @@
 
 # MSKA model settings
 mska:
-  # Path to MSKA's own config for Phoenix-2014T SLT
-  config: MSKA/configs/phoenix-2014t_s2t.yaml
-  # Full SLT checkpoint (download from MSKA Google Drive)
-  checkpoint: MSKA/pretrained_models/Phoenix-2014T_SLT/best.pth
+    # Path to MSKA's own config for Phoenix-2014T SLT
+    config: MSKA/configs/phoenix-2014t_s2t.yaml
+    # Full SLT checkpoint (download from MSKA Google Drive)
+    checkpoint: MSKA/pretrained_models/phoenix-2014T_slt.pth
 
 # Inference settings
 inference:
-  batch_size: 8
-  num_workers: 4
-  device: cuda
+    batch_size: 8
+    num_workers: 4
+    device: cuda
 
 # Output directory
 results_dir: results
