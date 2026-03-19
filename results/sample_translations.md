@@ -86,7 +86,7 @@ Showing random samples for each misalignment type at **20% severity**.
 |---|---|
 | **Reference** | milder bleibt es unter den regenwolken im osten mit fünfzehn sechzehn grad . |
 | **Clean output** | und der regen hier an der ostsee naja da ist es nochmal mild mit fünfzehn bis sechzehn grad . |
-| **Misaligned output** | es bringt noch regen und etwas mildere luft im osten so um die fünfzehn grad . |
+| **Misaligned output** | und wir haben noch regen im osten und im süden da bleibt es am längsten mild mit fünfzehn bis fünfzehn grad . |
 | **Failure type** | acceptable |
 
 ### Sample: `test/29March_2010_Monday_tagesschau-8387`
@@ -116,7 +116,7 @@ Showing random samples for each misalignment type at **20% severity**.
 |---|---|
 | **Reference** | auch am samstag regnet oder schneit es verbreitet später wird es im westen und norden freundlicher . |
 | **Clean output** | auch am samstag regnet oder schneit es verbreitet später wird es im westen und norden freundlicher . |
-| **Misaligned output** | bis zu zwanzig grad auch am samstag regen schnee später wird es im westen freundlicher . |
+| **Misaligned output** | bis zu zwanzig grad auch am samstag regnet oder schneit es zeitweise später wird es im westen und norden freundlicher . |
 | **Failure type** | acceptable |
 
 ### Sample: `test/01October_2009_Thursday_tagesschau-421`
@@ -364,7 +364,7 @@ Showing random samples for each misalignment type at **20% severity**.
 | | Text |
 |---|---|
 | **Reference** | auch noch verhältnismäßig kühl aber dann sieht es schon nach ein paar sonnigeren und auch deutlich wärmeren tagen aus . |
-| **Clean output** | und es wird auch ziemlich kühl aber dann kann sich zumindest in den nächsten tagen besser die sonne zeigen und es wird auch wieder wärmer . |
+| **Clean output** | und es wird auch entsprechend kühl aber dann kann sich zumindest in den nächsten tagen erstmal besser die sonne zeigen und es wird auch wieder wärmer . |
 | **Misaligned output** | die nächsten tage werden auch ziemlich kühl aber dann kann sich die sonne zumindest in den nächsten tagen langsam wieder etwas häufiger zeigen und die wärme kommt auch nach deutschland . |
 | **Failure type** | acceptable |
 

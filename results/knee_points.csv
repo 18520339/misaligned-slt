@@ -1,9 +1,9 @@
 misalignment_type,knee_severity,bleu_at_knee,bleu_at_clean,relative_drop_pct
-head_trunc,20,21.51,29.06,26.0
-head_contam,20,21.94,29.06,24.5
-head_trunc_tail_trunc,20,16.83,29.06,42.1
-head_trunc_tail_contam,20,17.51,29.06,39.7
-head_contam_tail_trunc,20,19.28,29.06,33.7
-head_contam_tail_contam,20,17.94,29.06,38.3
-tail_trunc,30,20.58,29.06,29.2
-tail_contam,30,19.96,29.06,31.3
+head_trunc,20,21.5,28.87,25.5
+head_contam,20,22.19,28.87,23.1
+head_trunc_tail_trunc,20,16.67,28.87,42.3
+head_trunc_tail_contam,20,17.55,28.87,39.2
+head_contam_tail_trunc,20,19.17,28.87,33.6
+head_contam_tail_contam,20,18.02,28.87,37.6
+tail_trunc,30,20.73,28.87,28.2
+tail_contam,40,17.03,28.87,41.0

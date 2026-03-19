@@ -1,0 +1,9 @@
+condition,slope,r_squared,rank
+head_trunc_tail_trunc,-0.5768,0.9856,1
+head_trunc_tail_contam,-0.4485,0.9857,2
+head_contam_tail_trunc,-0.3919,0.99,3
+head_contam_tail_contam,-0.3394,0.966,4
+head_trunc,-0.3267,0.9898,5
+tail_trunc,-0.3103,0.9959,6
+tail_contam,-0.2679,0.9891,7
+head_contam,-0.236,0.9641,8
