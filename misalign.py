@@ -59,7 +59,7 @@ def apply_misalignment(keypoint, prev_keypoint, next_keypoint,
 
     # Minimum frames to keep after truncation (10 % of T, at least 4 for the
     # model's stride-2 convolutions which need length divisible by 4).
-    min_frames = max(4, round(0.1 * T))
+    min_frames = min(T, max(4, round(0.1 * T)))
 
     # --- compute absolute frame counts (based on *original* T) -----------
     head_trunc  = round(delta_s_pct * T) if delta_s_pct > 0 else 0
