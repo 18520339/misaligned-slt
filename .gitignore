@@ -1,0 +1,13 @@
+.ignore/
+youtube-sl-25/
+PHOENIX-2014-*/
+*.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.pth
+*.pt
+*.bin
+*.ckpt
