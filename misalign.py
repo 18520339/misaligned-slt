@@ -75,7 +75,7 @@ def apply_misalignment(keypoint, prev_keypoint, next_keypoint,
         # int() floors toward zero — avoids round() overshooting past min_frames
         head_trunc = int(head_trunc * scale)
         tail_trunc = int(tail_trunc * scale)
-        # Final guard: rounding could still leave < min_frames in edge cases
+        # Final guard: scaling/truncation could still leave < min_frames for very short T
         while T - head_trunc - tail_trunc < min_frames:
             if head_trunc >= tail_trunc and head_trunc > 0:
                 head_trunc -= 1
