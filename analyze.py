@@ -332,7 +332,7 @@ def plot_degradation_curves(metrics, clean_bleu, out_dir):
     
     ax.set_xticks(x)
     ax.set_xticklabels([f'{v}%' for v in x])
-    ax.legend(fontsize=8, loc='lower left', ncol=2)
+    ax.legend(fontsize=10, loc='lower left', ncol=2)
     ax.grid(True, alpha=0.3)
     
     fig.tight_layout()
@@ -610,7 +610,7 @@ def plot_length_vs_drop(data, out_dir):
     # Deduplicate legend entries by label
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), fontsize=8, loc='upper right')
+    ax.legend(by_label.values(), by_label.keys(), fontsize=10, loc='upper right')
     ax.grid(True, alpha=0.3)
     
     fig.tight_layout()
@@ -754,7 +754,7 @@ def plot_radar_chart(metrics, out_dir):
         ax.fill(angles, vals, alpha=0.1, color=colors_radar[mi])
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([PRETTY[c] for c in MISALIGN_ORDER], fontsize=8)
+    ax.set_xticklabels([PRETTY[c] for c in MISALIGN_ORDER], fontsize=10)
     ax.set_ylim(0, 1)
     ax.set_yticks([0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(['0.25', '0.50', '0.75', '1.00'], fontsize=7)
@@ -1170,7 +1170,7 @@ def compute_sensitivity_ranking(metrics, out_dir):
 # OUTPUT 14: Failure Distribution — Small Multiples
 def plot_failure_distribution(data, out_dir):
     translations = data.get('translations', {})
-    fig, axes = plt.subplots(2, 4, figsize=(20, 20))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 15))
     axes = axes.flatten()
     any_data = False
 
@@ -1264,12 +1264,12 @@ def plot_compound_severity_grid(metrics, clean_bleu, out_dir):
                 if np.isnan(v): annot[r, c] = ''
                 else:
                     drop = (clean_bleu - v) / clean_bleu * 100 if clean_bleu > 0 else 0
-                    annot[r, c] = f'{v:.1f}\n({drop:+.0f}%)'
+                    annot[r, c] = f'{v:.1f}\n(-{drop:.0f}%)'
 
         sns.heatmap(
             mat, annot=annot, fmt='', cmap=cmap, 
             xticklabels=sev_labels, yticklabels=sev_labels,
-            vmin=vmin, vmax=vmax, annot_kws={'fontsize': 8},
+            vmin=vmin, vmax=vmax, annot_kws={'fontsize': 10},
             linewidths=0.5, ax=ax, cbar_kws={'label': 'BLEU-4'},
         )
         for d in range(len(SEVERITY_LEVELS)): # Black border on diagonal cells (symmetric h == t)
@@ -1410,9 +1410,9 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
         ax.fill_between([lo, hi], [lo, hi], hi, alpha=0.06, color='red')
         ax.fill_between([lo, hi], lo, [lo, hi], alpha=0.06, color='blue')
         ax.text(0.97, 0.03, 'Subadditive', transform=ax.transAxes, ha='right',
-                va='bottom', fontsize=8, color='#1565C0', style='italic')
+                va='bottom', fontsize=10, color='#1565C0', style='italic')
         ax.text(0.03, 0.97, 'Superadditive', transform=ax.transAxes, ha='left',
-                va='top', fontsize=8, color='#C62828', style='italic')
+                va='top', fontsize=10, color='#C62828', style='italic')
 
         preds = np.array([p for p, a, _ in additivity_pts])
         actuals = np.array([a for p, a, _ in additivity_pts])
@@ -1454,7 +1454,7 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
                      else 'Symmetric')
         ax.text(0.03, 0.97,
                 f'{direction}\n({n_above} above / {n_below} below y = x)',
-                transform=ax.transAxes, fontsize=8, va='top',
+                transform=ax.transAxes, fontsize=10, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85))
 
         handles, labels_leg = ax.get_legend_handles_labels()
@@ -1506,7 +1506,7 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
         dir_label = ('HC + TT less harmful' if n_a > n_b
                      else 'HT + TC less harmful' if n_b > n_a
                      else 'Equivalent')
-        ax.text(0.03, 0.97, dir_label, transform=ax.transAxes, fontsize=8, va='top',
+        ax.text(0.03, 0.97, dir_label, transform=ax.transAxes, fontsize=10, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85))
     else:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center',
