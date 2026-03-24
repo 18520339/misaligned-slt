@@ -8,17 +8,14 @@ Reads results/benchmark_results.json and generates:
   5.  Violin/box plots                 (violin_plots.png)
   6.  Length vs BLEU drop scatter      (length_vs_drop.png)
   7.  Multi-metric heatmap grid        (multi_metric_heatmap.png)
-  8.  Radar/spider chart                (radar_chart.png)
-  9.  Failure transition matrix         (failure_transitions.csv + failure_transitions.png)
-  10. Statistical significance tests   (significance_tests.csv)
-  11. Truncation vs contamination      (trunc_vs_contam.png)
-  12. Sample robustness analysis       (sample_robustness.csv + sample_robustness.png)
-  13. Sensitivity ranking              (sensitivity_ranking.csv)
-  14. Failure distribution (detailed)  (failure_distribution.png)
-  15. Compound severity grid           (compound_severity_grid.png)
-  16. Compound interaction analysis    (compound_interaction.png + compound_analysis.csv)
+  8.  Failure transition matrix         (failure_transitions.csv + failure_transitions.png)
+  9.  Truncation vs contamination      (trunc_vs_contam.png)
+  10. Sample robustness analysis       (sample_robustness.csv + sample_robustness.png)
+  11. Sensitivity ranking              (sensitivity_ranking.csv)
+  12. Failure distribution (detailed)  (failure_distribution.png)
+  13. Compound severity grid           (compound_severity_grid.png)
+  14. Compound interaction analysis    (compound_interaction.png + compound_analysis.csv)
 
-  
 Compound conditions (4 types × 5×5 = 100 entries) are represented throughout using
 a max-severity aggregation: at severity level s, all (head_sev, tail_sev) pairs
 where max(head_sev, tail_sev) == s are pooled and averaged.  This covers the full
@@ -87,16 +84,50 @@ CAT_MAP.update({c: 'Mixed' for c in MIXED})
 COND_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', '*']
 
 
-def compound_2d_matrix(metrics, cond_name, metric_name='bleu4'):
-    # Return (5×5) numpy array indexed by [head_sev_idx, tail_sev_idx]
-    mat = np.full((len(SEVERITY_LEVELS), len(SEVERITY_LEVELS)), np.nan)
-    cond_data = metrics.get(cond_name, {})
-    for ri, head_sev in enumerate(SEVERITY_LEVELS):
-        for ci, tail_sev in enumerate(SEVERITY_LEVELS):
-            val = cond_data.get(f'h{head_sev}_t{tail_sev}', {}).get(metric_name)
-            if val is not None: mat[ri, ci] = val
-    return mat
+def has_per_sample_scores(data): # Check if per-sample sent_bleu data is available in translations
+    translations = data.get('translations', {})
+    clean_samples = translations.get('clean', [])
+    if not clean_samples: return False
+    # Check if at least one sample has sent_bleu
+    return any(s.get('sent_bleu') is not None for s in clean_samples)
 
+
+def get_per_sample_scores(translations, key, score_field='sent_bleu'):
+    # Extract per-sample scores as a dict {name: score} for a given translation key
+    samples = translations.get(key, [])
+    result = {}
+    for s in samples:
+        val = s.get(score_field)
+        if val is not None: result[s['name']] = val
+    return result
+
+def get_per_sample_scores_compound(translations, cond, sev, score_field='sent_bleu'):
+    '''Per-sample mean score for compound *cond* across all (h,t) with max(h,t)==sev.
+
+    When a sample appears in multiple (h,t) compound variants, its scores are
+    averaged — giving one value per sample for paired statistical tests.
+    '''
+    pooled = {}  # {name: [scores]}
+    for head_sev in SEVERITY_LEVELS:
+        for tail_sev in SEVERITY_LEVELS:
+            if max(head_sev, tail_sev) == sev:
+                for s in translations.get(f'{cond}_h{head_sev}_t{tail_sev}', []):
+                    val = s.get(score_field)
+                    if val is not None: pooled.setdefault(s['name'], []).append(val)
+    return {name: float(np.mean(vals)) for name, vals in pooled.items()}
+
+
+def _compound_agg_samples(translations, cond, sev):
+    '''Pool translation samples for compound "cond" where max(head_sev,tail_sev)==sev.
+
+    Returns a flat list of sample dicts from all (h,t) pairs with max(h,t)==sev.
+    '''
+    samples = []
+    for head_sev in SEVERITY_LEVELS:
+        for tail_sev in SEVERITY_LEVELS:
+            if max(head_sev, tail_sev) == sev:
+                samples.extend(translations.get(f'{cond}_h{head_sev}_t{tail_sev}', []))
+    return samples
 
 def _compound_agg_metric(metrics, cond, metric_name, sev):
     '''Mean of metric_name for compound "cond" across all (h,t) with max(h,t)==sev.
@@ -113,18 +144,58 @@ def _compound_agg_metric(metrics, cond, metric_name, sev):
                 if val is not None: vals.append(val)
     return float(np.mean(vals)) if vals else None
 
+def compound_2d_matrix(metrics, cond_name, metric_name='bleu4'):
+    # Return (5×5) numpy array indexed by [head_sev_idx, tail_sev_idx]
+    mat = np.full((len(SEVERITY_LEVELS), len(SEVERITY_LEVELS)), np.nan)
+    cond_data = metrics.get(cond_name, {})
+    for ri, head_sev in enumerate(SEVERITY_LEVELS):
+        for ci, tail_sev in enumerate(SEVERITY_LEVELS):
+            val = cond_data.get(f'h{head_sev}_t{tail_sev}', {}).get(metric_name)
+            if val is not None: mat[ri, ci] = val
+    return mat
 
-def _compound_agg_samples(translations, cond, sev):
-    '''Pool translation samples for compound "cond" where max(head_sev,tail_sev)==sev.
 
-    Returns a flat list of sample dicts from all (h,t) pairs with max(h,t)==sev.
-    '''
-    samples = []
-    for head_sev in SEVERITY_LEVELS:
-        for tail_sev in SEVERITY_LEVELS:
-            if max(head_sev, tail_sev) == sev:
-                samples.extend(translations.get(f'{cond}_h{head_sev}_t{tail_sev}', []))
-    return samples
+def _get_metric(metrics, cond, sev, metric_name='bleu4'):
+    if cond in COMPOUND_CONDITIONS:
+        return _compound_agg_metric(metrics, cond, metric_name, sev)
+    return metrics.get(cond, {}).get(str(sev), {}).get(metric_name)
+
+def _get_samples(translations, cond, sev):
+    if cond in COMPOUND_CONDITIONS:
+        return _compound_agg_samples(translations, cond, sev)
+    return translations.get(f'{cond}_{sev}', [])
+
+def _get_per_sample_scores(translations, cond, sev, score_field='sent_bleu'):
+    if cond in COMPOUND_CONDITIONS:
+        return get_per_sample_scores_compound(translations, cond, sev, score_field)
+    return get_per_sample_scores(translations, f'{cond}_{sev}', score_field)
+
+
+def _save_fig(fig, path, dpi=200, bbox_inches='tight'):
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+def _save_df(df, out_dir, filename):
+    path = os.path.join(out_dir, filename)
+    df.to_csv(path, index=False)
+    print(f'  Saved {path}')
+    
+def _save_compound_csv(csv_rows, out_dir): # Write compound_analysis.csv if there are rows to write
+    if not csv_rows: return
+    df = pd.DataFrame(csv_rows)
+    path = os.path.join(out_dir, 'compound_analysis.csv')
+    df.to_csv(path, index=False)
+    print(f'  Saved {path}')
+
+def _no_data(ax, msg='No data'):
+    ax.text(0.5, 0.5, msg, ha='center', va='center', transform=ax.transAxes, fontsize=12, color='grey')
+
+def _dedup_legend(ax, **kwargs):
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), **kwargs)
 
 
 def metric_matrix(metrics, metric_name):
@@ -158,10 +229,10 @@ def find_knee(x, y):
         if kl.knee is not None:
             idx = list(x).index(kl.knee)
             return kl.knee, y[idx]
-    except Exception: 
+    except Exception:
         print('  [KneeLocator failed, falling back to steepest drop heuristic]')
         pass
-    
+
     # Fallback: steepest drop (max absolute first derivative).
     # More robust than second-derivative for monotonic or flat curves.
     if len(y) < 2: return x[0], y[0]
@@ -171,47 +242,21 @@ def find_knee(x, y):
     return x[idx + 1], y[idx + 1]
 
 
-def sentence_bleu_approx(ref, hyp): # Very simple unigram-precision proxy for sentence-level quality
-    ref_toks = ref.lower().split()
-    hyp_toks = hyp.lower().split()
-    if not hyp_toks: return 0.0
-    matches = sum(1 for t in hyp_toks if t in ref_toks)
-    return matches / len(hyp_toks)
-
-
 def classify_failure(ref, hyp): # Classify a single (ref, hyp) pair into a failure type
-    ref_toks = ref.split()
-    hyp_toks = hyp.split()
-    ref_len = len(ref_toks)
-    hyp_len = len(hyp_toks)
-
-    # Check for repeated tokens (3+ consecutive same word, case-insensitive)
-    hyp_lower = [t.lower() for t in hyp_toks]
-    for i in range(len(hyp_lower) - 2):
-        if hyp_lower[i] == hyp_lower[i+1] == hyp_lower[i+2]:
+    ref_toks, hyp_toks = ref.lower().split(), hyp.lower().split()
+    ref_len, hyp_len = len(ref_toks), len(hyp_toks)
+    
+    for i in range(len(hyp_toks) - 2): # Check for repeated tokens (3+ consecutive same word, case-insensitive)
+        if hyp_toks[i] == hyp_toks[i+1] == hyp_toks[i+2]:
             return 'incoherent'
-
-    # Under-generation: hyp < 50% of ref length
+    
     if ref_len > 0 and hyp_len < 0.5 * ref_len:
-        return 'under-generation'
+        return 'under-generation' # Under-generation: hyp < 50% of ref length
 
-    # Hallucination: normal/long length but very low overlap
-    overlap = sentence_bleu_approx(ref, hyp)
+    overlap = sum(1 for t in hyp_toks if t in ref_toks) / len(hyp_toks) if hyp_toks else 0
     if hyp_len >= 0.5 * ref_len and overlap < 0.2:
-        return 'hallucination'
+        return 'hallucination' # Hallucination: normal/long length but very low overlap
     return 'acceptable'
-
-
-def _count_failures(samples):
-    '''Count failure types for a list of sample dicts with 'ref' and 'hyp' keys.
-
-    Returns:
-        dict mapping each failure type in FAILURE_TYPES to its count.
-    '''
-    dist = {ft: 0 for ft in FAILURE_TYPES}
-    for s in samples:
-        dist[classify_failure(s['ref'], s['hyp'])] += 1
-    return dist
 
 
 def _add_regression_line(ax, x_arr, y_arr, color='r', linestyle='--', linewidth=2, alpha=0.8):
@@ -224,78 +269,13 @@ def _add_regression_line(ax, x_arr, y_arr, color='r', linestyle='--', linewidth=
     '''
     valid = np.isfinite(x_arr) & np.isfinite(y_arr)
     if valid.sum() < 3: return None, None
-    
+
     xv, yv = x_arr[valid], y_arr[valid]
     coeffs = np.polyfit(xv, yv, 1)
     x_line = np.linspace(xv.min(), xv.max(), 100)
     ax.plot(x_line, np.poly1d(coeffs)(x_line), color=color, linestyle=linestyle, linewidth=linewidth, alpha=alpha)
     r, p = scipy_stats.pearsonr(xv, yv)
     return r, p
-
-
-def _draw_stacked_bars(ax, x, data_by_type, width=0.7):
-    '''Draw a stacked bar chart on ax using FAILURE_TYPES / FAILURE_COLOURS.
-
-    Args:
-        ax: matplotlib Axes.
-        x: array-like of x positions.
-        data_by_type: dict {failure_type: list/array of percentages}.
-        width: bar width.
-    '''
-    bottom = np.zeros(len(x))
-    for ft in FAILURE_TYPES:
-        vals = np.array(data_by_type[ft])
-        ax.bar(x, vals, bottom=bottom, label=ft.capitalize(), color=FAILURE_COLOURS[ft], width=width)
-        bottom += vals
-
-
-def has_per_sample_scores(data): # Check if per-sample sent_bleu data is available in translations
-    translations = data.get('translations', {})
-    clean_samples = translations.get('clean', [])
-    if not clean_samples: return False
-    # Check if at least one sample has sent_bleu
-    return any(s.get('sent_bleu') is not None for s in clean_samples)
-
-
-def has_length_data(data): # Check if per-sample T_original data is available
-    translations = data.get('translations', {})
-    clean_samples = translations.get('clean', [])
-    if not clean_samples: return False
-    return any(s.get('T_original') is not None for s in clean_samples)
-
-
-def get_per_sample_scores(translations, key, score_field='sent_bleu'):
-    # Extract per-sample scores as a dict {name: score} for a given translation key
-    samples = translations.get(key, [])
-    result = {}
-    for s in samples:
-        val = s.get(score_field)
-        if val is not None: result[s['name']] = val
-    return result
-
-
-def get_per_sample_scores_compound(translations, cond, sev, score_field='sent_bleu'):
-    '''Per-sample mean score for compound *cond* across all (h,t) with max(h,t)==sev.
-
-    When a sample appears in multiple (h,t) compound variants, its scores are
-    averaged — giving one value per sample for paired statistical tests.
-    '''
-    pooled = {}  # {name: [scores]}
-    for head_sev in SEVERITY_LEVELS:
-        for tail_sev in SEVERITY_LEVELS:
-            if max(head_sev, tail_sev) == sev:
-                for s in translations.get(f'{cond}_h{head_sev}_t{tail_sev}', []):
-                    val = s.get(score_field)
-                    if val is not None: pooled.setdefault(s['name'], []).append(val)
-    return {name: float(np.mean(vals)) for name, vals in pooled.items()}
-
-
-def _save_compound_csv(csv_rows, out_dir): # Write compound_analysis.csv if there are rows to write
-    if not csv_rows: return
-    df = pd.DataFrame(csv_rows)
-    path = os.path.join(out_dir, 'compound_analysis.csv')
-    df.to_csv(path, index=False)
-    print(f'  Saved {path}')
 
 
 # OUTPUT 1: Degradation Curves
@@ -306,19 +286,15 @@ def plot_degradation_curves(metrics, clean_bleu, out_dir):
     ax.axhline(clean_bleu, color='grey', linestyle='--', linewidth=1, label=f'Clean ({clean_bleu:.1f})')
 
     for i, cond in enumerate(MISALIGN_ORDER):
-        cond_data = metrics.get(cond, {})
         y = [clean_bleu]
         for sev in SEVERITY_LEVELS:
-            if cond in COMPOUND_CONDITIONS:
-                val = _compound_agg_metric(metrics, cond, 'bleu4', sev)
-            else:
-                val = metrics.get(cond, {}).get(str(sev), {}).get('bleu4')
+            val = _get_metric(metrics, cond, sev, 'bleu4')
             y.append(val if val is not None else np.nan)
-            
+
         y = np.array(y, dtype=float)
         ax.plot(
             x, y, label=PRETTY[cond], linewidth=1.5, markersize=6,
-            marker=COND_MARKERS[i % len(COND_MARKERS)], color=colors[i % len(colors)], 
+            marker=COND_MARKERS[i % len(COND_MARKERS)], color=colors[i % len(colors)],
         )
         valid = ~np.isnan(y[1:])
         if valid.any(): # mark knee
@@ -329,35 +305,26 @@ def plot_degradation_curves(metrics, clean_bleu, out_dir):
     ax.set_ylabel('BLEU-4', fontsize=11)
     ax.set_title("BLEU-4 Degradation Under Temporal Misalignment\n"
                  "(Compound: mean over all h×t at max severity)", fontsize=12)
-    
+
     ax.set_xticks(x)
     ax.set_xticklabels([f'{v}%' for v in x])
     ax.legend(fontsize=10, loc='lower left', ncol=2)
     ax.grid(True, alpha=0.3)
-    
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'degradation_curves.png')
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    print(f'  Saved {path}')
+
+    _save_fig(fig, os.path.join(out_dir, 'degradation_curves.png'))
 
 
 # OUTPUT 2: Knee-Point Analysis CSV
 def compute_knee_points(metrics, clean_bleu, out_dir):
     rows = []
     for cond in MISALIGN_ORDER:
-        cond_data = metrics.get(cond, {})
         sevs, vals = [], []
         for sev in SEVERITY_LEVELS:
-            if cond in COMPOUND_CONDITIONS:
-                val = _compound_agg_metric(metrics, cond, 'bleu4', sev)
-            else:
-                val = metrics.get(cond, {}).get(str(sev), {}).get('bleu4')
-                
+            val = _get_metric(metrics, cond, sev, 'bleu4')
             if val is not None:
                 sevs.append(sev)
                 vals.append(val)
-                
+
         if not sevs: continue
         kx, ky = find_knee(np.array(sevs), np.array(vals))
         drop = (clean_bleu - ky) / clean_bleu * 100 if clean_bleu > 0 else 0
@@ -400,11 +367,11 @@ def generate_scores_csv(metrics, clean_bleu, out_dir):
         }
         if has_bertscore: row['bertscore_f1'] = entry.get('bertscore_f1')
         return row
-    
+
     c = metrics['clean']
     rows = [{ # Clean row
-        'misalignment_type': 'clean', 
-        'head_severity': 0, 'tail_severity': 0, 
+        'misalignment_type': 'clean',
+        'head_severity': 0, 'tail_severity': 0,
         'bleu4': c['bleu4'], 'bleu4_drop': '—',
         'rouge_l': c.get('rouge_l'), 'meteor': c.get('meteor'), 'ter': c.get('ter'),
     }]
@@ -444,7 +411,7 @@ def generate_sample_translations(data, out_dir, n_samples=5):
                 key = f'{cond}_h{h_sev}_t{t_sev}'
                 samples = translations.get(key, [])
                 if not samples: continue
-                
+
                 lines.append(f'\n### Head={h_sev}%, Tail={t_sev}%\n')
                 chosen = random.sample(samples, min(n_samples, len(samples)))
                 for s in chosen:
@@ -463,7 +430,7 @@ def generate_sample_translations(data, out_dir, n_samples=5):
             key = f'{cond}_20'
             samples = translations.get(key, [])
             if not samples: continue
-            
+
             lines.append(f'\n## {PRETTY[cond]} (20%)\n')
             chosen = random.sample(samples, min(n_samples, len(samples)))
             for s in chosen:
@@ -483,7 +450,7 @@ def generate_sample_translations(data, out_dir, n_samples=5):
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     print(f'  Saved {path}')
-    
+
 
 # OUTPUT 5: Violin/Box Plots of Per-Sample Score Distributions
 def plot_violin_plots(data, out_dir):
@@ -497,7 +464,7 @@ def plot_violin_plots(data, out_dir):
     if not clean_scores:
         print('  [Skipping — no clean sent_bleu data]')
         return
-    
+
     clean_median = np.median(list(clean_scores.values()))
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     axes = axes.flatten()
@@ -525,13 +492,12 @@ def plot_violin_plots(data, out_dir):
 
         if not plot_data:
             ax.set_title(PRETTY[cond], fontsize=10)
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=10, color='grey')
+            _no_data(ax, 'No data')
             continue
-        
+
         try: # Try violin plot, fall back to box plot
             parts = ax.violinplot(plot_data, positions=range(len(plot_data)), showmeans=True, showmedians=True)
-            for pc in parts.get('bodies', []):
-                pc.set_alpha(0.7)
+            for pc in parts.get('bodies', []): pc.set_alpha(0.7)
         except Exception:
             ax.boxplot(plot_data, positions=range(len(plot_data)))
 
@@ -545,19 +511,18 @@ def plot_violin_plots(data, out_dir):
         ax.grid(True, alpha=0.3)
 
     fig.suptitle('Per-Sample Sentence BLEU Distributions by Misalignment Type\n'
-                 '(Compound: per-sample mean across all h×t at max severity)',
-                 fontsize=14, y=1.02)
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'violin_plots.png')
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path}')
-    
-    
+                 '(Compound: per-sample mean across all h×t at max severity)', fontsize=14, y=1.02)
+    _save_fig(fig, os.path.join(out_dir, 'violin_plots.png'))
+
+
 # OUTPUT 6: Sequence Length vs BLEU Drop Scatter
 def plot_length_vs_drop(data, out_dir):
     translations = data.get('translations', {})
-    if not has_per_sample_scores(data) or not has_length_data(data):
+    clean_samples = translations.get('clean', [])
+    
+    # Check if per-sample T_original data is available
+    has_length_data = any(s.get('T_original') is not None for s in clean_samples) if clean_samples else False
+    if not has_per_sample_scores(data) or not has_length_data:
         print('  [Skipping — requires per-sample sent_bleu and T_original data]')
         return
 
@@ -567,9 +532,8 @@ def plot_length_vs_drop(data, out_dir):
         return
 
     # Build per-sample T_original lookup from clean translations
-    clean_samples = translations.get('clean', [])
     t_original_map = {
-        s['name']: s['T_original'] for s in clean_samples 
+        s['name']: s['T_original'] for s in clean_samples
         if s.get('T_original') is not None
     }
     target_sev = 30  # Representative severity
@@ -577,10 +541,7 @@ def plot_length_vs_drop(data, out_dir):
     all_x, all_y = [], []
 
     for cond in MISALIGN_ORDER:
-        if cond in COMPOUND_CONDITIONS:
-            mis_scores = get_per_sample_scores_compound(translations, cond, target_sev, 'sent_bleu')
-        else:
-            mis_scores = get_per_sample_scores(translations, f'{cond}_{target_sev}', 'sent_bleu')
+        mis_scores = _get_per_sample_scores(translations, cond, target_sev, 'sent_bleu')
         if not mis_scores: continue
 
         cat = CAT_MAP.get(cond, 'Mixed')
@@ -606,20 +567,13 @@ def plot_length_vs_drop(data, out_dir):
     ax.set_title(f'Sequence Length vs BLEU Drop at {target_sev}% Severity\n'
                  f'(Compound: per-sample mean across all h×t with max={target_sev}%)', fontsize=11)
     ax.axhline(0, color='grey', linestyle='-', linewidth=0.5)
-    
-    # Deduplicate legend entries by label
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), fontsize=10, loc='upper right')
-    ax.grid(True, alpha=0.3)
-    
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'length_vs_drop.png')
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    print(f'  Saved {path}')
 
-    
+    # Deduplicate legend entries by label
+    _dedup_legend(ax, fontsize=10, loc='upper right')
+    ax.grid(True, alpha=0.3)
+    _save_fig(fig, os.path.join(out_dir, 'length_vs_drop.png'))
+
+
 # OUTPUT 7: Multi-Metric Heatmap Grid
 def plot_multi_metric_heatmap(metrics, clean_bleu, out_dir):
     # Determine which metrics are available
@@ -636,13 +590,13 @@ def plot_multi_metric_heatmap(metrics, clean_bleu, out_dir):
         for v in [metrics.get(cond, {}).get(str(sev), {})]
     )
     if has_bertscore: metric_configs.append(('bertscore_f1', 'BERTScore', 'RdYlGn', False))
-    
+
     # Filter to only metrics that actually have data
     available_configs = []
     for mname, pretty_name, cmap_name, is_reversed in metric_configs:
         mat = metric_matrix(metrics, mname)
         knee_points = []
-        
+
         if not np.all(np.isnan(mat)):
             available_configs.append((mname, pretty_name, cmap_name, is_reversed, mat))
             for ri, cond in enumerate(MISALIGN_ORDER):
@@ -689,7 +643,7 @@ def plot_multi_metric_heatmap(metrics, clean_bleu, out_dir):
         )
         for idx, knee in enumerate(knee_points): # Knee column on the right
             ax.text(knee / 10 - 0.5, idx + 0.6, '___', ha='center', va='center', fontsize=14, fontweight='bold')
-        
+
         subtitle = f'(Clean = {clean_val:.2f})' if clean_val is not None else ''
         ax.set_title(f'{pretty_name} {subtitle}', fontsize=11)
         ax.set_xlabel('Max Severity')
@@ -697,81 +651,10 @@ def plot_multi_metric_heatmap(metrics, clean_bleu, out_dir):
 
     fig.suptitle('Multi-Metric Vulnerability Heatmaps with Knee Points Underlined\n'
                  '(Compound rows: mean over all h×t at max severity)', fontsize=14, y=1.02)
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'multi_metric_heatmap.png')
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path}')
+    _save_fig(fig, os.path.join(out_dir, 'multi_metric_heatmap.png'))
 
 
-# OUTPUT 8: Radar/Spider Chart at Fixed Severity
-def plot_radar_chart(metrics, out_dir):
-    target_sev = 30
-    metric_names = ['bleu4', 'rouge_l', 'meteor']
-    metric_labels = ['BLEU-4', 'ROUGE-L', 'METEOR']
-
-    # Collect values for each condition at target severity
-    raw_values = {}  # metric -> list of values (one per condition)
-    for mname in metric_names:
-        vals = []
-        for cond in MISALIGN_ORDER:
-            if cond in COMPOUND_CONDITIONS:
-                val = _compound_agg_metric(metrics, cond, mname, target_sev)
-            else:
-                val = metrics.get(cond, {}).get(str(target_sev), {}).get(mname)
-            vals.append(val)
-        raw_values[mname] = vals
-
-    # Check we have enough data
-    has_data = any(v is not None for mname in metric_names for v in raw_values[mname])
-    if not has_data:
-        print(f'  [Skipping — no metric data available at severity {target_sev}%]')
-        return
-
-    # Normalize each metric to [0, 1] based on min/max across all conditions
-    normalized = {}  # metric -> list of normalized values
-    for mname in metric_names:
-        vals = raw_values[mname]
-        numeric_vals = [v for v in vals if v is not None]
-        if not numeric_vals:
-            normalized[mname] = [0.0] * len(MISALIGN_ORDER)
-            continue
-        
-        vmin, vmax = min(numeric_vals), max(numeric_vals)
-        rng = vmax - vmin if vmax > vmin else 1.0
-        normalized[mname] = [(v - vmin) / rng if v is not None else 0.0 for v in vals]
-
-    # Number of axes = number of conditions
-    N = len(MISALIGN_ORDER)
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
-    angles += angles[:1]  # Close the polygon
-
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-    colors_radar = ['#1f77b4', '#ff7f0e', '#2ca02c']
-    for mi, mname in enumerate(metric_names):
-        vals = normalized[mname] + [normalized[mname][0]]  # close polygon
-        ax.plot(angles, vals, 'o-', linewidth=2, label=metric_labels[mi], color=colors_radar[mi], markersize=6)
-        ax.fill(angles, vals, alpha=0.1, color=colors_radar[mi])
-
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([PRETTY[c] for c in MISALIGN_ORDER], fontsize=10)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
-    ax.set_yticklabels(['0.25', '0.50', '0.75', '1.00'], fontsize=7)
-    ax.set_title(f'Model Vulnerability Profile at max {target_sev}% Severity\n'
-                 f'(Compound: mean over all h×t | Normalized to [0,1] per metric)',
-                 fontsize=11, y=1.08)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=9)
-    ax.grid(True, alpha=0.3)
-    
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'radar_chart.png')
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path}')
-    
-
-# OUTPUT 9: Failure Transition Matrix
+# OUTPUT 8: Failure Transition Matrix
 def compute_failure_transitions(data, out_dir):
     translations = data.get('translations', {})
     csv_rows = [] # Build transitions CSV
@@ -793,11 +676,8 @@ def compute_failure_transitions(data, out_dir):
 
         for si in range(1, len(sev_chain)):
             from_sev, to_sev = sev_chain[si - 1], sev_chain[si]
-            if cond in COMPOUND_CONDITIONS:
-                samples = _compound_agg_samples(translations, cond, to_sev)
-            else:
-                samples = translations.get(f'{cond}_{to_sev}', [])
-                
+            samples = _get_samples(translations, cond, to_sev)
+
             if not samples: continue
             curr_classes = {s['name']: classify_failure(s['ref'], s['hyp']) for s in samples}
 
@@ -812,7 +692,7 @@ def compute_failure_transitions(data, out_dir):
                     name: max(set(votes), key=votes.count)
                     for name, votes in name_votes.items()
                 }
-            
+
             # Build transition counts
             trans_counts = {}
             for name, curr_ft in curr_classes.items():
@@ -846,7 +726,7 @@ def compute_failure_transitions(data, out_dir):
     else:
         print('  [Skipping CSV — no transition data]')
         return
-    
+
     if not repr_matrices: # Plot transition heatmaps for representative condition
         print('  [Skipping plot — no transition matrices for representative condition]')
         return
@@ -864,7 +744,7 @@ def compute_failure_transitions(data, out_dir):
 
         sns.heatmap(
             mat_pct, annot=True, fmt='.0f', cmap='Blues',
-            xticklabels=[ft[:6] for ft in FAILURE_TYPES], 
+            xticklabels=[ft[:6] for ft in FAILURE_TYPES],
             yticklabels=[ft[:6] for ft in FAILURE_TYPES],
             ax=ax, vmin=0, vmax=100, linewidths=0.5, cbar_kws={'label': '%'}
         )
@@ -874,99 +754,27 @@ def compute_failure_transitions(data, out_dir):
         ax.set_ylabel('From')
 
     fig.suptitle(f'Failure Transition Matrices ({PRETTY[repr_cond]})', fontsize=12, y=1.02)
-    fig.tight_layout()
-    path_png = os.path.join(out_dir, 'failure_transitions.png')
-    fig.savefig(path_png, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path_png}')
+    _save_fig(fig, os.path.join(out_dir, 'failure_transitions.png'))
 
 
-# OUTPUT 10: Statistical Significance Tests
-def compute_significance_tests(data, out_dir):
-    translations = data.get('translations', {})
-    if not has_per_sample_scores(data):
-        print('  [Skipping — no per-sample sent_bleu data]')
-        return
-
-    clean_scores = get_per_sample_scores(translations, 'clean', 'sent_bleu')
-    if not clean_scores:
-        print('  [Skipping — no clean sent_bleu data]')
-        return
-
-    np.random.seed(42)  # For bootstrap reproducibility
-    rows = []
-    for cond in MISALIGN_ORDER:
-        for sev in SEVERITY_LEVELS:
-            if cond in COMPOUND_CONDITIONS:
-                mis_scores = get_per_sample_scores_compound(translations, cond, sev, 'sent_bleu')
-            else:
-                mis_scores = get_per_sample_scores(translations, f'{cond}_{sev}', 'sent_bleu')
-            if not mis_scores: continue
-
-            # Get paired samples (only samples present in both clean and misaligned)
-            paired_names = sorted(set(clean_scores.keys()) & set(mis_scores.keys()))
-            if len(paired_names) < 5: continue
-
-            clean_arr = np.array([clean_scores[n] for n in paired_names])
-            mis_arr = np.array([mis_scores[n] for n in paired_names])
-            diffs = clean_arr - mis_arr
-            mean_drop = np.mean(diffs)
-
-            # Wilcoxon signed-rank test
-            nonzero = diffs[diffs != 0] # Remove zero differences for Wilcoxon
-            p_value = scipy_stats.wilcoxon(nonzero).pvalue if len(nonzero) > 0 else 1.0
-
-            # Paired bootstrap CI (1000 resamples)
-            n_boot = 1000
-            boot_means = np.empty(n_boot)
-            n_samples = len(diffs)
-            boot_means = np.array([
-                np.mean(diffs[np.random.randint(0, n_samples, size=n_samples)])
-                for _ in range(n_boot)
-            ])
-            ci_lower = np.percentile(boot_means, 2.5)
-            ci_upper = np.percentile(boot_means, 97.5)
-
-            rows.append({
-                'condition': cond, 'severity': sev,
-                'n_paired': len(paired_names), 'mean_drop': round(mean_drop, 4),
-                'ci_lower': round(ci_lower, 4), 'ci_upper': round(ci_upper, 4),
-                'wilcoxon_p': round(p_value, 6) if np.isfinite(p_value) else 'NA',
-                'significant_at_005': 'yes' if (np.isfinite(p_value) and p_value < 0.05) else 'no',
-                'compound_agg': 'max_sev_mean' if cond in COMPOUND_CONDITIONS else 'single',
-            })
-
-    if not rows:
-        print('  [Skipping — no paired data for significance tests]')
-        return
-
-    df = pd.DataFrame(rows)
-    path = os.path.join(out_dir, 'significance_tests.csv')
-    df.to_csv(path, index=False)
-    print(f'  Saved {path}')
-
-
-# OUTPUT 11: Truncation vs Contamination Comparison
+# OUTPUT 9: Truncation vs Contamination Comparison
 def plot_trunc_vs_contam(metrics, out_dir):
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     categories = {'Truncation': TRUNC_ONLY, 'Contamination': CONTAM_ONLY, 'Mixed': MIXED}
     cat_means = {}
-    
+
     for cat_name, conds in categories.items(): # Compute average BLEU-4 for each category at each severity
         means = []
         for sev in SEVERITY_LEVELS:
             vals = []
             for cond in conds:
-                if cond in COMPOUND_CONDITIONS:
-                    val = _compound_agg_metric(metrics, cond, 'bleu4', sev)
-                else:
-                    val = metrics.get(cond, {}).get(str(sev), {}).get('bleu4')
+                val = _get_metric(metrics, cond, sev, 'bleu4')
                 if val is not None: vals.append(val)
             means.append(np.mean(vals) if vals else np.nan)
         cat_means[cat_name] = means
 
     # Panel 1: Category comparison (grouped bar)
-    ax1 = axes[0] 
+    ax1 = axes[0]
     bar_width = 0.25
     x = np.arange(len(SEVERITY_LEVELS))
 
@@ -1007,15 +815,10 @@ def plot_trunc_vs_contam(metrics, out_dir):
     ax2.set_xticklabels([f'{s}%' for s in SEVERITY_LEVELS])
     ax2.legend(fontsize=9)
     ax2.grid(True, alpha=0.3, axis='y')
-
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'trunc_vs_contam.png')
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-    print(f'  Saved {path}')
+    _save_fig(fig, os.path.join(out_dir, 'trunc_vs_contam.png'))
 
 
-# OUTPUT 12: Sample Robustness Analysis
+# OUTPUT 10: Sample Robustness Analysis
 def compute_sample_robustness(data, out_dir):
     translations = data.get('translations', {})
     clean_samples = translations.get('clean', [])
@@ -1102,17 +905,12 @@ def compute_sample_robustness(data, out_dir):
         if r is not None: ax2.set_title(f'Sequence Length vs Robustness (r={r:.3f})', fontsize=11)
         ax2.grid(True, alpha=0.3)
     else:
-        ax2.text(0.5, 0.5, 'No T_original data', ha='center', va='center', transform=ax2.transAxes, fontsize=12, color='grey')
+        _no_data(ax2, 'No T_original data')
         ax2.set_title('Sequence Length vs Robustness', fontsize=11)
-
-    fig.tight_layout()
-    path_png = os.path.join(out_dir, 'sample_robustness.png')
-    fig.savefig(path_png, dpi=200)
-    plt.close(fig)
-    print(f'  Saved {path_png}')
+    _save_fig(fig, os.path.join(out_dir, 'sample_robustness.png'))
 
 
-# OUTPUT 13: Sensitivity Ranking
+# OUTPUT 11: Sensitivity Ranking
 def compute_sensitivity_ranking(metrics, out_dir):
     '''Rank conditions by slope of BLEU-4 vs severity regression.
 
@@ -1123,7 +921,7 @@ def compute_sensitivity_ranking(metrics, out_dir):
     for cond in MISALIGN_ORDER:
         cond_data = metrics.get(cond, {})
         sevs, vals = [], []
-        
+
         for head_sev in SEVERITY_LEVELS: # Use all 25 entries; x = max(head_sev, tail_sev)
             for tail_sev in SEVERITY_LEVELS:
                 val = cond_data.get(f'h{head_sev}_t{tail_sev}', {}).get('bleu4')
@@ -1136,7 +934,7 @@ def compute_sensitivity_ranking(metrics, out_dir):
                 if val is not None:
                     sevs.append(sev)
                     vals.append(val)
-                    
+
         if len(sevs) < 2: continue
         x = np.array(sevs, dtype=float)
         y = np.array(vals, dtype=float)
@@ -1161,13 +959,10 @@ def compute_sensitivity_ranking(metrics, out_dir):
     for rank, row in enumerate(rows, 1):
         row['rank'] = rank
 
-    df = pd.DataFrame(rows)
-    path = os.path.join(out_dir, 'sensitivity_ranking.csv')
-    df.to_csv(path, index=False)
-    print(f'  Saved {path}')
+    _save_df(pd.DataFrame(rows), out_dir, 'sensitivity_ranking.csv')
 
 
-# OUTPUT 14: Failure Distribution — Small Multiples
+# OUTPUT 12: Failure Distribution — Small Multiples
 def plot_failure_distribution(data, out_dir):
     translations = data.get('translations', {})
     fig, axes = plt.subplots(2, 4, figsize=(20, 15))
@@ -1179,14 +974,14 @@ def plot_failure_distribution(data, out_dir):
         sev_labels, sev_counts = [], {ft: [] for ft in FAILURE_TYPES}
 
         for sev in SEVERITY_LEVELS:
-            if cond in COMPOUND_CONDITIONS:
-                samples = _compound_agg_samples(translations, cond, sev)
-            else:
-                samples = translations.get(f'{cond}_{sev}', [])
-                
+            samples = _get_samples(translations, cond, sev)
             if not samples: continue
             has_cond_data = True
-            dist = _count_failures(samples)
+            
+            dist = {ft: 0 for ft in FAILURE_TYPES}
+            for s in samples: # Count failure types for a list of sample dicts with 'ref' and 'hyp' keys.
+                dist[classify_failure(s['ref'], s['hyp'])] += 1
+            
             total = len(samples)
             sev_labels.append(f'{sev}%')
             for ft in FAILURE_TYPES:
@@ -1194,12 +989,16 @@ def plot_failure_distribution(data, out_dir):
 
         if not has_cond_data:
             ax.set_title(PRETTY[cond], fontsize=10)
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=10, color='grey')
+            _no_data(ax, 'No data')
             continue
 
         any_data = True
         x = np.arange(len(sev_labels))
-        _draw_stacked_bars(ax, x, sev_counts, width=0.6)
+        bottom = np.zeros(len(x))
+        for ft in FAILURE_TYPES: # Draw a stacked bar chart on ax using FAILURE_TYPES / FAILURE_COLOURS.
+            vals = np.array(sev_counts[ft])
+            ax.bar(x, vals, bottom=bottom, label=ft.capitalize(), color=FAILURE_COLOURS[ft], width=0.6)
+            bottom += vals
 
         ax.set_xticks(x)
         ax.set_xticklabels(sev_labels, fontsize=9)
@@ -1222,15 +1021,11 @@ def plot_failure_distribution(data, out_dir):
     )
     fig.suptitle('Failure-Type Distribution by Condition — Small Multiples\n'
                  '(Compound bars pool all h×t at max severity)', fontsize=14, y=1.02)
-    
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'failure_distribution.png')
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path}')
+
+    _save_fig(fig, os.path.join(out_dir, 'failure_distribution.png'))
 
 
-# OUTPUT 15: Compound Severity Grid (full h × t heatmap per type)
+# OUTPUT 13: Compound Severity Grid (full h × t heatmap per type)
 def plot_compound_severity_grid(metrics, clean_bleu, out_dir):
     '''2×2 layout of 5×5 heatmaps — one per compound condition type.
 
@@ -1253,9 +1048,9 @@ def plot_compound_severity_grid(metrics, clean_bleu, out_dir):
 
         if np.all(np.isnan(mat)):
             ax.set_title(PRETTY[cond], fontsize=11)
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='grey')
+            _no_data(ax)
             continue
-        
+
         any_data = True
         annot = np.empty_like(mat, dtype=object)
         for r in range(mat.shape[0]):
@@ -1267,7 +1062,7 @@ def plot_compound_severity_grid(metrics, clean_bleu, out_dir):
                     annot[r, c] = f'{v:.1f}\n(-{drop:.0f}%)'
 
         sns.heatmap(
-            mat, annot=annot, fmt='', cmap=cmap, 
+            mat, annot=annot, fmt='', cmap=cmap,
             xticklabels=sev_labels, yticklabels=sev_labels,
             vmin=vmin, vmax=vmax, annot_kws={'fontsize': 10},
             linewidths=0.5, ax=ax, cbar_kws={'label': 'BLEU-4'},
@@ -1288,15 +1083,11 @@ def plot_compound_severity_grid(metrics, clean_bleu, out_dir):
         f'Compound Condition BLEU-4: Head × Tail Severity Grid\n'
         f'(Clean = {clean_bleu:.2f} | Black border = symmetric h == t)',
         fontsize=14, y=1.01)
-    
-    fig.tight_layout()
-    path = os.path.join(out_dir, 'compound_severity_grid.png')
-    fig.savefig(path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path}')
+
+    _save_fig(fig, os.path.join(out_dir, 'compound_severity_grid.png'))
 
 
-# OUTPUT 16: Compound Interaction Analysis
+# OUTPUT 14: Compound Interaction Analysis
 def plot_compound_interaction(metrics, clean_bleu, out_dir):
     '''Consolidated 2×2 analysis of compound-condition interaction effects.
 
@@ -1339,7 +1130,7 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
                 drop_h = single_drops.get(head_type, {}).get(head_sev)
                 drop_t = single_drops.get(tail_type, {}).get(tail_sev)
                 predicted = interaction = None
-                
+
                 if drop_h is not None and drop_t is not None:
                     predicted = drop_h + drop_t
                     interaction = actual_drop - predicted
@@ -1424,11 +1215,9 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
 
         ax.set_xlabel('Predicted Additive Drop', fontsize=10)
         ax.set_ylabel('Actual Compound Drop', fontsize=10)
-        handles, labels_leg = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels_leg, handles))
-        ax.legend(by_label.values(), by_label.keys(), fontsize=6, loc='lower right')
+        _dedup_legend(ax, fontsize=6, loc='lower right')
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='grey')
+        _no_data(ax)
     ax.set_title('(a) Additivity Analysis', fontsize=11)
     ax.grid(True, alpha=0.3)
 
@@ -1457,11 +1246,9 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
                 transform=ax.transAxes, fontsize=10, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85))
 
-        handles, labels_leg = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels_leg, handles))
-        ax.legend(by_label.values(), by_label.keys(), fontsize=7, loc='lower right')
+        _dedup_legend(ax, fontsize=7, loc='lower right')
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='grey')
+        _no_data(ax)
     ax.set_title('(b) Head ↔ Tail Asymmetry (Symmetric Types)', fontsize=11)
     ax.grid(True, alpha=0.3)
 
@@ -1480,7 +1267,7 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
         ax.set_xlabel('Tail Severity', fontsize=10)
         ax.set_ylabel('Head Severity', fontsize=10)
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='grey')
+        _no_data(ax)
     ax.set_title('(c) Mean Interaction Strength\n(Actual Drop − Predicted Additive Drop)', fontsize=11)
 
     # (d) Mirror-type comparison
@@ -1509,17 +1296,12 @@ def plot_compound_interaction(metrics, clean_bleu, out_dir):
         ax.text(0.03, 0.97, dir_label, transform=ax.transAxes, fontsize=10, va='top',
                 bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85))
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center',
-                transform=ax.transAxes, fontsize=12, color='grey')
+        _no_data(ax)
     ax.set_title('(d) Mirror-Type Comparison\n(HT + TC vs HC + TT)', fontsize=11)
     ax.grid(True, alpha=0.3)
 
     fig.suptitle('Compound Condition Interaction Analysis', fontsize=14, y=1.01)
-    fig.tight_layout()
-    path_png = os.path.join(out_dir, 'compound_interaction.png')
-    fig.savefig(path_png, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f'  Saved {path_png}')
+    _save_fig(fig, os.path.join(out_dir, 'compound_interaction.png'))
     _save_compound_csv(csv_rows, out_dir)
 
 
@@ -1543,52 +1325,43 @@ def main():
     print(f'Clean BLEU-4: {clean_bleu:.2f}')
     print(f'Generating analysis outputs in {out_dir}/\n')
 
-    print("[1/16] Degradation curves")
+    print("[1/14] Degradation curves")
     plot_degradation_curves(metrics, clean_bleu, out_dir)
 
-    print("[2/16] Knee-point analysis")
+    print("[2/14] Knee-point analysis")
     compute_knee_points(metrics, clean_bleu, out_dir)
 
-    print("[3/16] Per-condition scores CSV")
+    print("[3/14] Per-condition scores CSV")
     generate_scores_csv(metrics, clean_bleu, out_dir)
 
-    print("[4/16] Sample translation comparison")
+    print("[4/14] Sample translation comparison")
     generate_sample_translations(data, out_dir)
 
-    print("[5/16] Violin plots")
-    plot_violin_plots(data, out_dir)
-
-    print("[6/16] Length vs drop scatter")
+    print("[6/14] Length vs drop scatter")
     plot_length_vs_drop(data, out_dir)
 
-    print("[7/16] Multi-metric heatmap grid")
+    print("[7/14] Multi-metric heatmap grid")
     plot_multi_metric_heatmap(metrics, clean_bleu, out_dir)
 
-    print("[8/16] Radar chart")
-    plot_radar_chart(metrics, out_dir)
-
-    print("[9/16] Failure transitions")
+    print("[8/14] Failure transitions")
     compute_failure_transitions(data, out_dir)
 
-    print("[10/16] Statistical significance tests")
-    compute_significance_tests(data, out_dir)
-
-    print("[11/16] Truncation vs contamination comparison")
+    print("[9/14] Truncation vs contamination comparison")
     plot_trunc_vs_contam(metrics, out_dir)
 
-    print("[12/16] Sample robustness analysis")
+    print("[10/14] Sample robustness analysis")
     compute_sample_robustness(data, out_dir)
 
-    print("[13/16] Sensitivity ranking")
+    print("[11/14] Sensitivity ranking")
     compute_sensitivity_ranking(metrics, out_dir)
 
-    print("[14/16] Failure distribution (detailed small multiples)")
+    print("[12/14] Failure distribution (detailed small multiples)")
     plot_failure_distribution(data, out_dir)
 
-    print("[15/16] Compound severity grid")
+    print("[13/14] Compound severity grid")
     plot_compound_severity_grid(metrics, clean_bleu, out_dir)
 
-    print("[16/16] Compound interaction analysis")
+    print("[14/14] Compound interaction analysis")
     plot_compound_interaction(metrics, clean_bleu, out_dir)
 
 
