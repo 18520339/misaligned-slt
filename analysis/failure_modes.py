@@ -1,4 +1,4 @@
-"""Failure mode classification for misaligned SLT predictions.
+'''Failure mode classification for misaligned SLT predictions.
 
 Classifies each (sample, condition) prediction into one of:
   - Acceptable:       sentence-BLEU >= 0.4
@@ -7,7 +7,7 @@ Classifies each (sample, condition) prediction into one of:
   - Partial match:    0.1 <= sentence-BLEU < 0.4 AND 0.5 <= length_ratio <= 1.5
   - Repetition:       any token repeated >= 3 times consecutively
   - Incoherent:       everything else with sentence-BLEU < 0.1
-"""
+'''
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from collections import Counter
@@ -35,14 +35,14 @@ def classify_failure_mode(
 
 
 def classify_all_predictions(results_json: dict) -> dict:
-    """Classify all predictions across all conditions.
+    '''Classify all predictions across all conditions.
 
     Args:
         results_json: The full results JSON from evaluator.py
 
     Returns:
         Dict mapping condition_name -> {sample_name -> failure_mode}
-    """
+    '''
     classifications = {}
     for cond_name, cond_data in results_json.items():
         if cond_name == 'meta': continue
@@ -73,7 +73,7 @@ def failure_mode_distribution(classifications: dict) -> dict: # Compute failure 
 
 
 def failure_mode_transitions(classifications: dict, condition_type: str, severity_levels: list) -> dict:
-    """Track how samples transition between failure modes as severity increases.
+    '''Track how samples transition between failure modes as severity increases.
 
     Args:
         classifications: Output of classify_all_predictions
@@ -82,7 +82,7 @@ def failure_mode_transitions(classifications: dict, condition_type: str, severit
 
     Returns:
         Dict mapping severity -> {mode: count}
-    """
+    '''
     transitions = {}
     for sev in severity_levels:
         pct = int(sev * 100)
@@ -94,7 +94,7 @@ def failure_mode_transitions(classifications: dict, condition_type: str, severit
 
 
 def compute_transition_matrix(classifications: dict, from_cond: str, to_cond: str) -> Tuple[Optional[np.ndarray], int]:
-    """Compute per-sample failure-mode transition matrix between two conditions.
+    '''Compute per-sample failure-mode transition matrix between two conditions.
 
     Rows   = failure mode at `from_cond` (e.g. 'clean').
     Columns = failure mode at `to_cond`  (e.g. 'HT_30').
@@ -105,7 +105,7 @@ def compute_transition_matrix(classifications: dict, from_cond: str, to_cond: st
         (matrix, n_common) where matrix is shape (n_modes, n_modes) int ndarray,
         and n_common is the number of samples tracked.  Returns (None, 0) if
         either condition has no classifications.
-    """
+    '''
     from_classes = classifications.get(from_cond, {})
     to_classes   = classifications.get(to_cond,   {})
     common = set(from_classes.keys()) & set(to_classes.keys())

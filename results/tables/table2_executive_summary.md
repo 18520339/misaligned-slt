@@ -1,9 +1,9 @@
-# Table 1: Cross-Metric Robustness Summary
+# Table 2: Cross-Metric Robustness Summary
 
 This table is intentionally aggregated (mean ± std across selected severities), so it complements the CSV instead of duplicating row-level metrics.
 
 | Group | Mean ΔBLEU (pp) | Mean ΔWER (pp) | Mean ΔROUGE (pp)  | Worst cond (ΔBLEU) |
-|------|------------------:|---------------:|-----------------:|--------------------|
+|-------|----------------:|---------------:|------------------:|--------------------|
 | HT | 3.51 ± 2.65 | 8.10 ± 5.96 | 4.30 ± 3.19 | HT_20 (7.06) |
 | TT | 1.90 ± 1.69 | 6.22 ± 4.96 | 1.89 ± 1.50 | TT_20 (4.24) |
 | HC | 3.38 ± 2.11 | 7.58 ± 5.54 | 2.81 ± 1.94 | HC_20 (6.21) |

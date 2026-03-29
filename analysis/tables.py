@@ -30,20 +30,63 @@ def _load_results(results_dir, filename):
     return None
 
 
-# Table 1: Cross-Metric Robustness Summary (aggregated; non-duplicate of CSV)
-def table1_executive_summary(results: dict, severity_levels: list) -> str:
+# Table 1: Knee Point Summary
+def table1_knee_points(results: dict, severity_levels: list) -> str:
+    knees = detect_all_knee_points(results, severity_levels)
+    clean_bleu = results.get('clean', {}).get('metrics', {}).get('bleu4', 0)
+    classifications = classify_all_predictions(results)
+    distributions = failure_mode_distribution(classifications)
+
+    lines = ['# Table 1: Knee Point Summary\n']
+    lines.append('| Condition | Knee Severity | BLEU at Knee | Clean BLEU | '
+                 'Abs Drop | Rel Drop (%) | WER at Knee | Dominant Failure Mode |')
+    lines.append('|-----------|--------------|-------------|-----------|'
+                 '---------|-------------|------------|----------------------|')
+
+    for ctype in ['HT', 'TT', 'HC', 'TC']:
+        k = knees.get(ctype, {}).get('bleu4')
+        if not k:
+            lines.append(f'| {ctype} | N/A | N/A | {clean_bleu:.1f} | - | - | - | - |')
+            continue
+
+        knee_sev = k['knee_severity']
+        knee_bleu = k['knee_value']
+        abs_drop = clean_bleu - knee_bleu
+        rel_drop = abs_drop / max(clean_bleu, 0.01) * 100
+
+        # WER at knee
+        wer_k = knees.get(ctype, {}).get('wer')
+        wer_at_knee = wer_k['knee_value'] if wer_k else 'N/A'
+
+        # Dominant failure mode at knee severity
+        cond_at_knee = f'{ctype}_{int(knee_sev * 100):02d}'
+        dom_mode = 'N/A'
+        if cond_at_knee in distributions:
+            dist = distributions[cond_at_knee]
+            dom_mode = max([m for m in dist if m != '_total'], key=lambda m: dist[m], default='N/A')
+
+        lines.append(
+            f"| {ctype} | {knee_sev*100:.0f}% | {knee_bleu:.1f} | {clean_bleu:.1f} | "
+            f"{abs_drop:.1f} | {rel_drop:.1f}% | "
+            f"{wer_at_knee if isinstance(wer_at_knee, str) else f'{wer_at_knee:.1f}'} | "
+            f"{dom_mode} |")
+    return '\n'.join(lines)
+
+
+# Table 2: Cross-Metric Robustness Summary (aggregated; non-duplicate of CSV)
+def table2_executive_summary(results: dict, severity_levels: list) -> str:
     clean_m = results.get('clean', {}).get('metrics', {})
     clean_wer = clean_m.get('wer', 0.0)
     clean_bleu = clean_m.get('bleu4', 0.0)
     clean_rouge = clean_m.get('rouge_l', 0.0)
 
-    lines = ['# Table 1: Cross-Metric Robustness Summary\n']
+    lines = ['# Table 2: Cross-Metric Robustness Summary\n']
     lines.append(
         'This table is intentionally aggregated (mean ± std across selected severities), '
         'so it complements the CSV instead of duplicating row-level metrics.\n'
     )
     lines.append('| Group | Mean ΔBLEU (pp) | Mean ΔWER (pp) | Mean ΔROUGE (pp)  | Worst cond (ΔBLEU) |')
-    lines.append('|------|------------------:|---------------:|-----------------:|--------------------|')
+    lines.append('|-------|----------------:|---------------:|------------------:|--------------------|')
 
     groups = OrderedDict({
         'HT': [], 'TT': [], 'HC': [], 'TC': [],
@@ -96,49 +139,6 @@ def table1_executive_summary(results: dict, severity_levels: list) -> str:
     return '\n'.join(lines)
 
 
-# Table 2: Knee Point Summary
-def table2_knee_points(results: dict, severity_levels: list) -> str:
-    knees = detect_all_knee_points(results, severity_levels)
-    clean_bleu = results.get('clean', {}).get('metrics', {}).get('bleu4', 0)
-    classifications = classify_all_predictions(results)
-    distributions = failure_mode_distribution(classifications)
-
-    lines = ['# Table 2: Knee Point Summary\n']
-    lines.append('| Condition | Knee Severity | BLEU at Knee | Clean BLEU | '
-                 'Abs Drop | Rel Drop (%) | WER at Knee | Dominant Failure Mode |')
-    lines.append('|-----------|--------------|-------------|-----------|'
-                 '---------|-------------|------------|----------------------|')
-
-    for ctype in ['HT', 'TT', 'HC', 'TC']:
-        k = knees.get(ctype, {}).get('bleu4')
-        if not k:
-            lines.append(f"| {ctype} | N/A | N/A | {clean_bleu:.1f} | - | - | - | - |")
-            continue
-
-        knee_sev = k['knee_severity']
-        knee_bleu = k['knee_value']
-        abs_drop = clean_bleu - knee_bleu
-        rel_drop = abs_drop / max(clean_bleu, 0.01) * 100
-
-        # WER at knee
-        wer_k = knees.get(ctype, {}).get('wer')
-        wer_at_knee = wer_k['knee_value'] if wer_k else 'N/A'
-
-        # Dominant failure mode at knee severity
-        cond_at_knee = f'{ctype}_{int(knee_sev * 100):02d}'
-        dom_mode = 'N/A'
-        if cond_at_knee in distributions:
-            dist = distributions[cond_at_knee]
-            dom_mode = max([m for m in dist if m != '_total'], key=lambda m: dist[m], default='N/A')
-
-        lines.append(
-            f"| {ctype} | {knee_sev*100:.0f}% | {knee_bleu:.1f} | {clean_bleu:.1f} | "
-            f"{abs_drop:.1f} | {rel_drop:.1f}% | "
-            f"{wer_at_knee if isinstance(wer_at_knee, str) else f'{wer_at_knee:.1f}'} | "
-            f"{dom_mode} |")
-    return '\n'.join(lines)
-
-
 # Table 3: Rank conditions by average BLEU-4 drop at matched severities
 def table3_severity_ranking(results: dict, severity_levels: list) -> str:
     clean_bleu = results.get('clean', {}).get('metrics', {}).get('bleu4', 0)
@@ -172,8 +172,8 @@ def table3_severity_ranking(results: dict, severity_levels: list) -> str:
         sorted_avgs = sorted(basic_avgs.items(), key=lambda x: x[1], reverse=True)
         worst, best = sorted_avgs[0], sorted_avgs[-1]
         ratio = worst[1] / max(best[1], 0.01)
-        lines.append(f"\n**Key finding:** {worst[0]} is on average {ratio:.1f}x "
-                     f"more damaging than {best[0]} at matched severity levels.")
+        lines.append(f'\n**Key finding:** {worst[0]} is on average {ratio:.1f}x '
+                     f'more damaging than {best[0]} at matched severity levels.')
     return '\n'.join(lines)
 
 
@@ -184,13 +184,10 @@ def export_metrics_csv(results: dict, output_path: str):
         if cond_name == 'meta': continue
         m = cond_data.get('metrics', {})
         row = {
-            'condition': cond_name,
-            'delta_s': cond_data.get('delta_s', 0),
-            'delta_e': cond_data.get('delta_e', 0),
+            'condition': cond_name, 
+            'delta_s': cond_data.get('delta_s', 0), 'delta_e': cond_data.get('delta_e', 0),
             'num_evaluated': cond_data.get('num_evaluated', 0),
-            'wer': m.get('wer', ''), 
-            'bleu4': m.get('bleu4', ''), 
-            'rouge_l': m.get('rouge_l', ''), 
+            'wer': m.get('wer', ''), 'bleu4': m.get('bleu4', ''), 'rouge_l': m.get('rouge_l', ''), 
         }
         rows.append(row)
 
@@ -210,19 +207,19 @@ def generate_all_tables(results_dir: str, output_dir: str):
     bench_results = _load_results(results_dir, 'benchmark.json')
     knee_sevs = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
     bench_sevs = [0.05, 0.10, 0.20]
+    
+    if knee_results:
+        print('▶ Knee point tables...')
+        t1 = table1_knee_points(knee_results, knee_sevs)
+        (output_dir / 'table1_knee_points.md').write_text(t1, encoding='utf-8')
+        export_metrics_csv(knee_results, str(output_dir / 'knee_point_metrics.csv'))
 
     if bench_results:
-        print("Generating benchmark tables...")
-        t1 = table1_executive_summary(bench_results, bench_sevs)
-        (output_dir / 'table1_executive_summary.md').write_text(t1, encoding='utf-8')
+        print('▶ Benchmark tables...')
+        t2 = table2_executive_summary(bench_results, bench_sevs)
+        (output_dir / 'table2_executive_summary.md').write_text(t2, encoding='utf-8')
 
         t3 = table3_severity_ranking(bench_results, bench_sevs)
         (output_dir / 'table3_severity_ranking.md').write_text(t3, encoding='utf-8')
         export_metrics_csv(bench_results, str(output_dir / 'benchmark_metrics.csv'))
-
-    if knee_results:
-        print("Generating knee point tables...")
-        t2 = table2_knee_points(knee_results, knee_sevs)
-        (output_dir / 'table2_knee_points.md').write_text(t2, encoding='utf-8')
-        export_metrics_csv(knee_results, str(output_dir / 'knee_point_metrics.csv'))
-    print(f"All tables saved to {output_dir}")
+    print('✓ All tables saved to', output_dir)

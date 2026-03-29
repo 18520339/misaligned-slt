@@ -1,15 +1,15 @@
-"""Knee point detection using the Kneedle algorithm.
+'''Knee point detection using the Kneedle algorithm.
 
 Identifies the severity level at which degradation accelerates —
 the point beyond which performance drops sharply.
-"""
+'''
 import numpy as np
 from typing import List, Tuple, Optional
 from kneed import KneeLocator
 
 
 def detect_knee_point(severities: List[float], values: List[float], direction: str = 'decreasing') -> Optional[dict]:
-    """Detect the knee point in a degradation curve.
+    '''Detect the knee point in a degradation curve.
 
     Args:
         severities: X-axis values (severity percentages).
@@ -21,7 +21,7 @@ def detect_knee_point(severities: List[float], values: List[float], direction: s
 
     Returns:
         Dict with knee severity, value at knee, and related info, or None.
-    """
+    '''
     if len(severities) < 3: return None
     kl = KneeLocator(severities, values, curve='convex', direction=direction, S=1.0, online=True)
     if kl.knee is None: return _fallback_knee_detection(severities, values, direction)
@@ -54,7 +54,7 @@ def compute_degradation_rate(severities: List[float], values: List[float]) -> fl
 
 
 def detect_all_knee_points(results_json: dict, severity_levels: list) -> dict:
-    """Detect knee points for all basic condition types.
+    '''Detect knee points for all basic condition types.
 
     Args:
         results_json: Full results JSON from evaluator.
@@ -62,7 +62,7 @@ def detect_all_knee_points(results_json: dict, severity_levels: list) -> dict:
 
     Returns:
         Dict mapping condition_type -> {metric -> knee_info}
-    """
+    '''
     basic_types = ['HT', 'TT', 'HC', 'TC']
     knee_results = {}
 

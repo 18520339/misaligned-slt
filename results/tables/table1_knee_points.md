@@ -1,4 +1,4 @@
-# Table 2: Knee Point Summary
+# Table 1: Knee Point Summary
 
 | Condition | Knee Severity | BLEU at Knee | Clean BLEU | Abs Drop | Rel Drop (%) | WER at Knee | Dominant Failure Mode |
 |-----------|--------------|-------------|-----------|---------|-------------|------------|----------------------|

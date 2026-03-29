@@ -1,9 +1,8 @@
-"""Qualitative translation example selection and formatting.
+'''Qualitative translation example selection and formatting.
 
 Selects representative samples showing different failure modes and formats
 them for inclusion in the paper.
-"""
-
+'''
 import json, os
 import numpy as np
 from pathlib import Path
@@ -27,7 +26,7 @@ MODE_ABBREV = {
 }
 
 def select_representative_samples(results_json: dict, n_per_category: int = 2) -> list:
-    """Select representative samples for qualitative analysis.
+    '''Select representative samples for qualitative analysis.
 
     Selection criteria:
         1. 2 samples where HT causes hallucination
@@ -39,7 +38,7 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
 
     Returns:
         List of dicts with sample info and selection reason.
-    """
+    '''
     selections = []
     clean = results_json.get('clean', {})
     clean_ps = clean.get('metrics', {}).get('per_sample', {})
