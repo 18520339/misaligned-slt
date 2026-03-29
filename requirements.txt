@@ -1,7 +1,0 @@
-# Additional dependencies beyond MSKA's own requirements.txt
-# Install MSKA requirements first: pip install -r MSKA/requirements.txt
-kneed>=0.8.0
-evaluate>=0.4.0
-nltk>=3.8
-seaborn>=0.13.0
-pandas>=1.5.0

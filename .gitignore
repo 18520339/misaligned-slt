@@ -1,4 +1,6 @@
 .ignore/
+MSKA/
+bd3lms/
 youtube-sl-25/
 PHOENIX-2014-*/
 *.pyc

@@ -1,9 +1,0 @@
-misalignment_type,knee_severity,bleu_at_knee,bleu_at_clean,relative_drop_pct,n_points_used
-head_trunc,20,21.5,28.87,25.5,5
-head_contam,20,22.19,28.87,23.1,5
-head_trunc_tail_trunc,20,19.26,28.87,33.3,5
-head_trunc_tail_contam,20,19.64,28.87,32.0,5
-head_contam_tail_contam,20,19.75,28.87,31.6,5
-tail_trunc,30,20.73,28.87,28.2,5
-head_contam_tail_trunc,30,17.4,28.87,39.7,5
-tail_contam,40,17.03,28.87,41.0,5
