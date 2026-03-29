@@ -1013,14 +1013,14 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
     Colour = compound pair family; marker = severity combo (sa, sb).
     '''
     if clean_metrics is None: clean_metrics = results.get('clean', {}).get('metrics', {})
-    clean_bleu = clean_metrics.get('bleu4', 0)
     clean_wer  = clean_metrics.get('wer',   0)
+    clean_bleu = clean_metrics.get('bleu4', 0)
     if not clean_bleu: return
 
-    fig, (ax_bleu, ax_wer) = plt.subplots(1, 2, figsize=(15.5, 7))
+    fig, (ax_wer, ax_bleu) = plt.subplots(1, 2, figsize=(15, 7), sharey=True)
     all_sev_combos = {}
-    bleu_data = defaultdict(list)  # pair → [(pred, deviation, a_sev, b_sev, lbl)]
     wer_data  = defaultdict(list)
+    bleu_data = defaultdict(list)  # pair → [(pred, deviation, a_sev, b_sev, lbl)]
 
     for cond_name, cond_data in results.items():
         if '+' not in cond_name or cond_name in ('clean', 'meta'): continue
@@ -1070,7 +1070,16 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
         if i < len(marker_catalog): marker_map[sev_key] = marker_catalog[i]
         else: marker_map[sev_key] = marker_catalog[i % len(marker_catalog)]
 
-    def _draw_deviation_scatter(ax, data_dict, title, xlabel, ylabel):
+    # Share one y-scale so WER/BLEU interaction strength is directly comparable.
+    all_dev_vals = [dev for pts in bleu_data.values() for _, dev, *_ in pts]
+    all_dev_vals += [dev for pts in wer_data.values() for _, dev, *_ in pts]
+    shared_ylim = None
+    if all_dev_vals:
+        y_abs_global = max(abs(v) for v in all_dev_vals)
+        y_span_global = max(1.0, y_abs_global * 1.35)
+        shared_ylim = (-y_span_global, y_span_global - 1.0)
+
+    def _draw_deviation_scatter(ax, data_dict, title, xlabel, ylabel, shared_ylim=None):
         all_preds, all_devs, flat = [], [], []
         for pair, pts in data_dict.items():
             color = COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d')
@@ -1086,6 +1095,7 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
 
         if not all_preds:
             ax.set_title(f'{title}\n(no compound data)')
+            if shared_ylim is not None: ax.set_ylim(*shared_ylim)
             return
 
         # y = 0 horizontal baseline (additive)
@@ -1094,20 +1104,22 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
         ax.axhline(0, color='black', linestyle='--', linewidth=1.6, alpha=0.55, label='Additive baseline')
 
         # Shaded zones
-        y_abs = max(abs(v) for v in all_devs) if all_devs else 1
-        y_span = max(1.0, y_abs * 1.35)
-        ax.fill_between([x_lo - x_margin, x_hi + x_margin], [0, 0], [y_span, y_span],
+        if shared_ylim is not None: y_lo, y_hi = shared_ylim
+        else:
+            y_abs = max(abs(v) for v in all_devs) if all_devs else 1
+            y_span = max(1.0, y_abs * 1.35)
+            y_lo, y_hi = -y_span, y_span
+        ax.fill_between([x_lo - x_margin, x_hi + x_margin], [0, 0], [y_hi, y_hi],
                         alpha=0.07, color='red', label='Superadditive zone\n(worse than expected)')
-        ax.fill_between([x_lo - x_margin, x_hi + x_margin], [-y_span, -y_span], [0, 0],
+        ax.fill_between([x_lo - x_margin, x_hi + x_margin], [y_lo, y_lo], [0, 0],
                         alpha=0.07, color='green', label='Subadditive zone\n(milder than expected)')
 
         n_super = sum(1 for d in all_devs if d > 0.5)
         n_sub   = sum(1 for d in all_devs if d < -0.5)
         n_add   = len(all_devs) - n_super - n_sub
         ax.text(
-            0.03, 0.97, f'Superadditive: {n_super}\n≈ Additive: {n_add}\nSubadditive: {n_sub}',
-            transform=ax.transAxes, fontsize=9, va='top',
-            bbox=dict(boxstyle='round,pad=0.4', fc='white', alpha=0.85)
+            0.03, 0.97, f'Superadditive (> 0.5): {n_super}\n≈ Additive (0.5 to -0.5): {n_add}\nSubadditive (< -0.5): {n_sub}',
+            transform=ax.transAxes, fontsize=9, va='top', bbox=dict(boxstyle='round,pad=0.4', fc='white', alpha=0.85)
         )
         if flat: # Label only the strongest interactions to reduce clutter.
             top_idx = np.argsort(np.abs(np.array(all_devs)))[-3:]
@@ -1118,22 +1130,24 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
                     color=COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d'), alpha=0.9
                 )
         ax.set_xlim(x_lo - x_margin, x_hi + x_margin)
-        ax.set_ylim(-y_span, y_span)
+        ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel(xlabel, fontsize=10)
         ax.set_ylabel(ylabel, fontsize=10)
         ax.set_title(title, fontsize=11, fontweight='bold')
         ax.legend(loc='lower left', fontsize=8.8, ncol=2, framealpha=0.9)
 
     _draw_deviation_scatter(
-        ax_bleu, bleu_data, 'BLEU-4: Deviation from Additivity',
-        'Predicted additive BLEU drop (pp)\n= drop_A + drop_B',
-        'Deviation (actual − predicted)  pp\n> 0 = superadditive  |  < 0 = subadditive')
-
-    _draw_deviation_scatter(
         ax_wer, wer_data, 'WER: Deviation from Additivity',
         'Predicted additive WER increase (pp)\n= inc_A + inc_B',
-        'Deviation (actual − predicted)  pp\n> 0 = superadditive  |  < 0 = subadditive')
-
+        'Deviation (actual − predicted)  pp\n> 0 = superadditive  |  < 0 = subadditive',
+        shared_ylim=shared_ylim
+    )
+    _draw_deviation_scatter(
+        ax_bleu, bleu_data, 'BLEU-4: Deviation from Additivity',
+        'Predicted additive BLEU drop (pp)\n= drop_A + drop_B',
+        'Deviation (actual − predicted)  pp\n> 0 = superadditive  |  < 0 = subadditive',
+        shared_ylim=shared_ylim
+    )
     # Explicit marker-shape legend: shape maps severity combination (a%, b%).
     shape_handles = []
     for sev_key in unique_pairs:
@@ -1163,11 +1177,11 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
         • 1 row per compound pair (mean across all sa/sb combos for that pair) — typically 4-6 rows, marked with diagonal hatching.
 
     Three-metric encoding:
+        ▲  WER increase  (pp, red dots, separate top axis)
         ▬  BLEU-4 drop   (pp, colored bar, bottom axis)
         ◆  ROUGE-L drop  (pp, dark dots, same bottom axis)
-        ▲  WER increase  (pp, red dots, separate top axis)
 
-    Uses absolute pp so BLEU and WER share a common scale. WER on a
+    Uses absolute pp so WER and BLEU share a common scale. WER on a
     separate top axis because its absolute range differs from BLEU/ROUGE.
     '''
     if clean_metrics is None: clean_metrics = results.get('clean', {}).get('metrics', {})
@@ -1309,15 +1323,12 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
 
 
 # Figure 11: Output Length Ratio
-def fig11_output_length_ratio(results, severity_levels, output_dir, compound_results=None):
+def fig11_output_length_ratio(results, severity_levels, output_dir):
     '''Mean output/reference length ratio per condition.
 
     Solid lines = single-noise basic conditions.
-    Dashed lines = two-noise compound conditions grouped by pair, with x as
-    combined severity (sum of both component severities).
     Ratio = 1.0 is ideal; ratio < 1 = under-generation; ratio > 1 = over-generation.
     '''
-    if compound_results is None: compound_results = results
     fig, ax = plt.subplots(figsize=(11, 6))
     sevs_pct = [s * 100 for s in severity_levels]
 
@@ -1336,27 +1347,6 @@ def fig11_output_length_ratio(results, severity_levels, output_dir, compound_res
             marker=CONDITION_MARKERS[ctype], label=CONDITION_LABELS[ctype]
         )
 
-    # Compound means (from compound_results, typically benchmark)
-    for pair in sorted(_extract_compound_mean_curves(compound_results, 'bleu4').keys()):
-        grouped = defaultdict(list)
-        for cond_name, cond_data in compound_results.items():
-            if '+' not in cond_name or cond_name in ('clean', 'meta'): continue
-            p = _parse_compound_name(cond_name)
-            if p is None or _canonical_pair(p[0], p[2]) != pair: continue
-            ps = cond_data.get('metrics', {}).get('per_sample', {})
-            if ps:
-                total = round(p[1] + p[3], 4)
-                grouped[total].append(np.mean([v['output_length_ratio'] for v in ps.values()]))
-                
-        if grouped:
-            items = sorted(grouped.items())
-            color = COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d')
-            ax.plot(
-                [x * 100 for x, _ in items], [float(np.mean(v)) for _, v in items], 
-                '--', color=color, linewidth=1.5, alpha=0.65,
-                label=f'[cpd] {COMPOUND_PAIR_LABELS.get(pair, pair)} mean'
-            )
-
     # Clean baseline
     clean_ps = results.get('clean', {}).get('metrics', {}).get('per_sample', {})
     if clean_ps:
@@ -1365,7 +1355,7 @@ def fig11_output_length_ratio(results, severity_levels, output_dir, compound_res
 
     ax.axhline(1.0, color='black', linestyle=':', linewidth=1.0, alpha=0.4)
     ax.text(sevs_pct[-1] * 0.02, 1.01, 'ideal (1.0)', fontsize=10, color='gray')
-    ax.set_xlabel('Severity (%) [for compound curves: combined severity = s1 + s2]')
+    ax.set_xlabel('Severity (%)')
     ax.set_ylabel('Mean Output / Reference Length Ratio')
     ax.set_title('Output Length Distortion Under Temporal Misalignment\n< 1.0 = under-generation;  > 1.0 = over-generation')
     ax.legend(ncol=2, fontsize=10, loc='best')
@@ -1374,15 +1364,12 @@ def fig11_output_length_ratio(results, severity_levels, output_dir, compound_res
 
 
 # Figure 12: CTC Recognition Confidence
-def fig12_ctc_confidence(results, severity_levels, output_dir, compound_results=None):
+def fig12_ctc_confidence(results, severity_levels, output_dir):
     '''Mean CTC confidence per condition.
 
     Solid lines = single-noise basic conditions.
-    Dashed lines = two-noise compound conditions grouped by pair, with x as
-    combined severity (sum of both component severities).
     Confidence drop foreshadows recognition collapse before BLEU fully degrades.
     '''
-    if compound_results is None: compound_results = results
     fig, ax = plt.subplots(figsize=(11, 6))
     sevs_pct  = [s * 100 for s in severity_levels]
     has_data  = False
@@ -1403,27 +1390,6 @@ def fig12_ctc_confidence(results, severity_levels, output_dir, compound_results=
             marker=CONDITION_MARKERS[ctype], label=CONDITION_LABELS[ctype],
         )
 
-    # Compound means (from compound_results, typically benchmark)
-    for pair in sorted(_extract_compound_mean_curves(compound_results, 'bleu4').keys()):
-        grouped = defaultdict(list)
-        for cond_name, cond_data in compound_results.items():
-            if '+' not in cond_name or cond_name in ('clean', 'meta'): continue
-            p = _parse_compound_name(cond_name)
-            if p is None or _canonical_pair(p[0], p[2]) != pair: continue
-            preds = cond_data.get('predictions', {})
-            cc = [v['mean_ctc_confidence'] for v in preds.values() if v.get('mean_ctc_confidence') is not None]
-            if cc:
-                total = round(p[1] + p[3], 4)
-                grouped[total].append(float(np.mean(cc)))
-                has_data = True
-        if grouped:
-            items = sorted(grouped.items())
-            color = COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d')
-            ax.plot([x * 100 for x, _ in items],
-                    [float(np.mean(v)) for _, v in items],
-                    '--', color=color, linewidth=1.5, alpha=0.65,
-                    label=f'[cpd] {COMPOUND_PAIR_LABELS.get(pair, pair)} mean')
-
     if not has_data:
         plt.close(fig)
         return
@@ -1435,7 +1401,7 @@ def fig12_ctc_confidence(results, severity_levels, output_dir, compound_results=
         cl_mean = float(np.mean(clean_cc))
         ax.axhline(cl_mean, color='gray', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Clean ({cl_mean:.3f})')
 
-    ax.set_xlabel('Severity (%) [for compound curves: combined severity = s1 + s2]')
+    ax.set_xlabel('Severity (%)')
     ax.set_ylabel('Mean CTC Frame Confidence')
     ax.set_title('CTC Recognition Confidence Under Temporal Misalignment\n'
                  '(early confidence drop = recognition bottleneck; dashed = compound)')
@@ -1478,14 +1444,8 @@ def generate_all_figures(results_dir: str, output_dir: str):
         fig06_transition_matrices(knee_results, knee_sevs, output_dir)
         fig07_length_vs_bleu_drop(knee_results, knee_sevs, output_dir)
         fig08_vulnerability_profile(knee_results, knee_sevs, output_dir)
-        fig11_output_length_ratio(
-            knee_results, knee_sevs, output_dir, 
-            compound_results=benchmark_results if benchmark_results is not None else knee_results
-        )
-        fig12_ctc_confidence(
-            knee_results, knee_sevs, output_dir, 
-            compound_results=benchmark_results if benchmark_results is not None else knee_results
-        )
+        fig11_output_length_ratio(knee_results, knee_sevs, output_dir)
+        fig12_ctc_confidence(knee_results, knee_sevs, output_dir)
 
     # ── Benchmark figures (all 49 conditions; compound interactions) ──────────
     if bench_path.exists():
@@ -1496,11 +1456,6 @@ def generate_all_figures(results_dir: str, output_dir: str):
         cm = benchmark_results.get('clean', {}).get('metrics', {})
         fig09_interaction_scatter(benchmark_results, output_dir, clean_metrics=cm)
         fig10_sensitivity_ranking(benchmark_results, output_dir, clean_metrics=cm)
-
-        # Re-render fig11/12 so compound overlays are included from benchmark.
-        if knee_path.exists():
-            fig11_output_length_ratio(knee_results, knee_sevs, output_dir, compound_results=benchmark_results)
-            fig12_ctc_confidence(knee_results, knee_sevs, output_dir, compound_results=benchmark_results)
 
     # ── Fig 5: basic panels from knee (10 levels) + compound from bench ───────
     # Deferred here so benchmark_results is always defined before use.
