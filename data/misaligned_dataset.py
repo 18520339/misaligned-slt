@@ -10,7 +10,7 @@ import torch
 # Add MSKA to path
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
-from mska_datasets import S2T_Dataset
+from datasets import S2T_Dataset
 from data.misalign import apply_misalignment
 
 

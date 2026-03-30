@@ -20,6 +20,17 @@ from phoenix_cleanup import clean_phoenix_2014_trans
 from utils import MetricLogger
 
 
+def _select_primary_gls_hyp(sample_row: dict) -> str:
+    # Select the canonical gloss hypothesis used in exported predictions.'''
+    if sample_row.get('ensemble_last_gls_hyp'): return sample_row['ensemble_last_gls_hyp']
+    if sample_row.get('fuse_gls_hyp'): return sample_row['fuse_gls_hyp']
+
+    # Fallback for other recognition-head outputs.
+    gls_keys = sorted(k for k in sample_row if 'gls_hyp' in k and sample_row.get(k))
+    if gls_keys: return sample_row.get(gls_keys[0], '')
+    return ''
+
+
 def compute_metrics(results: dict, config: dict) -> dict:
     '''Compute corpus-level and per-sample metrics from collected predictions.
 
@@ -95,7 +106,17 @@ def compute_metrics(results: dict, config: dict) -> dict:
         ref_tokens = ref.split() if ref else ['']
 
         s_bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smooth) * 100
-        sent_wer_res = wer_single(r=ref, h=hyp)
+        gls_hyp = _select_primary_gls_hyp(results[n])
+        gls_ref = results[n].get('gls_ref', '')
+        if dataset_name == 'phoenix-2014t':
+            gls_hyp = clean_phoenix_2014_trans(gls_hyp)
+            gls_ref = clean_phoenix_2014_trans(gls_ref)
+
+        # sentence_wer is gloss-level WER to match gls_hyp/gls_ref inspection.
+        if gls_ref or gls_hyp:
+            sent_wer_res = wer_single(r=gls_ref, h=gls_hyp)
+        else:
+            sent_wer_res = wer_single(r=ref, h=hyp)
         sent_wer = (sent_wer_res['num_err'] / max(sent_wer_res['num_ref'], 1)) * 100
         ref_set = set(ref_tokens)
         novel_tokens = [t for t in hyp_tokens if t not in ref_set]
@@ -158,19 +179,16 @@ def run_evaluation(
 
     all_results = OrderedDict()
     all_results['meta'] = {
-        'num_samples': len(dataset),
-        'num_conditions': len(conditions),
-        'beam_size': beam_size,
-        'generate_cfg': generate_cfg,
+        'num_samples': len(dataset), 'num_conditions': len(conditions),
+        'beam_size': beam_size, 'generate_cfg': generate_cfg,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
     }
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for cond_name, delta_s, delta_e in conditions:
-        # Set misalignment condition on dataset
+    for cond_name, delta_s, delta_e in tqdm(conditions):
         t_start = time.time()
-        dataset.set_condition(cond_name, delta_s, delta_e)
+        dataset.set_condition(cond_name, delta_s, delta_e) # Set misalignment condition on dataset
         loader = DataLoader(
             dataset, batch_size=batch_size,
             num_workers=num_workers, collate_fn=dataset.collate_fn,
@@ -181,7 +199,7 @@ def run_evaluation(
             skipped_names.add(dataset.list[idx])
 
         sample_results = OrderedDict()
-        for src_input in metric_logger.log_every(loader, 10, f'{cond_name}'):
+        for src_input in metric_logger.log_every(loader, 1, f'{cond_name}'):
             output = model(src_input)
             batch_names = src_input['name']
 
@@ -234,7 +252,7 @@ def run_evaluation(
         for n, v in sample_results.items():
             merged_entry = {
                 'txt_hyp': v.get('txt_hyp', ''), 'txt_ref': v.get('txt_ref', ''),
-                'gls_hyp': v.get('ensemble_last_gls_hyp', v.get('fuse_gls_hyp', '')), 'gls_ref': v.get('gls_ref', ''),
+                'gls_hyp': _select_primary_gls_hyp(v), 'gls_ref': v.get('gls_ref', ''),
                 'mean_ctc_confidence': v.get('mean_ctc_confidence', None),
             }
             merged_entry.update(per_sample_metrics.get(n, {}))
@@ -250,8 +268,8 @@ def run_evaluation(
         with open(output_path, 'w', encoding='utf-8') as f: # Save incrementally
             json.dump(all_results, f, indent=2, ensure_ascii=False)
 
-        print(f"{cond_name}: WER={metrics.get('wer', 0):.2f}\tBLEU-4={metrics.get('bleu4', 0):.2f}\t"
-              f"ROUGE-L={metrics.get('rouge_l', 0):.2f}\t({elapsed:.1f}s, {len(eval_results)} samples)")
+        print(f"{cond_name}: WER={metrics.get('wer', 0):.2f}; BLEU-4={metrics.get('bleu4', 0):.2f}; "
+              f"ROUGE-L={metrics.get('rouge_l', 0):.2f} ({elapsed:.1f}s, {len(eval_results)} samples)\n")
     return all_results
 
 
@@ -261,7 +279,6 @@ def verify_clean_baseline(
 ): # Run clean evaluation and verify against MSKA's reported numbers
     output_path = os.path.join(output_dir, 'raw', 'verify_clean.json')
     conditions = [('clean', 0.0, 0.0)]
-
     results = run_evaluation(
         model, dataset, conditions, config, output_path,
         batch_size=batch_size, num_workers=num_workers, beam_size=beam_size, 
@@ -269,10 +286,7 @@ def verify_clean_baseline(
     )
     metrics = results['clean']['metrics']
     
-    print(f"\n=== Clean Baseline Verification ===")
-    print(f"\tWER:\t{metrics.get('wer', 'N/A'):.2f}%")
-    print(f"\tBLEU-4:\t{metrics.get('bleu4', 'N/A'):.2f}")
-    print(f"\tROUGE-L:\t{metrics.get('rouge_l', 'N/A'):.2f}")
+    print("=== Clean Baseline Verification ===")
     if expected:
         tol = expected.get('tolerance', 2.0)
         checks = []
@@ -281,9 +295,9 @@ def verify_clean_baseline(
                 diff = abs(metrics[metric_name] - expected[metric_name])
                 ok = diff <= tol
                 status = 'OK' if ok else 'MISMATCH'
-                print(f"\t{metric_name}: expected {expected[metric_name]:.2f}, "
-                      f"got {metrics[metric_name]:.2f}, diff={diff:.2f} [{status}]")
+                print(f'{metric_name}: expected {expected[metric_name]:.2f}, '
+                      f'got {metrics[metric_name]:.2f}, diff={diff:.2f} [{status}]')
                 checks.append(ok)
-        if all(checks): print('\n\tVerification PASSED - metrics match MSKA paper within tolerance.')
-        else: print('\n\tWARNING: Some metrics differ from expected values.')
+        if all(checks): print('\nVerification PASSED - metrics match MSKA paper within tolerance.')
+        else: print('WARNING: Some metrics differ from expected values.')
     return results

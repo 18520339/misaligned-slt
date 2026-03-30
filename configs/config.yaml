@@ -54,5 +54,5 @@ evaluation:
 expected_clean:
     wer: 19.8
     bleu4: 29.03
-    rouge: 53.54
+    rouge_l: 53.54
     tolerance: 2.0 # acceptable deviation from reported numbers
