@@ -46,9 +46,12 @@ class MisalignedDataset(S2T_Dataset):
 
     def _check_sample_ordering(self): # Log whether samples appear to be sequentially ordered
         if len(self.list) < 3: return
-        names = [self.raw_data[k].get('name', k) for k in self.list[:10]]
-        print(f'Sample ordering check (first 10 names): {names} Note: If samples are from different '
-            "video sessions, contamination still provides meaningful 'irrelevant sign content'.")
+        names = self.list[:10]
+        print('\nSample ordering check (first 10 names):')
+        for i, n in enumerate(names): print(f'  [{i}] {n}')
+        print(f'  ... ({len(self.list)} total)')
+        print('If names share a video-session prefix and are sequential,')
+        print('contamination frames come from the same continuous stream.\n')
 
     def set_condition(self, name: str, delta_s: float, delta_e: float): # Set the current misalignment condition
         self._condition_name = name
