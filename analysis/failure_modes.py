@@ -24,14 +24,14 @@ FAILURE_COLORS = {
 def classify_failure_mode(
     sentence_bleu: float, novel_token_rate: float,
     output_length_ratio: float, has_repetition: bool,
-) -> str:# Classify a single prediction into a failure mode
-    if sentence_bleu >= 0.4: return 'Acceptable'
+) -> str: # Classify a single prediction into a failure mode
+    if sentence_bleu >= 40: return 'Acceptable'
     if has_repetition: return 'Repetition'
-    if novel_token_rate > 0.5 and sentence_bleu < 0.2: return 'Hallucination'
-    if output_length_ratio < 0.5 and sentence_bleu < 0.4: return 'Under-generation'
-    if 0.1 <= sentence_bleu < 0.4 and 0.5 <= output_length_ratio <= 1.5: return 'Partial match'
-    if sentence_bleu < 0.1: return 'Incoherent'
-    return 'Partial match'  # fallback for edge cases
+    if sentence_bleu < 20 and novel_token_rate > 0.5 : return 'Hallucination'
+    if sentence_bleu < 40 and output_length_ratio < 0.5: return 'Under-generation'
+    if 10 <= sentence_bleu < 40 and 0.5 <= output_length_ratio <= 1.5: return 'Partial match'
+    if sentence_bleu < 10: return 'Incoherent'
+    return 'Partial match'  # Fallback for edge cases
 
 
 def classify_all_predictions(results_json: dict) -> dict:

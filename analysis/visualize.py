@@ -962,7 +962,7 @@ def fig08_vulnerability_profile(results, severity_levels, output_dir):
                 if name in ps:
                     xs.append(sev)
                     ys.append(ps[name]['sentence_bleu'])
-            if len(xs) >= 3: sample_rates.append(compute_degradation_rate(xs, ys))
+            if len(xs) >= 3: sample_rates.append(compute_degradation_rate(xs, ys) / 100)
 
         if not sample_rates: continue
         rates = np.array(sample_rates, dtype=float)

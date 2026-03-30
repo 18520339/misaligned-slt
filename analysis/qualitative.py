@@ -53,7 +53,7 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
         cond = f'HT_{sev:02d}'
         samples = get_samples(cond)
         for name, m in samples.items():
-            if m.get('novel_token_rate', 0) > 0.5 and m.get('sentence_bleu', 0) < 0.2:
+            if m.get('novel_token_rate', 0) > 0.5 and m.get('sentence_bleu', 0) < 2:
                 clean_bleu = clean_samples.get(name, {}).get('sentence_bleu', 0)
                 if clean_bleu > 0.3:  # was decent originally
                     ht_hall.append((name, cond, clean_bleu, m.get('sentence_bleu', 0)))
@@ -70,7 +70,7 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
         cond = f'TT_{sev:02d}'
         samples = get_samples(cond)
         for name, m in samples.items():
-            if m.get('output_length_ratio', 1) < 0.5 and m.get('sentence_bleu', 0) < 0.4:
+            if m.get('output_length_ratio', 1) < 0.5 and m.get('sentence_bleu', 0) < 4:
                 clean_bleu = clean_samples.get(name, {}).get('sentence_bleu', 0)
                 if clean_bleu > 0.3:
                     tt_under.append((name, cond, clean_bleu, m.get('output_length_ratio', 1)))
@@ -116,7 +116,7 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     for ctype in ['HT', 'TT']:
         cond = f'{ctype}_30'
         samples = get_samples(cond)
-        robust = [(n, m.get('sentence_bleu', 0)) for n, m in samples.items() if m.get('sentence_bleu', 0) > 0.3]
+        robust = [(n, m.get('sentence_bleu', 0)) for n, m in samples.items() if m.get('sentence_bleu', 0) > 3]
         robust.sort(key=lambda x: x[1], reverse=True)
         if robust and not any(s['category'] == 'robust' for s in selections):
             selections.append({
@@ -128,8 +128,8 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     for cond in compound_conds[:5]:
         samples = get_samples(cond)
         for name, m in samples.items():
-            if m.get('sentence_bleu', 0) < 0.15 and name in clean_samples:
-                if clean_samples[name].get('sentence_bleu', 0) > 0.4:
+            if m.get('sentence_bleu', 0) < 1.5 and name in clean_samples:
+                if clean_samples[name].get('sentence_bleu', 0) > 4:
                     if not any(s['category'] == 'compound' for s in selections):
                         selections.append({
                             'name': name, 'reason': f'Compound degradation ({cond})',
@@ -151,10 +151,9 @@ def format_example_table(sample_name: str, results_json: dict, conditions_to_sho
                 conditions_to_show.append(f'{ctype}_{sev:02d}')
 
     lines = [
-        f"### Sample: {sample_name}",
-        f"**Reference:** {ref_text}",
-        f"**Reference Gloss:** {ref_gloss}",
-        "",
+        f"### Sample: {sample_name}\n",
+        f"**Reference:** {ref_text}\n",
+        f"**Reference Gloss:** {ref_gloss}\n",
         "| Condition | Gloss Prediction | Translation | sBLEU | Mode |",
         "|-----------|------------------|-------------|-------|------|",
     ]
@@ -199,7 +198,7 @@ def generate_qualitative_report(results_dir: str, output_dir: str):
 
     report_lines = ["# Qualitative Translation Examples\n"]
     for sel in selections:
-        report_lines.append(f"\n---\n**Category:** {sel['category']} | **Reason:** {sel['reason']}\n")
+        report_lines.append(f"---\n**Category:** {sel['category']} | **Reason:** {sel['reason']}\n")
 
         # Show relevant conditions for this sample
         conds = ['clean']
