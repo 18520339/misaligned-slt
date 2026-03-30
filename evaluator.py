@@ -13,19 +13,10 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
 
-from metrics import wer_list, bleu, rouge
+from metrics import wer_single, wer_list, bleu, rouge
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from phoenix_cleanup import clean_phoenix_2014_trans
 from data.misalign import generate_conditions, parse_condition_name
-
-try: # Sacrebleu sentence-level BLEU (for failure-mode classification)
-    import sacrebleu as _sb
-    def sentence_bleu(hyp: str, ref: str) -> float:
-        return _sb.sentence_bleu(hyp, [ref], smooth_method='exp').score / 100.0
-except ImportError: # Fall back to MSKA's bundled sacrebleu
-    from metrics import sacrebleu as _sb
-    def sentence_bleu(hyp: str, ref: str) -> float:
-        score = _sb.raw_corpus_bleu(sys_stream=[hyp], ref_streams=[[ref]]).scores
-        return score[3] / 100.0 if len(score) >= 4 else 0.0
 
 
 def compute_metrics(results: dict, config: dict) -> dict:
@@ -96,12 +87,15 @@ def compute_metrics(results: dict, config: dict) -> dict:
 
     # Per-sample metrics
     per_sample = {}
+    smooth = SmoothingFunction().method1
     for n in names:
         hyp, ref = results[n]['txt_hyp'], results[n]['txt_ref']
         hyp_tokens = hyp.split() if hyp else []
         ref_tokens = ref.split() if ref else ['']
 
-        s_bleu = sentence_bleu(hyp, ref)
+        s_bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smooth) * 100
+        sent_wer_res = wer_single(r=ref, h=hyp)
+        sent_wer = (sent_wer_res['num_err'] / max(sent_wer_res['num_ref'], 1)) * 100
         ref_set = set(ref_tokens)
         novel_tokens = [t for t in hyp_tokens if t not in ref_set]
         novel_rate = len(novel_tokens) / max(len(hyp_tokens), 1)
@@ -116,12 +110,9 @@ def compute_metrics(results: dict, config: dict) -> dict:
                     break
 
         per_sample[n] = {
-            'sentence_bleu': s_bleu,
-            'novel_token_rate': novel_rate,
-            'output_length_ratio': len_ratio,
-            'has_repetition': has_repetition,
-            'hyp_length': len(hyp_tokens),
-            'ref_length': len(ref_tokens),
+            'sentence_bleu': s_bleu, 'sentence_wer': sent_wer,
+            'novel_token_rate': novel_rate, 'output_length_ratio': len_ratio,
+            'has_repetition': has_repetition, 'hyp_length': len(hyp_tokens), 'ref_length': len(ref_tokens),
         }
     metrics['per_sample'] = per_sample
     return metrics
@@ -234,23 +225,28 @@ def run_evaluation(
         # --- Compute metrics for this condition ---
         # Filter out skipped samples
         metrics = {}
+        per_sample_metrics = {}
         eval_results = {k: v for k, v in sample_results.items() if k not in skipped_names and 'txt_hyp' in v}
         if eval_results:
             metrics = compute_metrics(eval_results, config)
-            metrics.update(extras)
+            per_sample_metrics = metrics.pop('per_sample', {})
+
+        merged_predictions = OrderedDict()
+        for n, v in sample_results.items():
+            merged_entry = {
+                'txt_hyp': v.get('txt_hyp', ''), 'txt_ref': v.get('txt_ref', ''),
+                'gls_hyp': v.get('ensemble_last_gls_hyp', v.get('fuse_gls_hyp', '')), 'gls_ref': v.get('gls_ref', ''),
+                'mean_ctc_confidence': v.get('mean_ctc_confidence', None),
+            }
+            merged_entry.update(per_sample_metrics.get(n, {}))
+            merged_predictions[n] = merged_entry
 
         elapsed = time.time() - t_start
         all_results[cond_name] = {
             'delta_s': delta_s, 'delta_e': delta_e,
             'num_evaluated': len(eval_results), 'num_skipped': len(skipped_names),
             'elapsed_seconds': round(elapsed, 1), 'metrics': metrics,
-            'predictions': {n: {
-                'txt_hyp': v.get('txt_hyp', ''),
-                'txt_ref': v.get('txt_ref', ''),
-                'gls_hyp': v.get('ensemble_last_gls_hyp', v.get('fuse_gls_hyp', '')),
-                'gls_ref': v.get('gls_ref', ''),
-                'mean_ctc_confidence': v.get('mean_ctc_confidence', None),
-            } for n, v in sample_results.items()},
+            'predictions': merged_predictions,
         }
         with open(output_path, 'w', encoding='utf-8') as f: # Save incrementally
             json.dump(all_results, f, indent=2, ensure_ascii=False)
@@ -275,7 +271,7 @@ def verify_clean_baseline(
     metrics = results['clean']['metrics']
     
     print(f"\n=== Clean Baseline Verification ===")
-    print(f"\tWER:\t{metrics.get('wer', 'N/A'):.2f}%')
+    print(f"\tWER:\t{metrics.get('wer', 'N/A'):.2f}%")
     print(f"\tBLEU-4:\t{metrics.get('bleu4', 'N/A'):.2f}")
     print(f"\tROUGE-L:\t{metrics.get('rouge_l', 'N/A'):.2f}")
     if expected:
