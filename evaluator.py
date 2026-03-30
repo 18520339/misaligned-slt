@@ -13,10 +13,11 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
 
-from metrics import wer_single, wer_list, bleu, rouge
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from phoenix_cleanup import clean_phoenix_2014_trans
 from data.misalign import generate_conditions, parse_condition_name
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from metrics import wer_single, wer_list, bleu, rouge
+from phoenix_cleanup import clean_phoenix_2014_trans
+from utils import MetricLogger
 
 
 def compute_metrics(results: dict, config: dict) -> dict:
@@ -150,6 +151,7 @@ def run_evaluation(
     })
 
     model.eval()
+    metric_logger = MetricLogger(delimiter='  ')
     tokenizer = model.gloss_tokenizer
     do_recognition = config.get('do_recognition', True)
     do_translation = config.get('do_translation', True)
@@ -165,12 +167,9 @@ def run_evaluation(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pbar_cond = tqdm(conditions, desc='Conditions', position=0)
-    for cond_name, delta_s, delta_e in pbar_cond:
-        pbar_cond.set_description(f'Condition: {cond_name}')
-        t_start = time.time()
-
+    for cond_name, delta_s, delta_e in conditions:
         # Set misalignment condition on dataset
+        t_start = time.time()
         dataset.set_condition(cond_name, delta_s, delta_e)
         loader = DataLoader(
             dataset, batch_size=batch_size,
@@ -182,7 +181,7 @@ def run_evaluation(
             skipped_names.add(dataset.list[idx])
 
         sample_results = OrderedDict()
-        for src_input in tqdm(loader, desc=f'\t{cond_name}', position=1, leave=False):
+        for src_input in metric_logger.log_every(loader, 10, f'{cond_name}'):
             output = model(src_input)
             batch_names = src_input['name']
 

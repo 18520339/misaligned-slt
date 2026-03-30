@@ -9,16 +9,17 @@ Usage:
     python run.py --mode qualitative   # Select samples and generate example tables
     python run.py --mode all           # Everything in sequence
 '''
-from pathlib import Path
 import os, sys, time, json, random, argparse
 import numpy as np
 import torch
 import yaml
 
+from pathlib import Path
+from transformers import logging
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MSKA_DIR = os.path.join(PROJECT_ROOT, 'MSKA')
 sys.path.insert(0, MSKA_DIR)
-
+logging.set_verbosity_error()
 
 def load_configs(args): # Load project config and MSKA config
     with open(args.config, 'r', encoding='utf-8') as f:
@@ -67,7 +68,7 @@ def load_model(mska_cfg, proj_cfg, device):
 
 def create_dataset(path, mska_cfg, phase, subsample_indices=None, proj_cfg=None):
     from Tokenizer import GlossTokenizer_S2G
-    from misaligned_dataset import MisalignedDataset
+    from data.misaligned_dataset import MisalignedDataset
     
     prev_cwd = os.getcwd()
     os.chdir(MSKA_DIR)
@@ -83,7 +84,7 @@ def create_dataset(path, mska_cfg, phase, subsample_indices=None, proj_cfg=None)
             subsample_indices=subsample_indices,
         )
     finally: os.chdir(prev_cwd)
-    print(f'Dataset loaded: {dataset} (phase={phase})')
+    print(f'{dataset} (phase={phase})')
     return dataset
 
 
