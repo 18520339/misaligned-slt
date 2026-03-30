@@ -46,15 +46,16 @@ def classify_all_predictions(results_json: dict) -> dict:
     classifications = {}
     for cond_name, cond_data in results_json.items():
         if cond_name == 'meta': continue
-        metrics = cond_data.get('metrics', {})
-        per_sample = metrics.get('per_sample', {})
         cond_class = {}
+        per_sample = cond_data.get('predictions', {})
+        if not isinstance(per_sample, dict): per_sample = {}
+        
         for sample_name, sm in per_sample.items():
             mode = classify_failure_mode(
-                sentence_bleu=sm['sentence_bleu'],
-                novel_token_rate=sm['novel_token_rate'],
-                output_length_ratio=sm['output_length_ratio'],
-                has_repetition=sm['has_repetition'],
+                sentence_bleu=sm.get('sentence_bleu', 0),
+                novel_token_rate=sm.get('novel_token_rate', 0),
+                output_length_ratio=sm.get('output_length_ratio', 1),
+                has_repetition=sm.get('has_repetition', False),
             )
             cond_class[sample_name] = mode
         classifications[cond_name] = cond_class

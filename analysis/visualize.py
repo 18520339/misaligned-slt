@@ -131,6 +131,11 @@ def _extract_compound_mean_curves(results, metric='bleu4'):
     return curves # {pair_key: {'totals_pct': [...], 'means': [...]}}
 
 
+def _get_condition_samples(results, cond_name):
+    samples = results.get(cond_name, {}).get('predictions', {})
+    return samples if isinstance(samples, dict) else {}
+
+
 # Figure 1: BLEU-4 Degradation — basic conditions + compound mean bands
 def fig01_bleu_degradation(results, severity_levels, output_dir, clean_bleu=None):
     '''BLEU-4 degradation curves.
@@ -875,7 +880,7 @@ def fig07_length_vs_bleu_drop(results, severity_levels, output_dir, target_sever
 
     Multiple severity levels overlaid with alpha encoding so severity trend is visible within each panel.
     '''
-    clean_ps = results.get('clean', {}).get('metrics', {}).get('per_sample', {})
+    clean_ps = _get_condition_samples(results, 'clean')
     if not clean_ps: return
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -890,7 +895,7 @@ def fig07_length_vs_bleu_drop(results, severity_levels, output_dir, target_sever
         corr_rows = []
         for sev, sev_color in zip(sev_show, sev_colors):
             cond = f'{ctype}_{int(sev * 100):02d}'
-            mis_ps = results.get(cond, {}).get('metrics', {}).get('per_sample', {})
+            mis_ps = _get_condition_samples(results, cond)
             if not mis_ps: continue
             
             lengths, drops = [], []
@@ -942,7 +947,7 @@ def fig08_vulnerability_profile(results, severity_levels, output_dir):
     x-axis = BLEU slope (more negative = more vulnerable).
     The plot is optimized for quick audience takeaway: vulnerable share, robust share, center tendency, and spread.
     '''
-    clean_ps = results.get('clean', {}).get('metrics', {}).get('per_sample', {})
+    clean_ps = _get_condition_samples(results, 'clean')
     if not clean_ps: return
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -953,7 +958,7 @@ def fig08_vulnerability_profile(results, severity_levels, output_dir):
             xs, ys = [], []
             for sev in severity_levels:
                 cond = f'{ctype}_{int(sev * 100):02d}'
-                ps   = results.get(cond, {}).get('metrics', {}).get('per_sample', {})
+                ps   = _get_condition_samples(results, cond)
                 if name in ps:
                     xs.append(sev)
                     ys.append(ps[name]['sentence_bleu'])
@@ -1337,7 +1342,7 @@ def fig11_output_length_ratio(results, severity_levels, output_dir):
         ratios, xs = [], []
         for sev, sev_pct in zip(severity_levels, sevs_pct):
             cond = f'{ctype}_{int(sev * 100):02d}'
-            ps = results.get(cond, {}).get('metrics', {}).get('per_sample', {})
+            ps = _get_condition_samples(results, cond)
             if ps:
                 r = np.mean([v['output_length_ratio'] for v in ps.values()])
                 ratios.append(r)
@@ -1348,7 +1353,7 @@ def fig11_output_length_ratio(results, severity_levels, output_dir):
         )
 
     # Clean baseline
-    clean_ps = results.get('clean', {}).get('metrics', {}).get('per_sample', {})
+    clean_ps = _get_condition_samples(results, 'clean')
     if clean_ps:
         clean_ratio = np.mean([v['output_length_ratio'] for v in clean_ps.values()])
         ax.axhline(clean_ratio, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Clean mean ratio ({clean_ratio:.3f})')
@@ -1379,7 +1384,7 @@ def fig12_ctc_confidence(results, severity_levels, output_dir):
         confs, xs = [], []
         for sev, sev_pct in zip(severity_levels, sevs_pct):
             cond  = f'{ctype}_{int(sev * 100):02d}'
-            preds = results.get(cond, {}).get('predictions', {})
+            preds = _get_condition_samples(results, cond)
             cc    = [v['mean_ctc_confidence'] for v in preds.values() if v.get('mean_ctc_confidence') is not None]
             if cc:
                 confs.append(float(np.mean(cc)))
@@ -1395,7 +1400,7 @@ def fig12_ctc_confidence(results, severity_levels, output_dir):
         return
 
     # Clean baseline
-    clean_preds = results.get('clean', {}).get('predictions', {})
+    clean_preds = _get_condition_samples(results, 'clean')
     clean_cc = [v['mean_ctc_confidence'] for v in clean_preds.values() if v.get('mean_ctc_confidence') is not None]
     if clean_cc:
         cl_mean = float(np.mean(clean_cc))

@@ -40,27 +40,23 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
         List of dicts with sample info and selection reason.
     '''
     selections = []
-    clean = results_json.get('clean', {})
-    clean_ps = clean.get('metrics', {}).get('per_sample', {})
-    clean_preds = clean.get('predictions', {})
+    clean_samples = results_json.get('clean', {}).get('predictions', {})
 
-    # Helper: get per-sample metrics for a condition
-    def get_ps(cond_name):
-        return results_json.get(cond_name, {}).get('metrics', {}).get('per_sample', {})
-
-    def get_preds(cond_name):
-        return results_json.get(cond_name, {}).get('predictions', {})
+    # Helper: get merged per-sample entries for a condition
+    def get_samples(cond_name):
+        samples = results_json.get(cond_name, {}).get('predictions', {})
+        return samples if isinstance(samples, dict) else {}
 
     # 1. HT causing hallucination (novel_token_rate > 0.5)
     ht_hall = []
     for sev in [20, 30, 40]:
         cond = f'HT_{sev:02d}'
-        ps = get_ps(cond)
-        for name, m in ps.items():
-            if m['novel_token_rate'] > 0.5 and m['sentence_bleu'] < 0.2:
-                clean_bleu = clean_ps.get(name, {}).get('sentence_bleu', 0)
+        samples = get_samples(cond)
+        for name, m in samples.items():
+            if m.get('novel_token_rate', 0) > 0.5 and m.get('sentence_bleu', 0) < 0.2:
+                clean_bleu = clean_samples.get(name, {}).get('sentence_bleu', 0)
                 if clean_bleu > 0.3:  # was decent originally
-                    ht_hall.append((name, cond, clean_bleu, m['sentence_bleu']))
+                    ht_hall.append((name, cond, clean_bleu, m.get('sentence_bleu', 0)))
                     
     ht_hall.sort(key=lambda x: x[2] - x[3], reverse=True)  # sort by drop
     for item in ht_hall[:n_per_category]:
@@ -72,12 +68,12 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     tt_under = []
     for sev in [20, 30, 40]:
         cond = f'TT_{sev:02d}'
-        ps = get_ps(cond)
-        for name, m in ps.items():
-            if m['output_length_ratio'] < 0.5 and m['sentence_bleu'] < 0.4:
-                clean_bleu = clean_ps.get(name, {}).get('sentence_bleu', 0)
+        samples = get_samples(cond)
+        for name, m in samples.items():
+            if m.get('output_length_ratio', 1) < 0.5 and m.get('sentence_bleu', 0) < 0.4:
+                clean_bleu = clean_samples.get(name, {}).get('sentence_bleu', 0)
                 if clean_bleu > 0.3:
-                    tt_under.append((name, cond, clean_bleu, m['output_length_ratio']))
+                    tt_under.append((name, cond, clean_bleu, m.get('output_length_ratio', 1)))
                     
     tt_under.sort(key=lambda x: x[3])  # sort by shortest ratio
     for item in tt_under[:n_per_category]:
@@ -89,12 +85,10 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     for sev in [20, 30]:
         for ctype in ['HC', 'TC']:
             cond = f'{ctype}_{sev:02d}'
-            preds = get_preds(cond)
-            ps = get_ps(cond)
-            for name, pred in preds.items():
-                hyp = pred.get('txt_hyp', '')
+            samples = get_samples(cond)
+            for name, sample in samples.items():
                 # Check if output contains tokens from adjacent sentence reference
-                if name in ps and ps[name]['novel_token_rate'] > 0.3:
+                if sample.get('novel_token_rate', 0) > 0.3:
                     if len(selections) < 5 or not any(s['category'] == 'mixing' for s in selections):
                         selections.append({
                             'name': name, 'reason': f'Contamination mixing ({cond})',
@@ -107,9 +101,9 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     for sev in [20, 30, 40, 50]:
         for ctype in ['HT', 'TT', 'HC', 'TC']:
             cond = f'{ctype}_{sev:02d}'
-            ps = get_ps(cond)
-            for name, m in ps.items():
-                if m['has_repetition']:
+            samples = get_samples(cond)
+            for name, m in samples.items():
+                if m.get('has_repetition', False):
                     if not any(s['category'] == 'repetition' for s in selections):
                         selections.append({
                             'name': name, 'reason': f'Repetition ({cond})',
@@ -121,8 +115,8 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     # 5. Surprisingly robust sample (high BLEU even at 30% truncation)
     for ctype in ['HT', 'TT']:
         cond = f'{ctype}_30'
-        ps = get_ps(cond)
-        robust = [(n, m['sentence_bleu']) for n, m in ps.items() if m['sentence_bleu'] > 0.3]
+        samples = get_samples(cond)
+        robust = [(n, m.get('sentence_bleu', 0)) for n, m in samples.items() if m.get('sentence_bleu', 0) > 0.3]
         robust.sort(key=lambda x: x[1], reverse=True)
         if robust and not any(s['category'] == 'robust' for s in selections):
             selections.append({
@@ -132,10 +126,10 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
     # 6. Compound condition effect
     compound_conds = [k for k in results_json if '+' in k and k != 'meta']
     for cond in compound_conds[:5]:
-        ps = get_ps(cond)
-        for name, m in ps.items():
-            if m['sentence_bleu'] < 0.15 and name in clean_ps:
-                if clean_ps[name]['sentence_bleu'] > 0.4:
+        samples = get_samples(cond)
+        for name, m in samples.items():
+            if m.get('sentence_bleu', 0) < 0.15 and name in clean_samples:
+                if clean_samples[name].get('sentence_bleu', 0) > 0.4:
                     if not any(s['category'] == 'compound' for s in selections):
                         selections.append({
                             'name': name, 'reason': f'Compound degradation ({cond})',
@@ -146,10 +140,9 @@ def select_representative_samples(results_json: dict, n_per_category: int = 2) -
 
 def format_example_table(sample_name: str, results_json: dict, conditions_to_show: list = None) -> str:
     # Format a single sample's predictions across conditions as a markdown table
-    preds_clean = results_json.get('clean', {}).get('predictions', {}).get(sample_name, {})
-    clean_ps = results_json.get('clean', {}).get('metrics', {}).get('per_sample', {}).get(sample_name, {})
-    ref_text = preds_clean.get('txt_ref', 'N/A')
-    ref_gloss = preds_clean.get('gls_ref', '')
+    clean_sample = results_json.get('clean', {}).get('predictions', {}).get(sample_name, {})
+    ref_text = clean_sample.get('txt_ref', 'N/A')
+    ref_gloss = clean_sample.get('gls_ref', '')
 
     if conditions_to_show is None:
         conditions_to_show = ['clean']
@@ -167,18 +160,17 @@ def format_example_table(sample_name: str, results_json: dict, conditions_to_sho
     ]
     for cond in conditions_to_show:
         if cond not in results_json: continue
-        pred = results_json[cond].get('predictions', {}).get(sample_name, {})
-        ps = results_json[cond].get('metrics', {}).get('per_sample', {}).get(sample_name, {})
-        if not pred: continue
+        sample = results_json.get(cond, {}).get('predictions', {}).get(sample_name, {})
+        if not sample: continue
 
-        gls = pred.get('gls_hyp', '')[:60]
-        txt = pred.get('txt_hyp', '')[:80]
-        sbleu = ps.get('sentence_bleu', 0)
+        gls = sample.get('gls_hyp', '')[:60]
+        txt = sample.get('txt_hyp', '')[:80]
+        sbleu = sample.get('sentence_bleu', 0)
         mode = classify_failure_mode(
-            ps.get('sentence_bleu', 0),
-            ps.get('novel_token_rate', 0),
-            ps.get('output_length_ratio', 1),
-            ps.get('has_repetition', False))
+            sample.get('sentence_bleu', 0),
+            sample.get('novel_token_rate', 0),
+            sample.get('output_length_ratio', 1),
+            sample.get('has_repetition', False))
         mode_abbrev = MODE_ABBREV.get(mode, mode[:5])
         lines.append(f"| {cond} | {gls} | {txt} | {sbleu:.2f} | {mode_abbrev} |")
     return '\n'.join(lines)
