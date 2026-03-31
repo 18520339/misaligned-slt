@@ -1,48 +1,53 @@
-'''Knee point detection using the Kneedle algorithm.
+'''Knee point detection using a clean-baseline threshold rule.
 
-Identifies the severity level at which degradation accelerates —
-the point beyond which performance drops sharply.
+Defines the knee as the first severity where the metric crosses a
+user-defined fraction of the clean baseline.
 '''
 import numpy as np
-from typing import List, Tuple, Optional
-from kneed import KneeLocator
+from typing import List, Optional
 
 
-def detect_knee_point(severities: List[float], values: List[float], direction: str = 'decreasing') -> Optional[dict]:
-    '''Detect the knee point in a degradation curve.
+def detect_knee_point(
+    severities: List[float], values: List[float], direction: str = 'decreasing',
+    clean_baseline: Optional[float] = None, retention_ratio: float = 0.70,
+) -> Optional[dict]:
+    '''Detect the knee point via threshold crossing from clean baseline.
 
     Args:
         severities: X-axis values (severity percentages).
         values: Y-axis values (metric values at each severity).
         direction: 'decreasing' for BLEU-like (lower = worse),
                    'increasing' for WER-like (higher = worse).
-        curve: 'convex' or 'concave'.
-        sensitivity: Kneedle sensitivity parameter.
+        clean_baseline: Clean-condition metric value. If None, uses values[0].
+        retention_ratio: Fraction of clean baseline used as threshold. Example: 0.70 means "70% of clean baseline".
 
     Returns:
-        Dict with knee severity, value at knee, and related info, or None.
+        Dict with knee severity and value at knee, or None.
     '''
-    if len(severities) < 3: return None
-    kl = KneeLocator(severities, values, curve='convex', direction=direction, S=1.0, online=True)
-    if kl.knee is None: return _fallback_knee_detection(severities, values, direction)
-    knee_idx = severities.index(kl.knee) if kl.knee in severities else None
-    return {'knee_severity': kl.knee, 'knee_value': kl.knee_y}
+    if not severities or not values or len(severities) != len(values): return None
+    if not (0 < retention_ratio <= 1.0): raise ValueError('retention_ratio must be in (0, 1].')
 
+    baseline = values[0] if clean_baseline is None else clean_baseline
+    if baseline is None: return None
 
-def _fallback_knee_detection(severities, values, direction):
-    # Simple fallback: find maximum second derivative (curvature)
-    if len(severities) < 3: return None
-    x, y = np.array(severities), np.array(values)
-    dy2 = np.diff(y, n=2) # Second derivative (finite differences)
-    
-    if direction == 'decreasing': # Look for most negative second derivative (steepest drop)
-        idx = np.argmin(dy2)
-    else: # Look for most positive second derivative (steepest rise)
-        idx = np.argmax(dy2)
-        
-    knee_idx = idx + 1  # offset due to double differencing
-    return {'knee_severity': severities[knee_idx], 'knee_value': values[knee_idx]}
-    
+    if direction == 'decreasing':
+        threshold = baseline * retention_ratio
+        crossed_idx = next((i for i, v in enumerate(values) if v <= threshold), None)
+    elif direction == 'increasing':
+        # Symmetric counterpart for "worse-is-higher" metrics.
+        threshold = baseline * (2.0 - retention_ratio)
+        crossed_idx = next((i for i, v in enumerate(values) if v >= threshold), None)
+    else: raise ValueError("direction must be 'decreasing' or 'increasing'.")
+
+    knee_idx = crossed_idx if crossed_idx is not None else len(values) - 1
+    return {
+        'knee_severity': severities[knee_idx],
+        'knee_value': values[knee_idx],
+        'clean_baseline': baseline,
+        'threshold': threshold,
+        'retention_ratio': retention_ratio,
+    }
+
 
 def compute_degradation_rate(severities: List[float], values: List[float]) -> float:
     # Compute linear degradation rate (slope) via least-squares fit
@@ -65,9 +70,10 @@ def detect_all_knee_points(results_json: dict, severity_levels: list) -> dict:
     '''
     basic_types = ['HT', 'TT', 'HC', 'TC']
     knee_results = {}
+    clean_bleu = results_json.get('clean', {}).get('metrics', {}).get('bleu4')
 
     for ctype in basic_types:
-        bleu_vals, wer_vals = [], []
+        bleu_vals = []
         valid_sevs = []
         for sev in severity_levels:
             cond_name = f'{ctype}_{int(sev * 100):02d}'
@@ -75,12 +81,16 @@ def detect_all_knee_points(results_json: dict, severity_levels: list) -> dict:
                 m = results_json[cond_name].get('metrics', {})
                 if 'bleu4' in m:
                     bleu_vals.append(m['bleu4'])
-                    wer_vals.append(m.get('wer', 0))
                     valid_sevs.append(sev)
 
         if not valid_sevs: continue
         knee_results[ctype] = {}
-        bleu_knee = detect_knee_point(valid_sevs, bleu_vals, direction='decreasing')
+        bleu_knee = detect_knee_point(
+            valid_sevs, bleu_vals,
+            direction='decreasing',
+            clean_baseline=clean_bleu,
+            retention_ratio=0.70,
+        )
         if bleu_knee: bleu_knee['degradation_rate'] = compute_degradation_rate(valid_sevs, bleu_vals)
         knee_results[ctype]['bleu4'] = bleu_knee
     return knee_results

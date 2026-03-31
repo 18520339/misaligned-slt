@@ -186,7 +186,7 @@ def fig01_bleu_degradation(results, severity_levels, output_dir, clean_bleu=None
 
     ax.set_xlabel('Severity (%)')
     ax.set_ylabel('BLEU-4')
-    ax.set_title('BLEU-4 Degradation Under Temporal Misalignment\n(★ = Kneedle knee point  |  dotted vertical = knee threshold)')
+    ax.set_title('BLEU-4 Degradation Under Temporal Misalignment\n(★ = first point <= 70% of clean baseline  |  dotted vertical = knee threshold)')
     ax.legend(loc='upper right', ncol=1, fontsize=10)
     ax.set_xlim(left=0)
 
