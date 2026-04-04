@@ -19,40 +19,14 @@ import torch.nn.functional as F
 from einops import rearrange
 
 # ── Import building blocks from bd3lms repo ──────────────────────────────────
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BD3LMS_ROOT = os.path.join(PROJECT_ROOT, 'bd3lms')
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'bd3lms'))
 
-# We use importlib to import from bd3lms directly, avoiding conflicts with
-# the project-level `models/` package (both have `models/__init__.py`).
-import importlib.util
-
-def _import_bd3lms_module(name, path): # Temporarily add bd3lms to sys.path for relative imports within bd3lms
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    _prev = sys.path.copy()
-    if BD3LMS_ROOT not in sys.path: sys.path.insert(0, BD3LMS_ROOT)
-    spec.loader.exec_module(mod)
-    sys.path[:] = _prev
-    return mod
-
-_noise_mod = _import_bd3lms_module('bd3lms.noise_schedule', os.path.join(BD3LMS_ROOT, 'noise_schedule.py'))
-_dit_mod = _import_bd3lms_module('bd3lms.models.dit', os.path.join(BD3LMS_ROOT, 'models', 'dit.py'))
-modulate = _dit_mod.modulate
-
-LogLinearNoise = _noise_mod.LogLinearNoise
-LayerNorm = _dit_mod.LayerNorm
-TimestepEmbedder = _dit_mod.TimestepEmbedder
-EmbeddingLayer = _dit_mod.EmbeddingLayer
-DDiTFinalLayer = _dit_mod.DDiTFinalLayer
-
-Rotary = _dit_mod.Rotary
-rotate_half = _dit_mod.rotate_half
-apply_rotary_pos_emb_torchscript = _dit_mod.apply_rotary_pos_emb_torchscript
-
-block_diff_mask = _dit_mod.block_diff_mask
-bias_dropout_add_scale_fused_train = _dit_mod.bias_dropout_add_scale_fused_train
-bias_dropout_add_scale_fused_inference = _dit_mod.bias_dropout_add_scale_fused_inference
-
+from noise_schedule import LogLinearNoise
+from models.dit import (
+    LayerNorm, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer, Rotary, rotate_half, apply_rotary_pos_emb_torchscript, 
+    block_diff_mask, bias_dropout_add_scale_fused_train, bias_dropout_add_scale_fused_inference, modulate
+)
 
 class CrossAttention(nn.Module): # Multi-head cross-attention to visual encoder features
     def __init__(self, dim, n_heads, dropout=0.1):
