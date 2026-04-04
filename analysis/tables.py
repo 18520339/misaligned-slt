@@ -177,6 +177,32 @@ def table3_severity_ranking(results: dict, severity_levels: list) -> str:
     return '\n'.join(lines)
 
 
+# Table 4: Group-Level Absolute Metrics
+def table4_group_metrics(results: dict) -> str:
+    '''Group-level absolute metrics from pre-computed group_summary, or computed on the fly.'''
+    clean_m = results.get('clean', {}).get('metrics', {})
+    summary = results.get('group_summary')
+    if summary is None:
+        # Compute on the fly if not pre-computed
+        from evaluator import _compute_group_summaries
+        summary = _compute_group_summaries(results)
+
+    lines = ['# Table 4: Group-Level Absolute Metrics\n']
+    lines.append('| Group | BLEU-4 | WER | ROUGE-L | # Conditions |')
+    lines.append('|-------|-------:|----:|--------:|-------------:|')
+
+    # Clean baseline
+    lines.append(
+        f"| Clean | {clean_m.get('bleu4', 0):.2f} | {clean_m.get('wer', 0):.2f} | "
+        f"{clean_m.get('rouge_l', 0):.2f} | 1 |")
+
+    for gname, gdata in summary.items():
+        lines.append(
+            f"| {gname} | {gdata['bleu4']:.2f} | {gdata['wer']:.2f} | "
+            f"{gdata['rouge_l']:.2f} | {gdata['n_conditions']} |")
+    return '\n'.join(lines)
+
+
 # Export all condition metrics to CSV
 def export_metrics_csv(results: dict, output_path: str):
     rows = []
@@ -221,5 +247,9 @@ def generate_all_tables(results_dir: str, output_dir: str):
 
         t3 = table3_severity_ranking(bench_results, bench_sevs)
         (output_dir / 'table3_severity_ranking.md').write_text(t3, encoding='utf-8')
+
+        t4 = table4_group_metrics(bench_results)
+        (output_dir / 'table4_group_metrics.md').write_text(t4, encoding='utf-8')
+
         export_metrics_csv(bench_results, str(output_dir / 'benchmark_metrics.csv'))
     print('✓ All tables saved to', output_dir)

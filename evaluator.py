@@ -270,7 +270,90 @@ def run_evaluation(
 
         print(f"{cond_name}: WER={metrics.get('wer', 0):.2f}; BLEU-4={metrics.get('bleu4', 0):.2f}; "
               f"ROUGE-L={metrics.get('rouge_l', 0):.2f} ({elapsed:.1f}s, {len(eval_results)} samples)\n")
+
+    # ── Group-level summaries ─────────────────────────────────────────────────
+    # Compute mean metrics for each misalignment group (4 basic + compound + overall)
+    group_summary = _compute_group_summaries(all_results)
+    all_results['group_summary'] = group_summary
+
+    # Print group summary
+    print('\n=== Group-Level Summary ===')
+    for gname, gdata in group_summary.items():
+        print(f"  {gname:12s}: BLEU-4={gdata['bleu4']:.2f}, "
+              f"WER={gdata['wer']:.2f}, ROUGE-L={gdata['rouge_l']:.2f} "
+              f"({gdata['n_conditions']} conditions)")
+
+    # Save final version with summaries
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
+
     return all_results
+
+
+def _compute_group_summaries(all_results):
+    '''Compute mean metrics for each misalignment group.
+
+    Groups:
+      4 basic: HT, TT, HC, TC (averaged over all severities)
+      compound groups: HT+TT, HC+TC, HT+TC, HC+TT (averaged over all severity combos)
+      All_Basic: mean over all basic conditions
+      All_Compound: mean over all compound conditions
+      Overall: mean over all misaligned conditions (basic + compound)
+    '''
+    groups = defaultdict(lambda: defaultdict(list))
+
+    for cond_name, cond_data in all_results.items():
+        if cond_name in ('meta', 'clean', 'group_summary'):
+            continue
+        m = cond_data.get('metrics', {})
+        bleu4 = m.get('bleu4')
+        if bleu4 is None:
+            continue
+
+        wer = m.get('wer', 0)
+        rouge_l = m.get('rouge_l', 0)
+
+        if '+' in cond_name:
+            # Compound condition — extract group from first parts
+            parts = cond_name.split('+')
+            a_type = parts[0].rsplit('_', 1)[0]
+            b_type = parts[1].rsplit('_', 1)[0]
+            group = f'{a_type}+{b_type}'
+            groups[group]['bleu4'].append(bleu4)
+            groups[group]['wer'].append(wer)
+            groups[group]['rouge_l'].append(rouge_l)
+            groups['All_Compound']['bleu4'].append(bleu4)
+            groups['All_Compound']['wer'].append(wer)
+            groups['All_Compound']['rouge_l'].append(rouge_l)
+        else:
+            # Basic condition
+            ctype = cond_name.rsplit('_', 1)[0]
+            groups[ctype]['bleu4'].append(bleu4)
+            groups[ctype]['wer'].append(wer)
+            groups[ctype]['rouge_l'].append(rouge_l)
+            groups['All_Basic']['bleu4'].append(bleu4)
+            groups['All_Basic']['wer'].append(wer)
+            groups['All_Basic']['rouge_l'].append(rouge_l)
+
+        groups['Overall']['bleu4'].append(bleu4)
+        groups['Overall']['wer'].append(wer)
+        groups['Overall']['rouge_l'].append(rouge_l)
+
+    summary = OrderedDict()
+    # Deterministic order: basic groups, compound groups, aggregates
+    ordered_keys = ['HT', 'TT', 'HC', 'TC',
+                    'HT+TT', 'HC+TC', 'HT+TC', 'HC+TT',
+                    'All_Basic', 'All_Compound', 'Overall']
+    for gname in ordered_keys:
+        if gname in groups:
+            g = groups[gname]
+            summary[gname] = {
+                'bleu4': float(np.mean(g['bleu4'])),
+                'wer': float(np.mean(g['wer'])),
+                'rouge_l': float(np.mean(g['rouge_l'])),
+                'n_conditions': len(g['bleu4']),
+            }
+    return summary
 
 
 def verify_clean_baseline(
