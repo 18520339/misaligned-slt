@@ -2,28 +2,19 @@ task: S2T
 device: cuda
 seed: 42
 
-# MSKA paths (relative to project root)
-paths:
+paths: # MSKA paths (relative to project root)
     mska_root: MSKA
     mska_config: MSKA/configs/phoenix-2014t_s2t.yaml
     checkpoint: MSKA/pretrained_models/phoenix-2014T_slt.pth
     results_dir: results
 
-# Dataset
 data:
     dataset_name: Phoenix-2014T
     train_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.train
     dev_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.dev
     test_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.test
 
-# Misalignment parameters
 misalignment:
-    # MSKA's get_selected_index rounds T to the nearest multiple of 4.
-    # Two stride-2 stages then give T_enc = ⌊(⌊(T-1)/2⌋+1)/2⌋.
-    # For any T ∈ [1,7]: valid_len ≤ 4 → T_enc = 1 (degenerate — full sentence
-    # collapses to one feature vector, temporal attention carries no information).
-    # For T = 8: valid_len = 8 → T_enc = 2 (minimum non-degenerate state).
-    # Samples with T_remaining < 8 after truncation are excluded from evaluation.
     min_frames: 8
     max_input_length: 400 # MSKA clip_len
 
@@ -40,9 +31,8 @@ misalignment:
         split: train
         subsample_size: 1000
 
-# Evaluation
 evaluation:
-    batch_size: 8
+    batch_size: 128
     num_workers: 4
     beam_size: 5
     translation:
@@ -50,8 +40,7 @@ evaluation:
         max_length: 100
         num_beams: 5
 
-# Expected clean baseline (from MSKA paper - Phoenix-2014T)
-expected_clean:
+expected_clean: # Expected clean baseline (from MSKA paper - Phoenix-2014T)
     wer: 19.8
     bleu4: 29.03
     rouge_l: 53.54
