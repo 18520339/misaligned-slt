@@ -220,7 +220,7 @@ def load_phase2_cfg(model_name):
 
 
 def build_phase2_model(mska_cfg, model_cfg, device): # Build a Phase 2 SLTModel (AR or BD)
-    from models.model_factory import SLTModel
+    from model_factory import SLTModel
     prev_cwd = os.getcwd()
     os.chdir(MSKA_DIR)
     try:
@@ -273,6 +273,7 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
                 min_severity=aug_cfg.get('min_severity', 0.05), min_frames=8,
                 max_input_length=proj_cfg['misalignment'].get('max_input_length', 400),
             )
+            print('Note that Dev dataset is clean for quick validation.')
         else:
             from datasets import S2T_Dataset
             train_dataset = S2T_Dataset(

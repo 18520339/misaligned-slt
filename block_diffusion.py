@@ -151,6 +151,7 @@ class ConditionalDDiTBlock(nn.Module): # Extends bd3lms DDiTBlock with cross-att
         ).transpose(1, 2)
         return rearrange(x, 'b s h d -> b s (h d)')
 
+
     def forward(self, x, rotary_cos_sin, c, encoder_out, encoder_mask=None, mask=None, sample_mode=False, store_kv=False):
         '''
         Args:

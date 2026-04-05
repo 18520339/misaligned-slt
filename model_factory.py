@@ -9,11 +9,11 @@ Both share the same Recognition network and VLMapper from MSKA.
 import os, sys, copy, math
 import torch
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
 
 from model import SignLanguageModel
-from models.block_diffusion import BlockDiffusionDecoder
+from block_diffusion import BlockDiffusionDecoder
 
 
 class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD decoders.
