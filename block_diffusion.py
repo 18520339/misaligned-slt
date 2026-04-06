@@ -316,6 +316,12 @@ class BlockDiffusionDecoder(nn.Module):
         logits = self._subs_parameterization(logits, xt) # Apply subs parameterization OUTSIDE autocast (matches bd3lms flow)
         log_p_theta = torch.gather(input=logits, dim=-1, index=x0[:, :, None]).squeeze(-1) # Gather log-probs at GT positions
         loss = loss_scale * log_p_theta # (B, L)
+
+        # During eval, exclude BOS from loss (matches bd3lms _loss lines 884-885)
+        if self.ignore_bos and not self.training:
+            attention_mask = attention_mask.clone()
+            attention_mask[:, 0] = 0
+
         nlls = loss * attention_mask # Mask out padding positions (matches bd3lms _loss)
         return nlls.sum() / attention_mask.sum().clamp(min=1)
 
@@ -383,7 +389,10 @@ class BlockDiffusionDecoder(nn.Module):
 
     @torch.no_grad()
     def _ddpm_caching_update(self, x, t, dt, p_x0=None, use_first_hitting=False):
-        # Single DDPM transition step with p_x0 caching. : bd3lms/diffusion.py Diffusion._ddpm_caching_update lines 559-603
+        '''Single DDPM transition step with p_x0 caching.
+        Ref: bd3lms/diffusion.py Diffusion._ddpm_caching_update lines 559-603.
+        x is the context window (x_accum[:, fwd_idx]), NOT the full accumulator.
+        '''
         _, move_chance_t = self.noise(t)             # (B, 1)
         _, move_chance_s = self.noise(t - dt)        # (B, 1)
         sigma_t = self._sigma_from_p(move_chance_t)  # (B, 1)
@@ -401,48 +410,46 @@ class BlockDiffusionDecoder(nn.Module):
                     logits = self._backbone_forward(x, sigma_proc, sample_mode=True)
                     logits = logits[:, -self.block_size:] # Get predictions for current block only
 
-            # SUBS parameterization + exp to get probabilities
+            # SUBS parameterization + exp to get probabilities (matches bd3lms lines 572-578)
             xt_block = x[:, -self.block_size:]
             logits = self._subs_parameterization(logits.clone(), xt_block)
             p_x0 = logits.to(torch.float64).exp()
             p_x0 = self._nucleus_sample(p_x0)
 
-        if use_first_hitting: # First-hitting sampler: unmask one random masked position per sample
-            # Ref: bd3lms/diffusion.py lines 580-587
+        if use_first_hitting: # First-hitting sampler (exact bd3lms lines 580-587)
             x_block = _sample_categorical(p_x0)
             num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-            ind = torch.randint(0, num_masked.clamp(min=1), (x_block.shape[0],))
-            mask_positions = (x[:, -self.block_size:] == self.mask_index)
-            masked_indices = mask_positions.nonzero()
-            if masked_indices.numel() > 0:
-                selected_idx = masked_indices[ind.item(), 1] if masked_indices.shape[0] > ind.item() else 0
-                mask = (torch.arange(self.block_size, device=x.device) == selected_idx).to(x_block.dtype)
-                x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
-            else:
-                x_block = x[:, -self.block_size:]
-        else: # Standard DDPM transition
+            ind = torch.randint(0, num_masked, (x_block.shape[0],))
+            ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+            mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
+            x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+        else: # Standard DDPM transition (bd3lms lines 588-591)
             q_xs = p_x0 * (1 - mask_prob)
             q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
             x_block = _sample_categorical(q_xs)
 
-        # Carry-over: preserve already-unmasked tokens
+        # Carry-over: preserve already-unmasked tokens (bd3lms lines 592-594)
         copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
         x_block = copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
         x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
 
-        # Store KV cache if entire block is committed
+        # Store KV cache if entire block is committed (bd3lms lines 597-598)
         if self.use_kv_cache and self.mask_index not in x_block:
             sigma_proc = self._process_sigma(sigma_t)
             self._backbone_forward(x_block, sigma_proc, sample_mode=True, store_kv=True)
 
-        # Cache p_x0 if state didn't change (for reuse)
+        # Cache p_x0 if state didn't change (for reuse, bd3lms lines 600-603)
         if not torch.allclose(x_new, x): return None, x_new
         return p_x0, x_new
 
 
     @torch.no_grad()
     def generate(self, input_feature=None, input_lengths=None, max_length=100, diffusion_steps=5000, **kwargs):
-        # Semi-AR block diffusion sampling. Ref: bd3lms/diffusion.py Diffusion._semi_ar_sampler lines 979-1052
+        '''Semi-AR block diffusion sampling.
+        Ref: bd3lms/diffusion.py Diffusion._semi_ar_sampler lines 979-1052.
+        Key: pass x_accum[:, fwd_idx] (context window) to _ddpm_caching_update,
+        then write back x_accum[:, fwd_idx] = x_next (matching bd3lms exactly).
+        '''
         B = input_feature.shape[0]
         device = input_feature.device
 
@@ -460,7 +467,7 @@ class BlockDiffusionDecoder(nn.Module):
 
         x_accum = None
         for block_idx in range(num_blocks_max):
-            # Extend with MASK block
+            # Extend with MASK block (matches bd3lms _sample_prior + concat)
             new_block = torch.full((B, self.block_size), self.mask_index, dtype=torch.long, device=device)
             if x_accum is None:
                 x_accum = new_block
@@ -468,24 +475,31 @@ class BlockDiffusionDecoder(nn.Module):
             else:
                 x_accum = torch.cat((x_accum, new_block), dim=1)
 
-            dt = 1.0 / diffusion_steps # Iterative denoising within this block. Following bd3lms _ddpm_caching_update logic
+            # Compute context window indices (matches bd3lms fwd_idx logic, lines 1011-1013)
+            end_idx = (block_idx + 1) * self.block_size
+            start_idx = max(end_idx - self.max_seq_len, 0)  # context can't exceed max_seq_len
+            fwd_idx = torch.arange(start_idx, end_idx)
+
+            dt = 1.0 / diffusion_steps
             t = 1.0
             p_x0_cache = None
 
             for step in range(diffusion_steps):
-                if self.mask_index not in x_accum[:, -self.block_size:]: break
+                if self.mask_index not in x_accum[:, fwd_idx]: break
                 if use_first_hitting:
                     u = np.random.rand()
-                    num_masked = (x_accum[:, -self.block_size:] == self.mask_index).sum(-1).item()
+                    num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
                     if num_masked == 0: break
                     t *= u ** (1.0 / num_masked)
                 else:
                     t = 1.0 - step / diffusion_steps
 
-                p_x0_cache, x_accum = self._ddpm_caching_update(
-                    x=x_accum, t=t * ones, dt=dt, p_x0=p_x0_cache,
+                # Pass windowed context to _ddpm_caching_update (matches bd3lms line 1034-1038)
+                p_x0_cache, x_next = self._ddpm_caching_update(
+                    x=x_accum[:, fwd_idx], t=t * ones, dt=dt, p_x0=p_x0_cache,
                     use_first_hitting=use_first_hitting)
-            
+                x_accum[:, fwd_idx] = x_next  # Write back to accumulator (matches bd3lms line 1042)
+
             if any(self.eos_index in x_accum[b, -self.block_size:] for b in range(B)):
                 break # Check for EOS in current block
 
