@@ -10,19 +10,25 @@ block_diffusion:
     n_layers: 6
     cond_dim: 128
     mlp_ratio: 4
-    dropout: 0.1
-    max_seq_len: 128
+    dropout: 0.3 # match mBART's dropout (0.3)
+    max_seq_len: 64
     noise_type: loglinear
     parameterization: subs
     sampling_eps_min: 1.0e-03
     sampling_eps_max: 1.0
     nucleus_p: 1.0
     antithetic_sampling: true
+    time_conditioning: false
+    ignore_bos: true
+    first_hitting: true
+    kv_cache: true
+    attn_backend: flex
 
 training:
     epochs: 60
     batch_size: 32
     train_from_scratch: false # set true to skip bd_clean weights and pretrained MSKA
+    num_workers: 4
     optimizer: AdamW
     learning_rate:
         default: 2.0e-05 # lower LR for fine-tuning from bd_clean
@@ -32,14 +38,17 @@ training:
     betas: [0.9, 0.998]
     scheduler: cosineannealing
     t_max: 60
+    warmup_epochs: 3
     gradient_clip_norm: 1.0
 
     save_every_n_epochs: 5
     early_stopping_patience: 5
+    eval_every_n_epochs: 3
 
     recognition_weight: 1.0
     translation_weight: 1.0
-    eval_every_n_epochs: 3
+
+    ema: 0.9999
     resume_from: results/checkpoints/bd_clean/best_checkpoint.pth
 
 augmentation:

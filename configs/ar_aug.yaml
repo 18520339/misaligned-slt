@@ -8,6 +8,7 @@ training:
     epochs: 80
     batch_size: 16
     train_from_scratch: false # set true to train without pretrained MSKA weights
+    num_workers: 4
     optimizer: Adam
     learning_rate:
         default: 1.0e-05
@@ -17,20 +18,18 @@ training:
     betas: [0.9, 0.998]
     scheduler: cosineannealing
     t_max: 80
+    warmup_epochs: 0 # MSKA doesn't use warmup, keep consistent
     gradient_clip_norm: 1.0
 
     # Checkpointing
     save_every_n_epochs: 5
     early_stopping_patience: 5
+    eval_every_n_epochs: 2 # Evaluation frequency (not every epoch, which is slow)
 
     # Loss weights (match MSKA default)
     recognition_weight: 1.0
     translation_weight: 1.0
 
-    # Evaluation frequency (not every epoch, which is slow)
-    eval_every_n_epochs: 2
-
-# Augmentation
 augmentation:
     enabled: true
     p_aug: 0.5 # probability of applying misalignment per sample
@@ -41,7 +40,6 @@ augmentation:
         HC: 0.30
         TC: 0.30
 
-# Validation
 validation:
     recognition:
         beam_size: 1
