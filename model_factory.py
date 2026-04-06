@@ -1,13 +1,12 @@
 '''Model factory for Phase 2: builds AR or BD model variants.
 
-Creates a SignLanguageModel with either:
+Creates an SLTModel with either:
   - AR decoder (original MSKA TranslationNetwork)
   - BD decoder (BlockDiffusionDecoder with cross-attention)
 
 Both share the same Recognition network and VLMapper from MSKA.
 '''
-import os, sys, copy, math
-import torch
+import os, sys, torch
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
@@ -49,29 +48,36 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
             d_model = self.mska_model.translation_network.input_dim # Get d_model from VLMapper output (= mBART d_model)
             pad_index = self.text_tokenizer.pad_index
             eos_index = self.text_tokenizer.eos_index
+            bos_index = getattr(self.text_tokenizer, 'sos_index', 0)
+            print(f'  BD decoder: vocab={vocab_size}, d_model={d_model}, pad={pad_index}, eos={eos_index}, bos={bos_index}')
 
             self.bd_decoder = BlockDiffusionDecoder(
-                vocab_size=vocab_size, 
+                vocab_size=vocab_size,
                 d_model=d_model,
                 n_heads=bd_cfg.get('n_heads', 16),
                 n_layers=bd_cfg.get('n_layers', 6),
                 cond_dim=bd_cfg.get('cond_dim', 128),
                 block_size=bd_cfg.get('block_size', 4),
                 mlp_ratio=bd_cfg.get('mlp_ratio', 4),
-                dropout=bd_cfg.get('dropout', 0.1),
+                dropout=bd_cfg.get('dropout', 0.3),
                 max_seq_len=bd_cfg.get('max_seq_len', 128),
-                pad_index=pad_index, 
+                pad_index=pad_index,
                 eos_index=eos_index,
+                bos_index=bos_index,
                 sampling_eps_min=bd_cfg.get('sampling_eps_min', 1e-3),
                 sampling_eps_max=bd_cfg.get('sampling_eps_max', 1.0),
                 antithetic_sampling=bd_cfg.get('antithetic_sampling', True),
+                time_conditioning=bd_cfg.get('time_conditioning', False),
+                ignore_bos=bd_cfg.get('ignore_bos', True),
+                nucleus_p=bd_cfg.get('nucleus_p', 1.0),
+                first_hitting=bd_cfg.get('first_hitting', True),
+                kv_cache=bd_cfg.get('kv_cache', True),
+                attn_backend=bd_cfg.get('attn_backend', 'flex'),
             )
-
-            # Remove MSKA's translation network to save memory
             del self.mska_model.translation_network
             self.translation_network = None
         else: raise ValueError(f'Unknown decoder_type: {decoder_type}')
-        
+
 
     def load_pretrained(self, checkpoint_path, strict=False): # Load pretrained MSKA checkpoint (Recognition + VLMapper + AR decoder)
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -79,9 +85,7 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
 
         if self.decoder_type == 'ar': ret = self.mska_model.load_state_dict(state_dict, strict=strict)
         else: # For BD: load Recognition + VLMapper, skip TranslationNetwork
-            filtered = {}
-            for k, v in state_dict.items():
-                if 'translation_network' not in k: filtered[k] = v
+            filtered = {k: v for k, v in state_dict.items() if 'translation_network' not in k}
             ret = self.mska_model.load_state_dict(filtered, strict=False)
 
         print(f'Loaded checkpoint from {checkpoint_path}')
@@ -94,8 +98,8 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
 
 
     def forward(self, src_input): # Full forward pass: Recognition -> VLMapper -> Decoder
-        recognition_outputs = self.recognition_network(src_input) # Recognition
-        mapped_feature = self.vl_mapper(visual_outputs=recognition_outputs) # VLMapper
+        recognition_outputs = self.recognition_network(src_input)
+        mapped_feature = self.vl_mapper(visual_outputs=recognition_outputs)
 
         if self.decoder_type == 'ar': # AR: use MSKA's TranslationNetwork
             translation_inputs = {
@@ -108,8 +112,7 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
             model_outputs['transformer_inputs'] = translation_outputs['transformer_inputs']
             model_outputs['total_loss'] = (
                 self.recognition_weight * recognition_outputs['recognition_loss']
-                + self.translation_weight * translation_outputs['translation_loss']
-            )
+                + self.translation_weight * translation_outputs['translation_loss'])
         else: # BD: use BlockDiffusionDecoder
             translation_inputs = {
                 'input_feature': mapped_feature,
@@ -121,10 +124,11 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
             model_outputs['translation_loss'] = translation_outputs['translation_loss']
             model_outputs['total_loss'] = (
                 self.recognition_weight * recognition_outputs['recognition_loss']
-                + self.translation_weight * translation_outputs['translation_loss']
-            )
-            # Store for generate_txt
-            model_outputs['transformer_inputs'] = {'input_feature': mapped_feature, 'input_lengths': recognition_outputs['input_lengths']}
+                + self.translation_weight * translation_outputs['translation_loss'])
+            model_outputs['transformer_inputs'] = { # Store for generate_txt
+                'input_feature': mapped_feature,
+                'input_lengths': recognition_outputs['input_lengths'],
+            }
         return model_outputs
 
 
@@ -138,37 +142,37 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
         if generate_cfg is None: generate_cfg = {}
         if self.decoder_type == 'ar': return self.translation_network.generate(**transformer_inputs, **generate_cfg)
         else: # BD inference
-            diffusion_steps = generate_cfg.get('diffusion_steps', 10)
+            diffusion_steps = generate_cfg.get('diffusion_steps', 5000)
             max_length = generate_cfg.get('max_length', 100)
             output = self.bd_decoder.generate(
                 input_feature=transformer_inputs['input_feature'],
                 input_lengths=transformer_inputs['input_lengths'],
-                max_length=max_length, diffusion_steps=diffusion_steps,
-            )
-            # Decode token IDs to text
-            sequences = output['sequences']
-            decoded = self._decode_sequences(sequences)
-            output['decoded_sequences'] = decoded
+                max_length=max_length, diffusion_steps=diffusion_steps)
+            output['decoded_sequences'] = self._decode_sequences(output['sequences'])
             return output
 
 
     def _decode_sequences(self, sequences): # Convert token IDs to text strings
         decoded = []
+        bos_index = self.bd_decoder.bos_index if self.bd_decoder else -1
+        
         for seq in sequences:
             tokens = []
             for tok_id in seq:
                 tok_id = tok_id.item()
-                # Stop at EOS or MASK
                 if tok_id == self.text_tokenizer.eos_index: break
                 if tok_id == self.bd_decoder.mask_index: continue
                 if tok_id == self.text_tokenizer.pad_index: continue
+                if tok_id == bos_index: continue
                 tokens.append(tok_id)
 
             if hasattr(self.text_tokenizer, 'level') and self.text_tokenizer.level == 'word':
                 text = ' '.join(self.text_tokenizer.id2token[t] for t in tokens if t < len(self.text_tokenizer.id2token))
             else: # Sentencepiece: need to reverse prune
+                if hasattr(self.text_tokenizer, 'pruneids_reverse'): 
+                    tokens = [self.text_tokenizer.pruneids_reverse.get(t, t) for t in tokens]
+                
                 tok_tensor = torch.tensor([tokens], dtype=torch.long)
-                if hasattr(self.text_tokenizer, 'prune_reverse'): tok_tensor = self.text_tokenizer.prune_reverse(tok_tensor)
                 text = self.text_tokenizer.tokenizer.batch_decode(tok_tensor, skip_special_tokens=True)[0]
 
             # Clean up German punctuation (matching MSKA's TextTokenizer.batch_decode)
