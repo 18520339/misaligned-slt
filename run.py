@@ -30,7 +30,7 @@ sys.path.insert(0, MSKA_DIR)
 logging.set_verbosity_error()
 
 
-def load_phase1_configs(args): # Load project config and MSKA config
+def load_base_configs(args): # Load project config and MSKA config
     with open(args.config, 'r', encoding='utf-8') as f:
         proj_cfg = yaml.safe_load(f)
 
@@ -39,6 +39,48 @@ def load_phase1_configs(args): # Load project config and MSKA config
         mska_cfg = yaml.safe_load(f)
     return proj_cfg, mska_cfg
 
+
+def get_min_frames(mska_cfg, train_label_path=None):
+    '''Compute min_frames from DSTA-Net temporal strides AND training data.
+
+    Two constraints:
+      1. Architectural floor: DSTA-Net strides determine the minimum input
+         length for the encoder to produce >= 2 timesteps.
+      2. Data floor: 5th percentile of training sequence lengths — any
+         truncation leaving fewer frames than this is statistically extreme.
+
+    Returns max(architectural_floor, data_5th_percentile).
+    '''
+    from data.misalign import compute_min_frames, MIN_FRAMES_DEFAULT
+
+    # 1. Architectural floor from DSTA-Net temporal strides
+    arch_min = MIN_FRAMES_DEFAULT
+    try:
+        layers = mska_cfg['model']['RecognitionNetwork']['DSTA-Net']['net']
+        strides = [layer[4] for layer in layers]  # 5th element is temporal stride
+        arch_min = compute_min_frames(strides)
+    except (KeyError, IndexError): pass
+
+    # 2. Data floor: 5th percentile of training set sequence lengths
+    data_min = 0
+    if train_label_path is not None:
+        try:
+            import gzip, pickle
+            full_path = os.path.join(PROJECT_ROOT, train_label_path) if not os.path.isabs(train_label_path) else train_label_path
+            if os.path.exists(full_path):
+                with gzip.open(full_path, 'rb') as f:
+                    data = pickle.load(f)
+                lengths = [sample['num_frames'] for sample in data.values() if isinstance(sample, dict) and 'num_frames' in sample]
+                if lengths:
+                    data_min = int(np.percentile(lengths, 5))
+                    print(f'Training data: {len(lengths)} samples, 5th percentile length = {data_min} frames')
+        except Exception as e: print(f'  Warning: could not compute 5th percentile: {e}')
+
+    result = max(arch_min, data_min)
+    print(f'min_frames = {result} (arch={arch_min}, data_5th={data_min})')
+    return result
+
+
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -46,28 +88,30 @@ def set_seed(seed=42):
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-def load_model(mska_cfg, proj_cfg, device):
-    from model import SignLanguageModel
-
-    # MSKA config paths are relative to MSKA dir
+    
+    
+def build_model(mska_cfg, model_cfg, device):
+    from model_factory import SLTModel
     prev_cwd = os.getcwd()
     os.chdir(MSKA_DIR)
     try:
         model_args = argparse.Namespace(device='cuda', distributed=False)
-        model = SignLanguageModel(cfg=mska_cfg, args=model_args)
-        model.to(device)
+        decoder_type = model_cfg.get('decoder_type', 'ar')
+        model = SLTModel(mska_cfg, model_args, model_cfg, decoder_type=decoder_type)
     finally: os.chdir(prev_cwd)
-    
-    ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
-    print('Loading checkpoint from', ckpt_path)
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
-    
-    ret = model.load_state_dict(checkpoint['model'], strict=False)
-    if ret.missing_keys: print('Missing keys', ret.missing_keys)
-    if ret.unexpected_keys: print('Unexpected keys', ret.unexpected_keys)
+    return model
 
+
+def load_phase1_model(mska_cfg, proj_cfg, device):
+    '''Load pretrained MSKA model for Phase 1 evaluation.
+
+    Reuses build_model + SLTModel.load_pretrained (same path as Phase 2 AR models) 
+    to avoid duplicating model construction and checkpoint loading logic.
+    '''
+    model_cfg = {'decoder_type': 'ar'}  # minimal config for AR model
+    model = build_model(mska_cfg, model_cfg, device)
+    ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
+    model.load_pretrained(ckpt_path, strict=False)
     model.to(device)
     model.eval()
     print('Model loaded and set to eval mode.')
@@ -77,17 +121,18 @@ def load_model(mska_cfg, proj_cfg, device):
 def create_eval_dataset(path, mska_cfg, phase, subsample_indices=None, proj_cfg=None):
     from Tokenizer import GlossTokenizer_S2G
     from data.misaligned_datasets import EvalDataset
-    
+
     prev_cwd = os.getcwd()
     os.chdir(MSKA_DIR)
     try:
         tokenizer = GlossTokenizer_S2G(mska_cfg['gloss'])
         max_len = proj_cfg['misalignment']['max_input_length'] if proj_cfg else 400
+        train_path = proj_cfg['data']['train_label_path'] if proj_cfg else None
         dataset = EvalDataset(
-            path=os.path.join(PROJECT_ROOT, path), tokenizer=tokenizer, config=mska_cfg, 
+            path=os.path.join(PROJECT_ROOT, path), tokenizer=tokenizer, config=mska_cfg,
             args=argparse.Namespace(device='cuda'), phase=phase,
-            min_frames=8, max_input_length=max_len,
-            subsample_indices=subsample_indices,
+            min_frames=get_min_frames(mska_cfg, train_label_path=train_path),
+            max_input_length=max_len, subsample_indices=subsample_indices,
         )
     finally: os.chdir(prev_cwd)
     print(f'{dataset} (phase={phase})')
@@ -96,7 +141,7 @@ def create_eval_dataset(path, mska_cfg, phase, subsample_indices=None, proj_cfg=
 
 def mode_verify(args, proj_cfg, mska_cfg, device): # Run 0: Verify clean baseline matches reported MSKA numbers
     from evaluator import verify_clean_baseline
-    model = load_model(mska_cfg, proj_cfg, device)
+    model = load_phase1_model(mska_cfg, proj_cfg, device)
 
     # Run on both dev and test
     for split, path_key, label in [('val', 'dev_label_path', 'Dev'), ('test', 'test_label_path', 'Test')]:
@@ -119,7 +164,7 @@ def mode_knee_point(args, proj_cfg, mska_cfg, device): # Run 1: Knee point analy
     from evaluator import run_evaluation
     from data.misalign import generate_conditions
 
-    model = load_model(mska_cfg, proj_cfg, device)
+    model = load_phase1_model(mska_cfg, proj_cfg, device)
     kp_cfg = proj_cfg['misalignment']['knee_point']
     severity_levels = kp_cfg['severity_levels']
 
@@ -142,7 +187,7 @@ def mode_benchmark(args, proj_cfg, mska_cfg, device): # Run 2: Full benchmark on
     from evaluator import run_evaluation
     from data.misalign import generate_conditions
 
-    model = load_model(mska_cfg, proj_cfg, device)
+    model = load_phase1_model(mska_cfg, proj_cfg, device)
     bench_cfg = proj_cfg['misalignment']['benchmark']
     severity_levels = bench_cfg['severity_levels']
 
@@ -165,7 +210,7 @@ def mode_train_eval(args, proj_cfg, mska_cfg, device): # Run 3: Train subset eva
     from evaluator import run_evaluation
     from data.misalign import generate_conditions
 
-    model = load_model(mska_cfg, proj_cfg, device)
+    model = load_phase1_model(mska_cfg, proj_cfg, device)
     train_eval_cfg = proj_cfg['misalignment']['train_eval']
     severity_levels = train_eval_cfg['severity_levels']
 
@@ -213,22 +258,10 @@ def mode_qualitative(args, proj_cfg, mska_cfg, device): # Select representative 
 
 
 # ============================= Phase 2 modes =============================
-def load_phase2_cfg(model_name):
+def load_model_cfg(model_name):
     cfg_path = os.path.join(PROJECT_ROOT, 'configs', f'{model_name}.yaml')
     with open(cfg_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
-
-
-def build_phase2_model(mska_cfg, model_cfg, device): # Build a Phase 2 SLTModel (AR or BD)
-    from model_factory import SLTModel
-    prev_cwd = os.getcwd()
-    os.chdir(MSKA_DIR)
-    try:
-        model_args = argparse.Namespace(device='cuda', distributed=False)
-        decoder_type = model_cfg.get('decoder_type', 'ar')
-        model = SLTModel(mska_cfg, args, model_cfg, decoder_type=decoder_type)
-    finally: os.chdir(prev_cwd)
-    return model
 
 
 def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+Aug, BD Clean, or BD+Aug
@@ -237,27 +270,29 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
     from Tokenizer import GlossTokenizer_S2G
 
     model_name = args.model
-    model_cfg = load_phase2_cfg(model_name)
+    model_cfg = load_model_cfg(model_name)
     train_cfg = model_cfg['training']
     aug_cfg = model_cfg.get('augmentation', {})
     decoder_type = model_cfg.get('decoder_type', 'ar')
 
     print(f'\n=== Training {model_name} (decoder={decoder_type}) ===\n')
-    model = build_phase2_model(mska_cfg, model_cfg, device)
+    model = build_model(mska_cfg, model_cfg, device)
 
-    # Weight initialization: pretrained MSKA or from scratch
+    # Weight initialization
     train_from_scratch = train_cfg.get('train_from_scratch', False)
-    if not train_from_scratch: # Load pretrained MSKA checkpoint as starting point
+    if train_from_scratch: print('train_from_scratch=True: all components initialized randomly.')
+    else:
         ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
         model.load_pretrained(ckpt_path, strict=False)
 
-    # If resuming from another Phase 2 checkpoint (e.g., bd_aug from bd_clean)
+    # Resume from Phase 2 checkpoint (e.g., bd_aug resumes from bd_clean)
     resume_from = train_cfg.get('resume_from')
-    if not train_from_scratch and resume_from and os.path.exists(os.path.join(PROJECT_ROOT, resume_from)):
+    if not train_from_scratch and resume_from:
         full_resume = os.path.join(PROJECT_ROOT, resume_from)
-        print(f'Loading Phase 2 checkpoint: {full_resume}')
-        ckpt = torch.load(full_resume, map_location='cpu')
-        model.load_state_dict(ckpt['model'], strict=False)
+        if os.path.exists(full_resume):
+            print(f'Loading Phase 2 checkpoint: {full_resume}')
+            ckpt = torch.load(full_resume, map_location='cpu')
+            model.load_state_dict(ckpt['model'], strict=False)
 
     # Build training dataset
     prev_cwd = os.getcwd()
@@ -269,11 +304,12 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
         if aug_cfg.get('enabled', False):
             train_dataset = TrainDataset(
                 path=train_path, tokenizer=tokenizer, config=mska_cfg, args=model_args, phase='train',
-                p_aug=aug_cfg.get('p_aug', 0.5), knee_thresholds=aug_cfg.get('knee_thresholds'), 
-                min_severity=aug_cfg.get('min_severity', 0.05), min_frames=8,
+                p_aug=aug_cfg.get('p_aug', 0.5), knee_thresholds=aug_cfg.get('knee_thresholds'),
+                min_severity=aug_cfg.get('min_severity', 0.05),
+                min_frames=get_min_frames(mska_cfg, train_label_path=proj_cfg['data']['train_label_path']),
                 max_input_length=proj_cfg['misalignment'].get('max_input_length', 400),
             )
-            print('Note that Dev dataset is clean for quick validation.')
+            print('Note: Dev dataset is clean for quick validation.')
         else:
             from datasets import S2T_Dataset
             train_dataset = S2T_Dataset(
@@ -281,7 +317,7 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
                 args=model_args, phase='train', training_refurbish=True
             )
 
-        # Dev dataset (clean, for validation)
+        # Dev dataset (clean, for quick validation)
         dev_path = os.path.join(PROJECT_ROOT, proj_cfg['data']['dev_label_path'])
         from datasets import S2T_Dataset
         dev_dataset = S2T_Dataset(
@@ -291,14 +327,19 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
     finally: os.chdir(prev_cwd)
     print(f'Train: {len(train_dataset)} samples, Dev: {len(dev_dataset)} samples')
 
-    # Train
-    output_dir = os.path.join(PROJECT_ROOT, proj_cfg['paths']['results_dir'], 'checkpoints', model_name)
+    # Param count summary
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Parameters: {total:,} total, {trainable:,} trainable')
+
     wandb_run = wandb.init(
         project='misalign-slt', name=model_name,
         config={**model_cfg, 'dataset': proj_cfg['data']['dataset_name']},
     )
-    train_model(model=model,
-        train_dataset=train_dataset, dev_dataset=dev_dataset,
+
+    output_dir = os.path.join(PROJECT_ROOT, proj_cfg['paths']['results_dir'], 'checkpoints', model_name)
+    train_model(
+        model=model, train_dataset=train_dataset, dev_dataset=dev_dataset,
         mska_cfg=mska_cfg, model_cfg=model_cfg, train_cfg=train_cfg,
         output_dir=output_dir, device=device, wandb_run=wandb_run,
     )
@@ -310,10 +351,10 @@ def mode_evaluate_phase2(args, proj_cfg, mska_cfg, device): # Phase 2 evaluation
     from data.misalign import generate_conditions
 
     model_name = args.model
-    model_cfg = load_phase2_cfg(model_name)
+    model_cfg = load_model_cfg(model_name)
     decoder_type = model_cfg.get('decoder_type', 'ar')
     print(f'\n=== Evaluating {model_name} (decoder={decoder_type}) ===\n')
-    model = build_phase2_model(mska_cfg, model_cfg, device)
+    model = build_model(mska_cfg, model_cfg, device)
 
     # Load best checkpoint
     ckpt_dir = os.path.join(PROJECT_ROOT, proj_cfg['paths']['results_dir'], 'checkpoints', model_name)
@@ -361,10 +402,9 @@ def mode_analyze_phase2(args, proj_cfg, mska_cfg, device): # Generate Phase 2 co
 
 def main():
     parser = argparse.ArgumentParser(description='Temporal Misalignment Analysis for SLT')
-    parser.add_argument(
-        '--mode', type=str, required=True, help='Execution mode', choices=[
-            'verify', 'knee_point', 'benchmark', 'train_eval', 'analyze_phase1', 'qualitative', 
-            'train', 'evaluate', 'analyze_phase2'
+    parser.add_argument('--mode', type=str, required=True, help='Execution mode', choices=[
+        'verify', 'knee_point', 'benchmark', 'train_eval', 'analyze_phase1', 'qualitative', 
+        'train', 'evaluate', 'analyze_phase2'
     ])
     parser.add_argument(
         '--config', type=str, help='Path to project config',
@@ -375,7 +415,7 @@ def main():
     parser.add_argument('--model', type=str, default=None, help='Phase 2 model name (ar_aug, bd_clean, bd_aug)')
     args = parser.parse_args()
 
-    proj_cfg, mska_cfg = load_phase1_configs(args)
+    proj_cfg, mska_cfg = load_base_configs(args)
     if args.batch_size: proj_cfg['evaluation']['batch_size'] = args.batch_size
     seed = proj_cfg.get('seed', 42)
     set_seed(seed)
