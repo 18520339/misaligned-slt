@@ -31,6 +31,39 @@ def _select_primary_gls_hyp(sample_row: dict) -> str:
     return ''
 
 
+def collect_batch_predictions(model, src_input, output, sample_results, beam_size=1, generate_cfg=None):
+    '''Collect recognition and translation predictions from one batch into sample_results.
+
+    Shared between evaluator.run_evaluation and trainer.evaluate_with_loss to
+    avoid duplicating the CTC decoding + translation generation logic.
+    '''
+    tokenizer = model.gloss_tokenizer
+    batch_names = src_input['name']
+
+    # Recognition (CTC gloss decoding)
+    for k in output: # Use ensemble logits for best decoding
+        if 'gloss_logits' not in k: continue
+        ctc_out = model.recognition_network.decode(
+            gloss_logits=output[k], beam_size=beam_size,
+            input_lengths=output['input_lengths']
+        )
+        pred_glosses = tokenizer.convert_ids_to_tokens(ctc_out)
+        for name, gls_hyp, gls_ref in zip(batch_names, pred_glosses, src_input['gloss']):
+            if name not in sample_results: sample_results[name] = {}
+            logits_prefix = k.replace('gloss_logits', '')
+            sample_results[name][f'{logits_prefix}gls_hyp'] = (
+                ' '.join(gls_hyp).upper() if tokenizer.lower_case else ' '.join(gls_hyp)
+            )
+            sample_results[name]['gls_ref'] = gls_ref.upper() if tokenizer.lower_case else gls_ref
+
+    # Translation
+    gen_output = model.generate_txt(transformer_inputs=output['transformer_inputs'], generate_cfg=generate_cfg)
+    for name, txt_hyp, txt_ref in zip(batch_names, gen_output['decoded_sequences'], src_input['text']):
+        if name not in sample_results: sample_results[name] = {}
+        sample_results[name]['txt_hyp'] = txt_hyp
+        sample_results[name]['txt_ref'] = txt_ref
+
+
 def compute_metrics(results: dict, config: dict) -> dict:
     '''Compute corpus-level and per-sample metrics from collected predictions.
 
@@ -173,9 +206,6 @@ def run_evaluation(
 
     model.eval()
     metric_logger = MetricLogger(delimiter='  ')
-    tokenizer = model.gloss_tokenizer
-    do_recognition = config.get('do_recognition', True)
-    do_translation = config.get('do_translation', True)
 
     all_results = OrderedDict()
     all_results['meta'] = {
@@ -202,42 +232,17 @@ def run_evaluation(
         for src_input in metric_logger.log_every(loader, 1, f'{cond_name}'):
             output = model(src_input)
             batch_names = src_input['name']
+            collect_batch_predictions(model, src_input, output, sample_results, beam_size=beam_size, generate_cfg=generate_cfg)
 
-            # --- Recognition (CTC gloss decoding) ---
-            if do_recognition:
-                for k in output: # Use ensemble logits for best decoding
-                    if 'gloss_logits' not in k: continue
-                    ctc_out = model.recognition_network.decode(
-                        gloss_logits=output[k], beam_size=beam_size,
-                        input_lengths=output['input_lengths']
-                    )
-                    pred_glosses = tokenizer.convert_ids_to_tokens(ctc_out)
-                    for name, gls_hyp, gls_ref in zip(batch_names, pred_glosses, src_input['gloss']):
-                        if name not in sample_results: sample_results[name] = {}
-                        logits_prefix = k.replace('gloss_logits', '')
-                        sample_results[name][f'{logits_prefix}gls_hyp'] = (
-                            ' '.join(gls_hyp).upper() 
-                            if tokenizer.lower_case else ' '.join(gls_hyp)
-                        )
-                        sample_results[name]['gls_ref'] = gls_ref.upper() if tokenizer.lower_case else gls_ref
-
-                # Collect CTC logits for confidence analysis
-                if collect_logits and 'ensemble_last_gloss_logits' in output:
-                    logits = output['ensemble_last_gloss_logits']
-                    probs = logits.softmax(dim=-1)
-                    max_conf = probs.max(dim=-1).values  # (B, T)
-                    for i, name in enumerate(batch_names):
-                        valid_len = output['input_lengths'][i].item()
-                        mean_conf = max_conf[i, :valid_len].mean().item()
-                        sample_results[name]['mean_ctc_confidence'] = mean_conf
-
-            # --- Translation ---
-            if do_translation:
-                gen_output = model.generate_txt(transformer_inputs=output['transformer_inputs'], generate_cfg=generate_cfg)
-                for name, txt_hyp, txt_ref in zip(batch_names, gen_output['decoded_sequences'], src_input['text']):
-                    if name not in sample_results: sample_results[name] = {}
-                    sample_results[name]['txt_hyp'] = txt_hyp
-                    sample_results[name]['txt_ref'] = txt_ref
+            # Collect CTC logits for confidence analysis (evaluator-specific)
+            if collect_logits and 'ensemble_last_gloss_logits' in output:
+                logits = output['ensemble_last_gloss_logits']
+                probs = logits.softmax(dim=-1)
+                max_conf = probs.max(dim=-1).values  # (B, T)
+                for i, name in enumerate(batch_names):
+                    valid_len = output['input_lengths'][i].item()
+                    mean_conf = max_conf[i, :valid_len].mean().item()
+                    sample_results[name]['mean_ctc_confidence'] = mean_conf
 
         # --- Compute metrics for this condition ---
         # Filter out skipped samples
@@ -293,28 +298,22 @@ def run_evaluation(
 def _compute_group_summaries(all_results):
     '''Compute mean metrics for each misalignment group.
 
-    Groups:
-      4 basic: HT, TT, HC, TC (averaged over all severities)
-      compound groups: HT+TT, HC+TC, HT+TC, HC+TT (averaged over all severity combos)
-      All_Basic: mean over all basic conditions
-      All_Compound: mean over all compound conditions
-      Overall: mean over all misaligned conditions (basic + compound)
+    - 4 basic: HT, TT, HC, TC (averaged over all severities)
+    - compound groups: HT+TT, HC+TC, HT+TC, HC+TT (averaged over all severity combos)
+    - All_Basic: mean over all basic conditions
+    - All_Compound: mean over all compound conditions
+    - Overall: mean over all misaligned conditions (basic + compound)
     '''
     groups = defaultdict(lambda: defaultdict(list))
-
     for cond_name, cond_data in all_results.items():
-        if cond_name in ('meta', 'clean', 'group_summary'):
-            continue
+        if cond_name in ('meta', 'clean', 'group_summary'): continue
         m = cond_data.get('metrics', {})
         bleu4 = m.get('bleu4')
-        if bleu4 is None:
-            continue
-
+        if bleu4 is None: continue
         wer = m.get('wer', 0)
         rouge_l = m.get('rouge_l', 0)
 
-        if '+' in cond_name:
-            # Compound condition — extract group from first parts
+        if '+' in cond_name: # Compound condition — extract group from first parts
             parts = cond_name.split('+')
             a_type = parts[0].rsplit('_', 1)[0]
             b_type = parts[1].rsplit('_', 1)[0]
@@ -325,8 +324,7 @@ def _compute_group_summaries(all_results):
             groups['All_Compound']['bleu4'].append(bleu4)
             groups['All_Compound']['wer'].append(wer)
             groups['All_Compound']['rouge_l'].append(rouge_l)
-        else:
-            # Basic condition
+        else: # Basic condition
             ctype = cond_name.rsplit('_', 1)[0]
             groups[ctype]['bleu4'].append(bleu4)
             groups[ctype]['wer'].append(wer)
@@ -339,19 +337,16 @@ def _compute_group_summaries(all_results):
         groups['Overall']['wer'].append(wer)
         groups['Overall']['rouge_l'].append(rouge_l)
 
-    summary = OrderedDict()
     # Deterministic order: basic groups, compound groups, aggregates
-    ordered_keys = ['HT', 'TT', 'HC', 'TC',
-                    'HT+TT', 'HC+TC', 'HT+TC', 'HC+TT',
-                    'All_Basic', 'All_Compound', 'Overall']
+    ordered_keys = ['HT', 'TT', 'HC', 'TC', 'HT+TT', 'HC+TC', 'HT+TC', 'HC+TT', 'All_Basic', 'All_Compound', 'Overall']
+    summary = OrderedDict()
+    
     for gname in ordered_keys:
         if gname in groups:
             g = groups[gname]
             summary[gname] = {
-                'bleu4': float(np.mean(g['bleu4'])),
-                'wer': float(np.mean(g['wer'])),
-                'rouge_l': float(np.mean(g['rouge_l'])),
-                'n_conditions': len(g['bleu4']),
+                'wer': float(np.mean(g['wer'])), 'bleu4': float(np.mean(g['bleu4'])),
+                'rouge_l': float(np.mean(g['rouge_l'])), 'n_conditions': len(g['bleu4']),
             }
     return summary
 
