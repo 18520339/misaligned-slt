@@ -12,8 +12,8 @@ training:
     optimizer: Adam
     learning_rate:
         default: 1.0e-05
-        vl_mapper: 5.0e-04
-        translation_network: 5.0e-05 # Slightly higher LR for translation to adapt faster
+        vl_mapper: 1.0e-03 # Match MSKA (mapper: 1e-3)
+        translation_network: 1.0e-05 # Match MSKA (translation: 1e-5)
     weight_decay: 0.001
     betas: [0.9, 0.998]
     scheduler: cosineannealing
@@ -24,7 +24,7 @@ training:
     # Checkpointing
     save_every_n_epochs: 5
     early_stopping_patience: 5
-    eval_every_n_epochs: 2 # Evaluation frequency (not every epoch, which is slow)
+    eval_every_n_epochs: 3
 
     # Loss weights (match MSKA default)
     recognition_weight: 1.0

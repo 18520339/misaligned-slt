@@ -10,7 +10,7 @@ block_diffusion:
     n_layers: 6
     cond_dim: 128
     mlp_ratio: 4
-    dropout: 0.3 # match mBART's dropout (0.3)
+    dropout: 0.1
     max_seq_len: 64
     noise_type: loglinear
     parameterization: subs
@@ -33,7 +33,7 @@ training:
     learning_rate:
         default: 2.0e-05 # lower LR for fine-tuning from bd_clean
         recognition_network: 1.0e-05
-        vl_mapper: 1.0e-04
+        vl_mapper: 5.0e-04 # Fine-tune VLMapper from bd_clean (half of bd_clean's 1e-3)
     weight_decay: 0.001
     betas: [0.9, 0.998]
     scheduler: cosineannealing

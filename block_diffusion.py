@@ -9,15 +9,14 @@ Adapts BD3LMs' discrete diffusion framework for *conditional* text generation:
 All diffusion logic (noise schedule, loss, sampling) follows bd3lms/diffusion.py
 with minimal adaptation.  See inline references to bd3lms source lines.
 '''
-import os, sys, math
+import os, sys
 import numpy as np
 from functools import partial
-from einops import rearrange
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import create_block_mask
 
 # ── Import building blocks from bd3lms repo ──────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -25,8 +24,8 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, 'bd3lms'))
 
 from noise_schedule import LogLinearNoise
 from models.dit import (
-    DDiTBlock, LayerNorm, TimestepEmbedder, EmbeddingLayer, DDiTFinalLayer, Rotary, block_diff_mask, 
-    modulate_fused, bias_dropout_add_scale_fused_train, bias_dropout_add_scale_fused_inference,
+    DDiTBlock, LayerNorm, TimestepEmbedder, EmbeddingLayer, 
+    DDiTFinalLayer, Rotary, block_diff_mask, modulate_fused
 )
 
 def _sample_categorical(categorical_probs): # Gumbel-max trick for sampling from categorical distribution

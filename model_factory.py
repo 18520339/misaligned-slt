@@ -29,10 +29,10 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
         self.gloss_tokenizer = self.mska_model.gloss_tokenizer
         self.text_tokenizer = self.mska_model.text_tokenizer
 
-        # Loss weights
-        model_section = mska_cfg.get('model', {})
-        self.recognition_weight = model_section.get('recognition_weight', 1.0)
-        self.translation_weight = model_section.get('translation_weight', 1.0)
+        # Loss weights — read from model_cfg training section (Phase 2 configs)
+        train_section = model_cfg.get('training', {})
+        self.recognition_weight = train_section.get('recognition_weight', 1.0)
+        self.translation_weight = train_section.get('translation_weight', 1.0)
 
         if decoder_type == 'ar': # Use MSKA's original TranslationNetwork
             self.translation_network = self.mska_model.translation_network
