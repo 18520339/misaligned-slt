@@ -102,14 +102,26 @@ class EvalDataset(S2T_Dataset):
         return name_sample, sample, gloss, text
             
             
-    def _get_contamination_keypoints(self, index): # Get previous and next keypoint samples for potential contamination
+    def _get_contamination_keypoints(self, index, delta_s=None, delta_e=None):
+        '''Get previous and next keypoint samples for potential contamination.
+
+        Args:
+            index: position in self.list
+            delta_s: start-offset ratio to use for HC check (negative → contamination from prev).
+                     If None, falls back to self._delta_s (set by set_condition() for eval).
+            delta_e: end-offset ratio to use for TC check (positive → contamination from next).
+                     If None, falls back to self._delta_e (set by set_condition() for eval).
+        '''
+        _ds = delta_s if delta_s is not None else self._delta_s
+        _de = delta_e if delta_e is not None else self._delta_e
+
         prev_keypoints = None
-        if self._delta_s < 0 and index > 0:
+        if _ds < 0 and index > 0:
             prev_key = self.list[index - 1]
             prev_keypoints = self.raw_data[prev_key]['keypoint'].numpy()
 
         next_keypoints = None
-        if self._delta_e > 0 and index < len(self.list) - 1:
+        if _de > 0 and index < len(self.list) - 1:
             next_key = self.list[index + 1]
             next_keypoints = self.raw_data[next_key]['keypoint'].numpy()
         return prev_keypoints, next_keypoints
@@ -196,8 +208,9 @@ class TrainDataset(EvalDataset):
             delta_s, delta_e = self._sample_misalignment()
             
             # Get raw keypoints as numpy (T, V, C) and Get adjacent samples for contamination
+            # Pass the locally-sampled delta_s/delta_e so HC (delta_s<0) and TC (delta_e>0)
             keypoints_np = sample['keypoint'].numpy()
-            prev_keypoints, next_keypoints = self._get_contamination_keypoints(index)
+            prev_keypoints, next_keypoints = self._get_contamination_keypoints(index, delta_s=delta_s, delta_e=delta_e)
 
             misaligned_keypoints, info = apply_misalignment(
                 keypoints_np, delta_s, delta_e,
