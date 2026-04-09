@@ -231,8 +231,8 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
         # if 'ema' in ckpt and ckpt['ema'] is not None and ema is not None:
         #     ema.load_state_dict(ckpt['ema'])
         #     ema.move_shadow_params_to_device(device)
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_bleu4 = ckpt.get('best_bleu4', 0.0)
+        # start_epoch = ckpt.get('epoch', 0) + 1
+        # best_bleu4 = ckpt.get('best_bleu4', 0.0)
 
     # Patience is counted in eval cycles, not epochs
     eval_cycles_without_improvement = 0

@@ -17,12 +17,11 @@ Phase 2 (training & evaluation):
     python run.py --mode evaluate --model bd_aug
     python run.py --mode analyze_phase2              # Phase 2 comparison figures
 '''
-import os, sys, time, json, random, argparse, yaml
+import os, sys, time, random, argparse, yaml
 import numpy as np
 import wandb
 import torch
 
-from pathlib import Path
 from transformers import logging
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MSKA_DIR = os.path.join(PROJECT_ROOT, 'MSKA')
@@ -65,10 +64,10 @@ def get_min_frames(mska_cfg, train_label_path=None):
     data_min = 0
     if train_label_path is not None:
         try:
-            import gzip, pickle
+            import pickle
             full_path = os.path.join(PROJECT_ROOT, train_label_path) if not os.path.isabs(train_label_path) else train_label_path
             if os.path.exists(full_path):
-                with gzip.open(full_path, 'rb') as f:
+                with open(full_path, 'rb') as f:
                     data = pickle.load(f)
                 lengths = [sample['num_frames'] for sample in data.values() if isinstance(sample, dict) and 'num_frames' in sample]
                 if lengths:
@@ -280,19 +279,22 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
 
     # Weight initialization
     train_from_scratch = train_cfg.get('train_from_scratch', False)
-    if train_from_scratch: print('train_from_scratch=True: all components initialized randomly.')
+    if train_from_scratch:
+        if decoder_type == 'bd':
+            print('train_from_scratch=True (BD): recognition/VLMapper initialized randomly; BD decoder initialized from pretrained mBART.')
+        else:
+            print('train_from_scratch=True: all components initialized randomly.')
     else:
-        ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
-        model.load_pretrained(ckpt_path, strict=False)
-
-    # Resume from Phase 2 checkpoint (e.g., bd_aug resumes from bd_clean)
-    resume_from = train_cfg.get('resume_from')
-    if not train_from_scratch and resume_from:
-        full_resume = os.path.join(PROJECT_ROOT, resume_from)
-        if os.path.exists(full_resume):
-            print(f'Loading Phase 2 checkpoint: {full_resume}')
-            ckpt = torch.load(full_resume, map_location='cpu')
-            model.load_state_dict(ckpt['model'], strict=False)
+        resume_from = train_cfg.get('resume_from')
+        if resume_from: # Resume from Phase 2 checkpoint (e.g., bd_aug resumes from bd_clean)
+            full_resume = os.path.join(PROJECT_ROOT, resume_from)
+            if os.path.exists(full_resume):
+                print(f'Loading Phase 2 checkpoint: {full_resume}')
+                ckpt = torch.load(full_resume, map_location='cpu')
+                model.load_state_dict(ckpt['model'], strict=False)
+        else:
+            ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
+            model.load_pretrained(ckpt_path, strict=False)
 
     # Build training dataset
     prev_cwd = os.getcwd()
@@ -330,13 +332,12 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
     # Param count summary
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Parameters: {total:,} total, {trainable:,} trainable')
+    print(f'Parameters: {total:,} total, {trainable:,} trainable\n')
 
     wandb_run = wandb.init(
         project='misalign-slt', name=model_name,
         config={**model_cfg, 'dataset': proj_cfg['data']['dataset_name']},
     )
-
     output_dir = os.path.join(PROJECT_ROOT, proj_cfg['paths']['results_dir'], 'checkpoints', model_name)
     train_model(
         model=model, train_dataset=train_dataset, dev_dataset=dev_dataset,
@@ -380,7 +381,7 @@ def mode_evaluate_phase2(args, proj_cfg, mska_cfg, device): # Phase 2 evaluation
     generate_cfg = dict(eval_cfg['translation'])
     if decoder_type == 'bd':
         bd_cfg = model_cfg.get('block_diffusion', {})
-        generate_cfg['diffusion_steps'] = bd_cfg.get('diffusion_steps', 10)
+        generate_cfg['diffusion_steps'] = bd_cfg.get('diffusion_steps', 128)
 
     output_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['results_dir'], 'raw', f'benchmark_{model_name}.json')
     run_evaluation(
