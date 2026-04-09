@@ -40,40 +40,23 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
         elif decoder_type == 'bd': # Replace TranslationNetwork with BlockDiffusionDecoder
             bd_cfg = model_cfg.get('block_diffusion', {})
 
-            # Get vocab size from MSKA's text tokenizer
-            if hasattr(self.text_tokenizer, 'pruneids'): vocab_size = max(self.text_tokenizer.pruneids.values()) + 1
-            elif hasattr(self.text_tokenizer, 'id2token'): vocab_size = len(self.text_tokenizer.id2token)
-            else: vocab_size = 1024  # fallback
-
-            d_model = self.mska_model.translation_network.input_dim # Get d_model from VLMapper output (= mBART d_model)
-            pad_index = self.text_tokenizer.pad_index
-            eos_index = self.text_tokenizer.eos_index
-            bos_index = getattr(self.text_tokenizer, 'sos_index', 0)
-            print(f'  BD decoder: vocab={vocab_size}, d_model={d_model}, pad={pad_index}, eos={eos_index}, bos={bos_index}')
-
+            # A2D (AR-to-Diffusion): build BD decoder using pretrained mBART weights.
+            # translation_network is passed so BlockDiffusionDecoder can extract its
+            # pretrained encoder/decoder layers, embeddings, and prepare_feature_inputs.
+            print('  BD decoder (A2D): building from pretrained mBART in TranslationNetwork...')
             self.bd_decoder = BlockDiffusionDecoder(
-                vocab_size=vocab_size,
-                d_model=d_model,
-                n_heads=bd_cfg.get('n_heads', 16),
-                n_layers=bd_cfg.get('n_layers', 6),
-                cond_dim=bd_cfg.get('cond_dim', 128),
+                translation_network=self.mska_model.translation_network,
                 block_size=bd_cfg.get('block_size', 4),
-                mlp_ratio=bd_cfg.get('mlp_ratio', 4),
-                dropout=bd_cfg.get('dropout', 0.3),
-                max_seq_len=bd_cfg.get('max_seq_len', 128),
-                pad_index=pad_index,
-                eos_index=eos_index,
-                bos_index=bos_index,
                 sampling_eps_min=bd_cfg.get('sampling_eps_min', 1e-3),
                 sampling_eps_max=bd_cfg.get('sampling_eps_max', 1.0),
                 antithetic_sampling=bd_cfg.get('antithetic_sampling', True),
-                time_conditioning=bd_cfg.get('time_conditioning', False),
                 ignore_bos=bd_cfg.get('ignore_bos', True),
-                nucleus_p=bd_cfg.get('nucleus_p', 1.0),
                 first_hitting=bd_cfg.get('first_hitting', True),
-                kv_cache=bd_cfg.get('kv_cache', True),
-                attn_backend=bd_cfg.get('attn_backend', 'flex'),
+                nucleus_p=bd_cfg.get('nucleus_p', 1.0),
+                time_conditioning=bd_cfg.get('time_conditioning', False)
             )
+            # Remove the original TranslationNetwork from mska_model to avoid
+            # duplicate parameters (bd_decoder already holds refs to its submodules).
             del self.mska_model.translation_network
             self.translation_network = None
         else: raise ValueError(f'Unknown decoder_type: {decoder_type}')
@@ -142,7 +125,7 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
         if generate_cfg is None: generate_cfg = {}
         if self.decoder_type == 'ar': return self.translation_network.generate(**transformer_inputs, **generate_cfg)
         else: # BD inference
-            diffusion_steps = generate_cfg.get('diffusion_steps', 5000)
+            diffusion_steps = generate_cfg.get('diffusion_steps', 128)
             max_length = generate_cfg.get('max_length', 100)
             output = self.bd_decoder.generate(
                 input_feature=transformer_inputs['input_feature'],
@@ -155,13 +138,15 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
     def _decode_sequences(self, sequences): # Convert token IDs to text strings
         decoded = []
         bos_index = self.bd_decoder.bos_index if self.bd_decoder else -1
-        
+        # mask_token_id is the new attribute name; mask_index kept for compat
+        mask_id = getattr(self.bd_decoder, 'mask_token_id', getattr(self.bd_decoder, 'mask_index', -1)) if self.bd_decoder else -1
+
         for seq in sequences:
             tokens = []
             for tok_id in seq:
                 tok_id = tok_id.item()
                 if tok_id == self.text_tokenizer.eos_index: break
-                if tok_id == self.bd_decoder.mask_index: continue
+                if tok_id == mask_id: continue
                 if tok_id == self.text_tokenizer.pad_index: continue
                 if tok_id == bos_index: continue
                 tokens.append(tok_id)
@@ -169,9 +154,9 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
             if hasattr(self.text_tokenizer, 'level') and self.text_tokenizer.level == 'word':
                 text = ' '.join(self.text_tokenizer.id2token[t] for t in tokens if t < len(self.text_tokenizer.id2token))
             else: # Sentencepiece: need to reverse prune
-                if hasattr(self.text_tokenizer, 'pruneids_reverse'): 
+                if hasattr(self.text_tokenizer, 'pruneids_reverse'):
                     tokens = [self.text_tokenizer.pruneids_reverse.get(t, t) for t in tokens]
-                
+
                 tok_tensor = torch.tensor([tokens], dtype=torch.long)
                 text = self.text_tokenizer.tokenizer.batch_decode(tok_tensor, skip_special_tokens=True)[0]
 

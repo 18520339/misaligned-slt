@@ -1,340 +1,317 @@
 '''Block Diffusion Decoder for conditional sign language translation.
 
-Adapts BD3LMs' discrete diffusion framework for *conditional* text generation:
-  - Subclasses DDiTBlock to inherit self-attention, block-causal mask handling,
-    KV cache, and rotary embedding logic from the bd3lms repository.
-  - Inserts a CrossAttention sublayer to attend to MSKA visual encoder features.
-  - Provides forward() and generate() matching TranslationNetwork's interface.
+Implements BD3LM (block diffusion) adapted to mBART via the A2D recipe from
+dLLM (arxiv.org/abs/2602.22661), with full bd3lms fidelity:
+  - Architecture: pretrained mBART decoder with block-causal self-attention.
+  - Training: BD3LM masked diffusion loss with [xt | x0] concatenation,
+              BD3LM attention mask (M_BD + M_OBC + M_BC), repeated position IDs,
+              and cross-entropy weighted by 1/t at masked positions.
+  - Inference: BD3LM semi-AR sampling with DDPM transitions / first-hitting,
+               p_x0 caching, nucleus sampling, block-by-block denoising.
 
-All diffusion logic (noise schedule, loss, sampling) follows bd3lms/diffusion.py
-with minimal adaptation.  See inline references to bd3lms source lines.
+Key insight (from dLLM, takeaway box p.8): AR and diffusion models differ only in training
+objective and attention mask, NOT in architecture. Converting mBART's decoder to BD3LM requires:
+  1. Replace causal self-attention mask with BD3LM mask during training.
+  2. Concatenate noised tokens xt with clean tokens x0 as model input.
+  3. Use repeated position IDs [0..L-1, 0..L-1] for both halves.
+  4. Compute MDLM masked diffusion loss on only the xt-half logits.
+
+BD3LM training mask (2L × 2L) over concatenated [xt | x0] input:
+  M_BD:  Block diagonal — within-block self-attention (xt↔xt, x0↔x0).
+  M_OBC: Offset block causal — xt attends to x0 from *previous* blocks.
+  M_BC:  Block causal — x0 attends to x0 from same and previous blocks.
+
+Inference uses simple block-causal mask (committed prefix + current noised block)
+with DDPM transitions or first-hitting sampler (bd3lms _semi_ar_sampler + _ddpm_caching_update):
+  - No x0 concatenation needed; finalized prefix is clean in x_accum.
+  - Simple block-causal mask (xt_current attends to clean prefix by causal mask).
+  - DDPM transitions or first-hitting sampler.
+  - p_x0 caching, nucleus sampling.
+
+References:
+  - dLLM paper + A2D recipe: https://arxiv.org/pdf/2602.22661
+  - dLLM BD3LMTrainer: dllm/core/trainers/bd3lm.py (BD3LMTrainer.compute_loss)
+  - BD3LM paper: https://arxiv.org/pdf/2503.09573
+  - bd3lms reference: bd3lms/diffusion.py, bd3lms/models/hf/modeling_bd3lm.py
+  - LogLinearNoise: bd3lms/noise_schedule.py
 '''
-import os, sys
-import numpy as np
-from functools import partial
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
-
-# ── Import building blocks from bd3lms repo ──────────────────────────────────
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'bd3lms'))
-
-from noise_schedule import LogLinearNoise
-from models.dit import (
-    DDiTBlock, LayerNorm, TimestepEmbedder, EmbeddingLayer, 
-    DDiTFinalLayer, Rotary, block_diff_mask, modulate_fused
-)
-
-def _sample_categorical(categorical_probs): # Gumbel-max trick for sampling from categorical distribution
-    # Ref: bd3lms/diffusion.py _sample_categorical
-    gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
-    return (categorical_probs / gumbel_norm).argmax(dim=-1)
+from diffusion_utils import _sample_categorical, LogLinearNoise, TimestepEmbedder
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 
-class CrossAttention(nn.Module):
-    '''Multi-head cross-attention: text queries attend to visual encoder features.
+def build_bd3lm_mask(seq_len, block_size, dtype, device):
+    '''BD3LM training attention mask for concatenated [xt | x0] input.
 
-    Output projection is zero-initialized so cross-attention starts as identity,
-    matching the adaLN zero-init philosophy in DiT.
+    Mirrors _create_bd3lm_attention_mask (dLLM/dllm/core/trainers/bd3lm.py) and
+    block_diff_mask (bd3lms/models/dit.py). 
+    
+    For input of length 2*tgt_len, creates a (1, 1, 2L, 2L) mask with 3 components:
+    - M_BD:  xt_block_b ↔ all xt in same block b  (bidirectional, noisy self-attn within each block)
+    - M_OBC: xt_block_b → x0_block_{0..b-1}       (clean prefix, STRICTLY prior, cross-attn for conditional context)
+    - M_BC:  x0_block_b → x0_block_{0..b}         (block-causal over clean copy)
+    x0 never attends to xt; inference uses build_block_causal_mask instead.
+
+    Returns:
+        (1, 1, 2L, 2L) float mask: 0 = attend, -inf = masked.
     '''
-    def __init__(self, dim, n_heads, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = LayerNorm(dim)
-        nn.init.zeros_(self.out_proj.weight)
+    n = seq_len
+    idx = torch.arange(2 * n, device=device)
+    q_idx  = idx[:, None]   # (2L, 1)
+    kv_idx = idx[None, :]   # (1, 2L)
 
-    def forward(self, x, encoder_out, encoder_mask=None):
-        '''
-        Args:
-            x: (B, S, D) decoder hidden states
-            encoder_out: (B, T_v, D) visual features
-            encoder_mask: (B, T_v) boolean mask (True = valid, False = padding)
-        '''
-        residual = x
-        x = self.norm(x)
-        B, S, D = x.shape
-        H = self.n_heads
+    # Indicate whether token belongs to xt or x0
+    x0_flag_q, = q_idx  >= n
+    x0_flag_kv = kv_idx >= n
+    
+    # Compute block indices
+    block_q  = torch.where(x0_flag_q,  (q_idx  - n) // block_size, q_idx  // block_size)
+    block_kv = torch.where(x0_flag_kv, (kv_idx - n) // block_size, kv_idx // block_size)
 
-        q = self.q_proj(x).view(B, S, H, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(encoder_out).view(B, -1, 2, H, self.head_dim)
-        k, v = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
-        attn_mask = encoder_mask[:, None, None, :].bool() if encoder_mask is not None else None
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0
-        )
-        out = out.transpose(1, 2).contiguous().view(B, S, D)
-        return residual + self.dropout(self.out_proj(out))
+    # M_BD: same block, same half (xt-xt or x0-x0)
+    # M_OBC: xt queries attend to x0 keys from strictly earlier/previous blocks
+    # M_BC: x0 queries attend to x0 keys from same/current or earlier/previous blocks
+    block_diagonal      = (block_q == block_kv) & (x0_flag_q == x0_flag_kv)
+    offset_block_causal = (block_q >  block_kv) & x0_flag_kv & ~x0_flag_q
+    block_causal        = (block_q >= block_kv) & x0_flag_kv & x0_flag_q
+
+    # Combine Masks
+    can_attend = block_diagonal | offset_block_causal | block_causal
+    mask = torch.zeros(2 * n, 2 * n, dtype=dtype, device=device)
+    mask = mask.masked_fill(~can_attend, torch.finfo(dtype).min)
+    return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, 2L, 2L)
 
 
-class ConditionalDDiTBlock(DDiTBlock):
-    '''DDiTBlock subclass that adds cross-attention to visual features.
+def build_block_causal_mask(batch_size, tgt_len, block_size, dtype, device):
+    '''Block-causal (staircase) attention mask.
 
-    Overrides attn_mlp() to insert cross-attention between self-attention residual and MLP.
-    All other logic (QKV, rotary, block-causal mask, KV cache) is inherited from DDiTBlock.
+    Bidirectional within each block; block b can attend to blocks 0..b (causal
+    across blocks). Based on dLLM HF quickstart build_staircase_attention_mask.
 
-    Encoder context is set via _encoder_out/_encoder_mask attributes
-    before calling forward() to avoid changing DDiTBlock's signature.
+    Returns:
+        (B, 1, T, T) float mask: 0 = attend, -inf = masked.
     '''
-    def __init__(self, n, dim, n_heads, cond_dim, block_size, mlp_ratio=4, dropout=0.1, max_seqlen=1024, attn_backend='sdpa'):
-        super().__init__(
-            n=n, dim=dim, n_heads=n_heads, adaLN=True, cond_dim=cond_dim, block_size=block_size,
-            mlp_ratio=mlp_ratio, dropout=dropout, max_seqlen=max_seqlen, attn_backend=attn_backend
-        )
-        self.cross_attn_visual = CrossAttention(dim, n_heads, dropout=dropout) # Cross-attention to visual features (NEW)
-        self._encoder_out = None
-        self._encoder_mask = None
-
-
-    def attn_mlp(self, x, c, gate_msa, gate_mlp, shift_mlp, scale_mlp, x_skip):
-        '''Override: insert cross-attention between self-attention and MLP.
-        Matches DDiTBlock.attn_mlp exactly, adding only cross_attn_visual.'''
-        bias_dropout_scale_fn = self._get_bias_dropout_scale()
-        if c is not None:
-            x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
-            if self._encoder_out is not None: x = self.cross_attn_visual(x, self._encoder_out, self._encoder_mask)
-            x = bias_dropout_scale_fn(
-                self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp)),
-                None, gate_mlp, x, self.dropout
-            )
-        else:
-            scale = torch.ones(1, device=x.device, dtype=x.dtype)
-            x = bias_dropout_scale_fn(self.attn_out(x), None, scale, x_skip, self.dropout)
-            if self._encoder_out is not None: x = self.cross_attn_visual(x, self._encoder_out, self._encoder_mask)
-            x = bias_dropout_scale_fn(self.mlp(self.norm2(x)), None, scale, x, self.dropout)
-        return x
+    positions  = torch.arange(tgt_len, device=device)
+    block_ids  = positions // block_size     # (T,)
+    q_block    = block_ids.view(tgt_len, 1)  # (T, 1)
+    k_block    = block_ids.view(1, tgt_len)  # (1, T)
+    can_attend = (k_block <= q_block)        # (T, T): True = can attend
+    mask = torch.zeros(tgt_len, tgt_len, dtype=dtype, device=device)
+    mask = mask.masked_fill(~can_attend, torch.finfo(dtype).min)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, tgt_len, tgt_len)
 
 
 class BlockDiffusionDecoder(nn.Module):
-    '''Block Diffusion decoder for conditional text generation from visual features.
+    '''BD3LM decoder built on the pretrained mBART decoder backbone.
 
-    Replaces MSKA's TranslationNetwork (mBART decoder) with a block diffusion
-    decoder.  Supports both flex and sdpa attention backends (matching bd3lms).
-    Sequences are padded to max_seq_len so the pre-compiled flex mask is valid
-    for all inputs (bd3lms uses the same fixed-length approach).
+    Replaces MSKA's TranslationNetwork (mBART AR decoder) with a block diffusion
+    decoder that:
+      - Shares the same mBART pretrained weights (encoder + decoder layers).
+      - Replaces the causal decoder self-attention mask with a block-causal mask.
+      - Trains with MDLM masked diffusion loss (loglinear noise schedule).
+      - Generates via iterative denoising block-by-block at inference time.
+
+    Cross-attention to visual encoder features is inherited directly from mBART's
+    decoder layers — no separate cross-attention module is needed.
     '''
-    def __init__(self, vocab_size, d_model=1024, n_heads=16, n_layers=6,
-                 cond_dim=128, block_size=4, mlp_ratio=4, dropout=0.3,
-                 max_seq_len=128, pad_index=1, eos_index=2, bos_index=6,
-                 sampling_eps_min=1e-3, sampling_eps_max=1.0,
-                 antithetic_sampling=True, time_conditioning=False,
-                 ignore_bos=True, nucleus_p=1.0, first_hitting=True,
-                 kv_cache=True, attn_backend='flex'):
+    def __init__(
+        self, translation_network, block_size=4, sampling_eps_min=1e-3, sampling_eps_max=1.0,
+        antithetic_sampling=True, ignore_bos=True, first_hitting=True, nucleus_p=1.0, time_conditioning=False
+    ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.n_heads = n_heads
+        mbart = translation_network.model # MBartForConditionalGeneration
         self.block_size = block_size
-        self.max_seq_len = max_seq_len
-        self.pad_index = pad_index
-        self.eos_index = eos_index
-        self.bos_index = bos_index
         self.sampling_eps_min = sampling_eps_min
         self.sampling_eps_max = sampling_eps_max
         self.antithetic_sampling = antithetic_sampling
-        self.time_conditioning = time_conditioning
         self.ignore_bos = ignore_bos
-        self.nucleus_p = nucleus_p
         self.first_hitting = first_hitting
-        self.use_kv_cache = kv_cache
-        self.neg_infinity = -1000000.0
-        self.attn_backend = attn_backend
-        assert max_seq_len % block_size == 0, f'max_seq_len ({max_seq_len}) must be a multiple of block_size ({block_size})'
+        self.nucleus_p = nucleus_p
+        self.neg_infinity = -1e9
+        self.time_conditioning = time_conditioning # Sigma conditioning (additive TimestepEmbedder)
 
-        # Vocab: append MASK token at end (matching bd3lms)
-        self.mask_index = vocab_size
-        self.full_vocab_size = vocab_size + 1 # MASK token is appended at end of vocab
+        # ── mBART components (pretrained weights) ────────────────────────────
+        self._prepare_feature_inputs = translation_network.prepare_feature_inputs
+        self.mbart_encoder = mbart.model.encoder   # MBartEncoder
+        self.mbart_decoder = mbart.model.decoder   # MBartDecoder layers + norms
+        self.embed_scale = translation_network.input_embed_scale  # sqrt(d_model)
+        self.d_model = mbart.config.d_model
 
-        # Components (matching bd3lms DIT architecture)
-        self.vocab_embed = EmbeddingLayer(d_model, self.full_vocab_size)
-        self.sigma_map = TimestepEmbedder(cond_dim)
-        self.rotary_emb = Rotary(d_model // n_heads)
-        self.blocks = nn.ModuleList([ # Transformer blocks (ConditionalDDiTBlock = DDiTBlock + CrossAttention)
-            ConditionalDDiTBlock(
-                n=max_seq_len, dim=d_model, n_heads=n_heads, cond_dim=cond_dim, block_size=block_size,
-                mlp_ratio=mlp_ratio, dropout=dropout, max_seqlen=max_seq_len, attn_backend=self.attn_backend
-            ) for _ in range(n_layers)
-        ])
+        # ── Tokenizer info ───────────────────────────────────────────────────
+        self.text_tokenizer = translation_network.text_tokenizer
+        self.pad_index = self.text_tokenizer.pad_index
+        self.eos_index = self.text_tokenizer.eos_index
+        self.bos_index = getattr(self.text_tokenizer, 'sos_index', getattr(self.text_tokenizer, 'lang_index', 0))
+        vocab_size = mbart.config.vocab_size
+        self.vocab_size = vocab_size
 
-        # Output projection and  (from bd3lms)
-        self.output_layer = DDiTFinalLayer(hidden_size=d_model, out_channels=self.full_vocab_size, cond_dim=cond_dim, adaLN=True)
+        # ── Extend vocabulary with a MASK token ─────────────────────────────
+        self.mask_token_id = vocab_size # Append [MASK] at index vocab_size so existing token IDs are unchanged
+        self.mask_index = self.mask_token_id # Backward-compat attribute name for model_factory._decode_sequences
+
+        # ── Extend embedding and language model heads ───────────────────────
+        old_embed = mbart.model.shared  # nn.Embedding (vocab_size, d_model)
+        old_lm    = mbart.lm_head       # nn.Linear (d_model → vocab_size)
+        d_model   = old_embed.embedding_dim
+        self.embed_tokens = nn.Embedding(vocab_size + 1, d_model, padding_idx=self.pad_index)
+        self.lm_head = nn.Linear(d_model, vocab_size + 1, bias=False)
+        with torch.no_grad():
+            self.embed_tokens.weight[:vocab_size].copy_(old_embed.weight)
+            self.lm_head.weight[:vocab_size].copy_(old_lm.weight)
+            nn.init.normal_(self.embed_tokens.weight[vocab_size:], std=0.02)
+            nn.init.zeros_(self.lm_head.weight[vocab_size:])
+
+        # Point decoder's embed_tokens to our extended version so that the
+        # original (un-extended) embedding is not a duplicate parameter.
+        self.mbart_decoder.embed_tokens = self.embed_tokens
         self.noise = LogLinearNoise()
+        if self.time_conditioning: self.sigma_embedder = TimestepEmbedder(d_model)
+        print(
+            f'BlockDiffusionDecoder (mBART A2D): d_model={d_model}, vocab={vocab_size}+1(MASK), '
+            f'block_size={block_size}, time_cond={time_conditioning}, first_hitting={first_hitting}, '
+            f'nucleus_p={nucleus_p}, antithetic_sampling={antithetic_sampling}, ignore_bos={ignore_bos}, '
+            f'sampling_eps_min={self.sampling_eps_min}, sampling_eps_max={self.sampling_eps_max}')
+        
+    # ── Visual encoder ────────────────────────────────────────────────────────
 
-        # Block-causal mask (matching bd3lms DIT.gen_mask)
-        # Created once at max_seq_len — sequences are padded to this length.
-        if self.attn_backend == 'flex':
-            self._block_diff_mask = create_block_mask(
-                partial(block_diff_mask, block_size=block_size, n=max_seq_len),
-                B=None, H=None, Q_LEN=max_seq_len * 2, KV_LEN=max_seq_len * 2)
+    def _encode_visual(self, input_feature, input_lengths):
+        # Encode visual features via mBART encoder (same pipeline as AR model)
+        enc_inputs = self._prepare_feature_inputs(input_feature, input_lengths)
+        enc_out = self.mbart_encoder(
+            inputs_embeds=enc_inputs['inputs_embeds'],
+            attention_mask=enc_inputs['attention_mask'],
+            return_dict=True,
+        )
+        return enc_out.last_hidden_state, enc_inputs['attention_mask']
+
+    # ── Decoder with block-causal / bd3lm self-attention ──────────────────────
+    
+    def _decode(self, decoder_input_ids, enc_hidden, enc_mask, self_attn_mask=None, position_ids=None, sigma=None):
+        '''Run mBART decoder layers with custom self-attention mask.
+
+        Bypasses MBartDecoder.forward() to replace its internal causal mask. Everything else
+        (positional embeddings, layer norms, cross-attention, FFN) is identical to the AR path.
+
+        Args:
+            decoder_input_ids: (B, T) token IDs.
+            enc_hidden: encoder hidden states for cross-attention.
+            enc_mask: encoder padding mask.
+            self_attn_mask: optional (1, 1, T, T) or (B, 1, T, T) float mask.
+                If None, builds block-causal mask from block_size.
+            position_ids: optional (B, T) position IDs for embed_positions.
+                If None, uses default sequential positions from embed_positions.
+            sigma: optional (B,) or (B, 1) noise level for time conditioning.
+        '''
+        batch_size, tgt_len = decoder_input_ids.shape
+        device = decoder_input_ids.device
+        dtype = enc_hidden.dtype
+        inputs_embeds = self.embed_tokens(decoder_input_ids) * self.embed_scale
+
+        # if position_ids is not None:
+        #     # positions for xt and x0 halves should both be [0..L-1]
+        #     # When position_ids is provided, it manually indexes into embed_positions.weight[pos + 2] 
+        #     # to support the repeated [0..L-1, 0..L-1] positions needed for the 2L concatenated input
+        #     positions = self.mbart_decoder.embed_positions.weight[position_ids + 2]
+        # else:
+        #     positions = self.mbart_decoder.embed_positions(decoder_input_ids)
+        
+        hidden = inputs_embeds + self.mbart_decoder.embed_positions(decoder_input_ids)
+        hidden = self.mbart_decoder.layernorm_embedding(hidden)
+        hidden = F.dropout(hidden, p=self.mbart_decoder.dropout, training=self.training)
+        
+        # Self-attention mask: BD3LM mask during training or build block-causal mask for inference
+        if self_attn_mask is None:
+            self_mask = build_block_causal_mask(batch_size, tgt_len, self.block_size, dtype, device)
         else:
-            q_idx = torch.arange(max_seq_len * 2)[:, None]
-            kv_idx = torch.arange(max_seq_len * 2)[None, :]
-            self.register_buffer('_block_diff_mask', block_diff_mask(
-                b=None, h=None, q_idx=q_idx, kv_idx=kv_idx,
-                block_size=block_size, n=max_seq_len))
+            self_mask = self_attn_mask.to(dtype=dtype, device=device)
+            
+        # Optional sigma conditioning: add to all sequence positions
+        if sigma is not None and hasattr(self, 'sigma_embedder'):
+            sigma_emb = self.sigma_embedder(sigma)    # (B, D)
+            hidden = hidden + sigma_emb.unsqueeze(1)  # broadcast over seq
+        
+        # Cross-attention mask: expand encoder padding mask to 4D
+        cross_mask = ( 
+            AttentionMaskConverter._expand_mask(enc_mask, dtype, tgt_len=tgt_len)
+            if enc_mask is not None else None)
 
-        print(f'BlockDiffusionDecoder: d={d_model}, heads={n_heads}, layers={n_layers}, block={block_size}, vocab={vocab_size}+1(MASK), '
-              f'max_len={max_seq_len}, dropout={dropout}, attn={self.attn_backend}, time_cond={time_conditioning}, ignore_bos={ignore_bos}')
+        # Run each decoder layer (self-attn + cross-attn + FFN)
+        for layer in self.mbart_decoder.layers:
+            hidden = layer(
+                hidden, attention_mask=self_mask,
+                encoder_hidden_states=enc_hidden,
+                encoder_attention_mask=cross_mask,
+            )[0]
 
-    # ── Diffusion utilities (matching bd3lms/diffusion.py) ────────────────────
+        # Final layer norm (present in mBART-large)
+        if getattr(self.mbart_decoder, 'layer_norm', None) is not None:
+            hidden = self.mbart_decoder.layer_norm(hidden)
+        return self.lm_head(hidden)   # (B, T, vocab_size+1)
 
-    def _sigma_from_p(self, p): # Convert move_chance p to sigma — matches Diffusion._sigma_from_p
-        return torch.min(-torch.log(1 - p), self.noise.sigma_max.to(p.device))
+    # ── Parameterization and sampling ────────────────────────────────────────
 
-    def _process_sigma(self, sigma): # Ref: bd3lms/diffusion.py Diffusion._process_sigma lines 308-319
-        assert sigma.ndim == 2
-        sigma = sigma.mean(-1).squeeze()
-        if sigma.ndim == 0: sigma = sigma.unsqueeze(0)
-        if not self.time_conditioning: sigma = torch.zeros_like(sigma)
-        assert sigma.ndim == 1, sigma.shape
-        return sigma
-
-    def _sample_t(self, batch_size, num_blocks, device): # Ref: bd3lms/diffusion.py Diffusion._sample_t lines 768-789
-        # Sample timesteps per block with antithetic sampling
-        _eps_b = torch.rand((batch_size, num_blocks), device=device)
+    def _sample_t(self, batch_size, num_blocks, device):
+        # Antithetic timestep sampling per block; mask x0 → xt (bd3lms diffusion.py _sample_t)
+        t = torch.rand((batch_size, num_blocks), device=device)
         if self.antithetic_sampling:
             offset = torch.arange(batch_size * num_blocks, device=device).float()
-            offset = offset / (batch_size * num_blocks)
-            offset = offset.view(batch_size, num_blocks)
-            _eps_b = (_eps_b / (batch_size * num_blocks) + offset) % 1
-        t = _eps_b
-        if self.block_size != self.max_seq_len: t = t.repeat_interleave(self.block_size, dim=-1)
+            offset = (offset / (batch_size * num_blocks)).view(batch_size, num_blocks)
+            t = (t / (batch_size * num_blocks) + offset) % 1.0
+        t = t.repeat_interleave(self.block_size, dim=-1)
         return t * (self.sampling_eps_max - self.sampling_eps_min) + self.sampling_eps_min
-
-    def q_xt(self, x, p): # Ref: bd3lms/diffusion.py Diffusion.q_xt lines 502-536
-        # Create noisy sample by masking tokens
-        move_indices = torch.rand(*x.shape, device=x.device) <= p
-        return torch.where(move_indices, self.mask_index, x)
-
-    def _subs_parameterization(self, logits, xt): # Ref: bd3lms/diffusion.py Diffusion._subs_parameterization lines 275-291
-        # Apply substitution parameterization
-        logits[:, :, self.mask_index] += self.neg_infinity
+    
+    def _subs_parameterization(self, logits, xt):
+        '''Substitution parameterization (bd3lms diffusion.py _subs_parameterization).
+        Forces the model to predict the original token, not MASK, and preserves already-unmasked positions.
+        '''
+        logits = logits.clone()  # avoid in-place modification of lm_head's output tensor
+        logits[..., self.mask_token_id] += self.neg_infinity
         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-        unmasked_indices = (xt != self.mask_index)
-        logits[unmasked_indices] = self.neg_infinity
-        logits[unmasked_indices, xt[unmasked_indices]] = 0
+        unmasked = xt != self.mask_token_id
+        logits[unmasked] = self.neg_infinity
+        logits[unmasked, xt[unmasked]] = 0.0
         return logits
 
-    @torch.no_grad()
-    def _nucleus_sample(self, p_x0): # Ref: bd3lms/diffusion.py Diffusion._nucleus_sample lines 543-556
+    def _nucleus_sample(self, p_x0):
+        '''Top-p nucleus filtering on the last block_size positions (bd3lms).
+        p_x0: (B, L, vocab_size+1) probabilities (not log).
+        Only the last block_size columns are filtered in-place.
+        '''
         if self.nucleus_p >= 1.0: return p_x0
         p_x0_ = p_x0[:, -self.block_size:].clone()
         sorted_probs, sorted_indices = p_x0_.sort(dim=-1, descending=True)
         cum_probs = sorted_probs.cumsum(dim=-1)
         nucleus_mask = cum_probs <= self.nucleus_p
-        nucleus_mask[..., 0] = 1
+        nucleus_mask[..., 0] = True   # always keep top token
         sorted_probs = sorted_probs * nucleus_mask
-        p_x0_.scatter_(-1, sorted_indices, sorted_probs * nucleus_mask)
-        p_x0_ /= p_x0_.sum(-1, keepdim=True)
+        p_x0_.scatter_(-1, sorted_indices, sorted_probs)
+        p_x0_ /= p_x0_.sum(dim=-1, keepdim=True).clamp(min=1e-10)
         p_x0[:, -self.block_size:] = p_x0_
         return p_x0
 
-    # ── Encoder context management ────────────────────────────────────────────
-
-    def _set_encoder_context(self, encoder_out, encoder_mask):
-        for block in self.blocks:
-            block._encoder_out = encoder_out
-            block._encoder_mask = encoder_mask
-
-    def _clear_encoder_context(self):
-        for block in self.blocks:
-            block._encoder_out = None
-            block._encoder_mask = None
-
-    # ── Training forward pass (matches DIT.forward structure) ──────────────────────
-
-    def _backbone_forward(self, x_input, sigma, sample_mode=False, store_kv=False):
-        '''Embedding -> transformer blocks -> output projection.
-        Ref: bd3lms/models/dit.py DIT.forward lines 729-775.'''
-        device = x_input.device
-        x = self.vocab_embed(x_input)
-        t_cond = F.silu(self.sigma_map(sigma)) if sigma is not None else None
-        n = self.max_seq_len
-
-        # Mask and rotary setup — mirrors DIT.forward exactly
-        mask = self._block_diff_mask
-        if sample_mode:
-            if self.use_kv_cache and self.blocks[0].kv_cache is not None:
-                # KV cache: full cross-attention to cached KV pairs
-                # Ref: DIT.forward lines 741-748
-                accum_len = self.blocks[0].cache_idx + self.block_size
-                x_full = torch.zeros((x.shape[0], accum_len, x.shape[2]), device=device)
-                rotary_cos_sin = self.rotary_emb(x_full)
-                mask = None
-            else: # No cache: index block-causal mask to x0 portion. Ref: DIT.forward lines 750-753
-                rotary_cos_sin = self.rotary_emb(x)
-                if self.attn_backend == 'sdpa':
-                    mask = self._block_diff_mask[n:n + x_input.shape[1], n:n + x_input.shape[1]].to(device)
-                else: mask = None # flex: always uses kv_cache during sampling
-        else: # Training: rotary for xt portion only (first n tokens of [xt, x0]). Ref: DIT.forward line 756
-            rotary_cos_sin = self.rotary_emb(x[:, :n])
-            if self.attn_backend == 'sdpa': mask = mask.to(device)
-            # flex: mask is already a block_mask object, passed directly
-
-        # Blocks + output under bfloat16 autocast (matching DIT.forward)
-        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
-            for block in self.blocks:
-                x = block(x, rotary_cos_sin, c=t_cond, mask=mask, sample_mode=sample_mode, store_kv=store_kv)
-            logits = self.output_layer(x, t_cond)
-
-        # Training: return only xt portion logits (matching DIT.forward line 773-774)
-        if not sample_mode: logits = logits[:, :n]
-        return logits
-
-
-    def _forward_pass_diffusion(self, x0, attention_mask, encoder_out, encoder_mask):
-        # Ref: bd3lms/diffusion.py Diffusion._forward_pass_diffusion + _loss
-        B, L = x0.shape
-        device = x0.device
-        num_blocks = L // self.block_size
-        
-        t = self._sample_t(B, num_blocks, device) # Sample timesteps per block (matches bd3lms _sample_t)
-        loss_scale, p = self.noise(t) # Get noise schedule: loss_scale = -1/t, p = t (matches LogLinearNoise)
-        sigma = self._sigma_from_p(p[:, 0].unsqueeze(-1))  # (B, 1): sigma = -log(1 - p) for first block's timestep (matches bd3lms)
-        
-        xt = self.q_xt(x0, p) # Create noisy sample (matches bd3lms q_xt)
-        if self.ignore_bos: xt[:, 0] = x0[:, 0]
-        x_input = torch.cat((xt, x0), dim=-1) # Concatenate [xt, x0] for block-causal training (matches bd3lms cross_attn)
-        sigma_proc = self._process_sigma(sigma) # Process sigma for conditioning: (B,1) -> (B,) (matches bd3lms _process_sigma)
-        self._set_encoder_context(encoder_out, encoder_mask) # Set encoder context for cross-attention
-
-        # Forward pass — wrapping in float32 autocast to match Diffusion.forward
-        # (the inner _backbone_forward uses bfloat16 for blocks, matching DIT.forward)
-        with torch.amp.autocast('cuda' if device.type == 'cuda' else 'cpu', dtype=torch.float32):
-            logits = self._backbone_forward(x_input, sigma_proc)
-
-        logits = self._subs_parameterization(logits, xt) # Apply subs parameterization OUTSIDE autocast (matches bd3lms flow)
-        log_p_theta = torch.gather(input=logits, dim=-1, index=x0[:, :, None]).squeeze(-1) # Gather log-probs at GT positions
-        loss = loss_scale * log_p_theta # (B, L)
-
-        # During eval, exclude BOS from loss (matches bd3lms _loss lines 884-885)
-        if self.ignore_bos and not self.training:
-            attention_mask = attention_mask.clone()
-            attention_mask[:, 0] = 0
-
-        nlls = loss * attention_mask # Mask out padding positions (matches bd3lms _loss)
-        return nlls.sum() / attention_mask.sum().clamp(min=1)
-
+    # ── Training forward pass ─────────────────────────────────────────────────
 
     def forward(self, **kwargs):
-        '''Training forward pass — matches TranslationNetwork interface.
+        '''BD3LM training forward pass (dLLM A2D) — matches TranslationNetwork interface.
+
+        Implements the BD3LM training from dLLM (arxiv.org/abs/2602.22661):
+          1. Build x0 (clean target), pad to multiple of block_size.
+          2. Sample per-block noise and create xt (noised tokens).
+          3. Concatenate [xt | x0] → (B, 2L) with BD3LM attention mask.
+          4. Repeated position IDs: [0..L-1, 0..L-1].
+          5. Take first L logits (xt positions) for loss computation.
+          6. Cross-entropy weighted by 1/t at masked positions only.
 
         Expected kwargs:
-            input_feature: (B, T_v, D) visual features from VLMapper
-            input_lengths: (B,) valid lengths of visual features
-            labels: (B, L_text) target token IDs
-            decoder_input_ids: (B, L_text) (unused, kept for interface compatibility)
+            input_feature: (B, T_v, D) visual features from VLMapper.
+            input_lengths: (B,) valid lengths of visual feature sequences.
+            labels: (B, L_text) target token IDs (-100 for HF ignore positions).
+            decoder_input_ids: (B, L_text) BOS-shifted inputs (provides BOS token).
         Returns:
-            dict with 'translation_loss'
+            dict with 'translation_loss' (scalar).
         '''
         input_feature = kwargs['input_feature']
         input_lengths = kwargs['input_lengths']
@@ -342,166 +319,195 @@ class BlockDiffusionDecoder(nn.Module):
         decoder_input_ids = kwargs.get('decoder_input_ids', None)
         B, device = input_feature.shape[0], input_feature.device
 
-        # Build visual padding mask (on same device as input)
-        T_v = input_feature.shape[1]
-        encoder_mask = torch.zeros(B, T_v, dtype=torch.bool, device=device)
-        for i in range(B): encoder_mask[i, :input_lengths[i].long()] = True
-
-        # Prepare target tokens: remove ignore_index (-100) and replace with pad
+        # ── 1. Build x0 (clean target): [BOS, label_tokens...] ───────────────
         x0 = labels.clone().to(device)
         x0[x0 == -100] = self.pad_index
-
         if decoder_input_ids is not None: bos = decoder_input_ids[:, 0:1].to(device)
         else: bos = torch.full((B, 1), self.bos_index, dtype=x0.dtype, device=device)
-        x0 = torch.cat([bos, x0], dim=1)
+        x0 = torch.cat([bos, x0], dim=1)             # (B, L+1)
 
-        # Attention mask: 1 for real tokens (BOS + text + EOS), 0 for padding
-        text_mask = (x0 != self.pad_index).float()
+        # Text attention mask: 1 for real tokens, 0 for padding
+        text_mask = (x0 != self.pad_index)           # (B, L+1) bool
+        if self.ignore_bos: text_mask[:, 0] = False  # BOS never masked
 
-        # Pad/truncate to max_seq_len (required for pre-compiled flex mask dimensions)
-        # bd3lms uses fixed-length sequences (config.model.length); we do the same.
-        if x0.shape[1] > self.max_seq_len:
-            x0 = x0[:, :self.max_seq_len]
-            text_mask = text_mask[:, :self.max_seq_len]
-        if x0.shape[1] < self.max_seq_len:
-            pad_len = self.max_seq_len - x0.shape[1]
-            x0 = F.pad(x0, (0, pad_len), value=self.pad_index)
-            text_mask = F.pad(text_mask, (0, pad_len), value=0.0)
+        # Align length to a multiple of block_size
+        L = x0.shape[1]
+        num_blocks = max(1, math.ceil(L / self.block_size))
+        L_aligned = num_blocks * self.block_size
+        if L < L_aligned:
+            x0 = F.pad(x0, (0, L_aligned - L), value=self.pad_index)
+            text_mask = F.pad(text_mask, (0, L_aligned - L), value=False)
+        else:
+            x0 = x0[:, :L_aligned]
+            text_mask = text_mask[:, :L_aligned]
+        L = L_aligned
 
-        loss = self._forward_pass_diffusion(x0, text_mask, input_feature, encoder_mask)
-        self._clear_encoder_context()
-        return {'translation_loss': loss}
+        # ── 2. Sample noise and create xt (noised tokens) ────────────────────
+        t = self._sample_t(B, num_blocks, device) # (B, L) per-block t; mask x0 → xt
+        _, p = self.noise(t)                      # loglinear schedule: p=t (mask probability)
+        rand = torch.rand_like(x0.float())
+        masked_mask = (rand < p) & text_mask      # (B, L) bool, True = masked AND valid text position
+        xt = torch.where(masked_mask, self.mask_token_id, x0)
+
+        # ── 3. Decoder forward with BD3LM mask ───────────────────────────────
+        enc_hidden, enc_mask = self._encode_visual(input_feature, input_lengths)
+        
+        # BD3LM attention mask: (1, 1, 2L, 2L)
+        bd3lm_mask = build_bd3lm_mask(L, self.block_size, enc_hidden.dtype, device)
+
+        # Repeated position IDs: [0..L-1, 0..L-1]
+        base_pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+        position_ids = torch.cat([base_pos, base_pos], dim=1)  # (B, 2L)
+        
+        # Sigma: not used for mBART A2D (dLLM BD3LMTrainer does not pass sigma).
+        sigma = None # TimestepEmbedder is DDiT-specific (AdaLN); for mBART it adds noise.
+
+        # BD3LM forward: [xt | x0] with 3-component mask
+        logits = self._decode(
+            torch.cat([xt, x0], dim=1), # (B, 2L), concatenate [xt | x0] with SHARED positional embeddings
+            enc_hidden, enc_mask, self_attn_mask=bd3lm_mask,
+            position_ids=position_ids, sigma=sigma
+        )  # (B, 2L, V+1)
+        logits = logits[:, :L]  # (B, L, V+1), take only first L logits (xt half)
+
+        # ── 4. Compute weighted cross-entropy loss ────────────────────────────
+        loss_weights = 1.0 / t.clamp(min=1e-6)  # (B, L), 1/t per block (MDLM loglinear schedule)
+        
+        # Substitution parameterization is simply equivalent to cross-entropy
+        # with targets = x0 and logits masked to force MASK prediction at masked positions.
+        token_nll = F.cross_entropy( 
+            logits.transpose(1, 2),             # (B, V+1, L)
+            x0,                                 # (B, L) — targets
+            reduction='none',                   # (B, L)
+        )
+        # Mask: only count loss at masked & maskable positions
+        loss_mask = masked_mask.float()         # (B, L)
+        weighted_nll = token_nll * loss_weights * loss_mask  # Zero out unmasked positions
+
+        # Normalize by total maskable tokens (dLLM "token" normalization)
+        translation_loss = weighted_nll.sum() / loss_mask.sum().clamp(min=1)
+        return {'translation_loss': translation_loss}
 
     # ── Inference ─────────────────────────────────────────────────────────────
-
-    def reset_kv_cache(self, batch_size): # Initialize KV cache for inference
-        device = next(self.parameters()).device
-        for block in self.blocks:
-            block.kv_cache = torch.zeros(batch_size, self.max_seq_len, self.d_model * 3, device=device, dtype=torch.bfloat16)
-            block.cache_idx = 0
-
-    def clear_kv_cache(self):
-        for block in self.blocks:
-            block.kv_cache = None
-            block.cache_idx = 0
-
+    
+    def _sigma_from_p(self, p): # Diffusion utilities (noise schedule helpers)
+        # Convert masking probability p to sigma (bd3lms diffusion._sigma_from_p)
+        sigma_max = self.noise.sigma_max.to(device=p.device, dtype=p.dtype)
+        return torch.min(-torch.log1p(-p.clamp(max=1.0 - 1e-7)), sigma_max)
 
     @torch.no_grad()
-    def _ddpm_caching_update(self, x, t, dt, p_x0=None, use_first_hitting=False):
-        '''Single DDPM transition step with p_x0 caching.
-        Ref: bd3lms/diffusion.py Diffusion._ddpm_caching_update lines 559-603.
-        x is the context window (x_accum[:, fwd_idx]), NOT the full accumulator.
+    def _ddpm_caching_update(self, x, t, dt, enc_hidden, enc_mask, p_x0=None):
+        '''One BD3LM DDPM denoising step (bd3lms._ddpm_caching_update, A2D variant).
+
+        Uses full forward pass with block-causal mask (correct dLLM A2D approach).
+        KV caching is DDiT-specific and not applicable to mBART A2D.
+
+        Args:
+            x:          (B, context_len) tokens; last block_size positions = current block.
+            t:          (B, 1) current timestep in [0, 1].
+            dt:         float, timestep decrement (1 / num_steps_per_block).
+            enc_hidden: visual encoder hidden states.
+            enc_mask:   visual encoder padding mask.
+            p_x0:       cached model output from previous step (None = recompute).
+
+        Returns:
+            p_x0:  model output reused next step if unchanged, else None.
+            x_new: updated context window.
         '''
-        _, move_chance_t = self.noise(t)             # (B, 1)
-        _, move_chance_s = self.noise(t - dt)        # (B, 1)
-        sigma_t = self._sigma_from_p(move_chance_t)  # (B, 1)
-        move_chance_t = move_chance_t[:, None]
-        move_chance_s = move_chance_s[:, None]
-        mask_prob = move_chance_s / move_chance_t
+        _, move_chance_t = self.noise(t)                           # (B, 1)
+        _, move_chance_s = self.noise((t - dt).clamp(min=1e-10))   # (B, 1)
+        alpha_t = move_chance_t[:, :, None]                        # (B, 1, 1)
+        alpha_s = move_chance_s[:, :, None]                        # (B, 1, 1)
+        mask_prob = alpha_s / alpha_t.clamp(min=1e-10)             # (B, 1, 1)
+        cur_block = x[:, -self.block_size:]                        # (B, block_size)
 
         if p_x0 is None:
-            sigma_proc = self._process_sigma(sigma_t)  # (B,)
-            device_type = 'cuda' if x.device.type == 'cuda' else 'cpu'
-            with torch.amp.autocast(device_type, dtype=torch.float32):
-                if self.use_kv_cache and self.blocks[0].kv_cache is not None:
-                    logits = self._backbone_forward(x[:, -self.block_size:], sigma_proc, sample_mode=True)
-                else:
-                    logits = self._backbone_forward(x, sigma_proc, sample_mode=True)
-                    logits = logits[:, -self.block_size:] # Get predictions for current block only
-
-            # SUBS parameterization + exp to get probabilities (matches bd3lms lines 572-578)
-            xt_block = x[:, -self.block_size:]
-            logits = self._subs_parameterization(logits.clone(), xt_block)
-            p_x0 = logits.to(torch.float64).exp()
+            sigma_t = self._sigma_from_p(move_chance_t) if self.time_conditioning else None
+            logits = self._decode(x, enc_hidden, enc_mask, sigma=sigma_t)  # (B, context_len, V+1)
+            logits = logits[:, -self.block_size:]                          # (B, block_size, V+1)
+            logits = self._subs_parameterization(logits, cur_block)
+            p_x0 = logits.float().exp()
             p_x0 = self._nucleus_sample(p_x0)
 
-        if use_first_hitting: # First-hitting sampler (exact bd3lms lines 580-587)
-            x_block = _sample_categorical(p_x0)
-            num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-            ind = torch.randint(0, num_masked, (x_block.shape[0],))
-            ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
-            mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
-            x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
-        else: # Standard DDPM transition (bd3lms lines 588-591)
-            q_xs = p_x0 * (1 - mask_prob)
-            q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
+        if self.first_hitting: # Unmask exactly one randomly-chosen masked position per sample
+            x_block_pred = _sample_categorical(p_x0)               # (B, block_size)
+            x_block = cur_block.clone()
+            for b in range(x_block.shape[0]):
+                masked_pos = (cur_block[b] == self.mask_token_id).nonzero(as_tuple=True)[0]
+                if len(masked_pos) > 0:
+                    pick = torch.randint(len(masked_pos), (1,), device=x.device).item()
+                    x_block[b, masked_pos[pick]] = x_block_pred[b, masked_pos[pick]]
+        else: # DDPM transition: q(xs|xt,x0) (bd3lms eq.)
+            q_xs = p_x0 * (1 - mask_prob)                          # (B, block_size, V+1)
+            q_xs[..., self.mask_token_id] = mask_prob.squeeze(-1)  # broadcast (B,1)→(B,block)
             x_block = _sample_categorical(q_xs)
 
-        # Carry-over: preserve already-unmasked tokens (bd3lms lines 592-594)
-        copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
-        x_block = copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
-        x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+        # Preserve already-unmasked tokens
+        copy_flag = (cur_block != self.mask_token_id)
+        x_block = torch.where(copy_flag, cur_block, x_block)
+        x_new = torch.cat([x[:, :-self.block_size], x_block], dim=-1)
 
-        # Store KV cache if entire block is committed (bd3lms lines 597-598)
-        if self.use_kv_cache and self.mask_index not in x_block:
-            sigma_proc = self._process_sigma(sigma_t)
-            self._backbone_forward(x_block, sigma_proc, sample_mode=True, store_kv=True)
-
-        # Cache p_x0 if state didn't change (for reuse, bd3lms lines 600-603)
-        if not torch.allclose(x_new, x): return None, x_new
-        return p_x0, x_new
+        # Cache p_x0 only if tokens didn't change (avoid redundant forward pass)
+        return (None, x_new) if not torch.equal(x_new, x) else (p_x0, x_new)
 
 
     @torch.no_grad()
-    def generate(self, input_feature=None, input_lengths=None, max_length=100, diffusion_steps=5000, **kwargs):
-        '''Semi-AR block diffusion sampling.
-        Ref: bd3lms/diffusion.py Diffusion._semi_ar_sampler lines 979-1052.
-        Key: pass x_accum[:, fwd_idx] (context window) to _ddpm_caching_update,
-        then write back x_accum[:, fwd_idx] = x_next (matching bd3lms exactly).
+    def generate(self, input_feature=None, input_lengths=None, max_length=100, diffusion_steps=128, **kwargs):
+        '''BD3LM semi-AR block diffusion inference (dLLM A2D for mBART).
+
+        Faithful adaptation of bd3lms._semi_ar_sampler() for mBART:
+          - Full forward pass with block-causal mask each step (dLLM A2D)
+          - DDPM transitions or first-hitting sampler (controlled by first_hitting)
+          - p_x0 caching: reuse model output when no tokens changed
+          - Nucleus sampling: top-p filtering (controlled by nucleus_p)
         '''
         B = input_feature.shape[0]
         device = input_feature.device
+        enc_hidden, enc_mask = self._encode_visual(input_feature, input_lengths)
 
-        # Build encoder mask and set context
-        T_v = input_feature.shape[1]
-        encoder_mask = torch.zeros(B, T_v, dtype=torch.bool, device=device)
-        for i in range(B): encoder_mask[i, :input_lengths[i].long()] = True
-        self._set_encoder_context(input_feature, encoder_mask)
-
-        # First-hitting requires batch_size=1 (bd3lms constraint)
-        use_first_hitting = self.first_hitting and B == 1
-        num_blocks_max = max_length // self.block_size
+        num_blocks_max = max(1, max_length // self.block_size)
+        num_steps = max(1, diffusion_steps // num_blocks_max)  # steps per block
+        dt = 1.0 / num_steps
         ones = torch.ones((B, 1), device=device)
-        if self.use_kv_cache: self.reset_kv_cache(B)
 
-        x_accum = None
-        for block_idx in range(num_blocks_max):
-            # Extend with MASK block (matches bd3lms _sample_prior + concat)
-            new_block = torch.full((B, self.block_size), self.mask_index, dtype=torch.long, device=device)
-            if x_accum is None:
-                x_accum = new_block
-                x_accum[:, 0] = self.bos_index
-            else:
-                x_accum = torch.cat((x_accum, new_block), dim=1)
+        # First block: position 0 = BOS (never masked), rest = MASK
+        x_accum = torch.full((B, self.block_size), self.mask_token_id, dtype=torch.long, device=device)
+        x_accum[:, 0] = self.bos_index
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
 
-            # Compute context window indices (matches bd3lms fwd_idx logic, lines 1011-1013)
-            end_idx = (block_idx + 1) * self.block_size
-            start_idx = max(end_idx - self.max_seq_len, 0)  # context can't exceed max_seq_len
-            fwd_idx = torch.arange(start_idx, end_idx)
+        for stride_num in range(num_blocks_max):
+            if finished.all(): break
+            if stride_num > 0:
+                new_block = torch.full((B, self.block_size), self.mask_token_id, dtype=torch.long, device=device)
+                x_accum = torch.cat([x_accum, new_block], dim=1)
 
-            dt = 1.0 / diffusion_steps
-            t = 1.0
-            p_x0_cache = None
+            end_idx = (stride_num + 1) * self.block_size
+            start_idx = max(end_idx - 1024, 0)  # Context window (≤1024 tokens)
+            p_x0_cache, t_val = None, 1.0
+            timesteps = torch.linspace(1.0, 0.0, num_steps, device=device)
 
-            for step in range(diffusion_steps):
-                if self.mask_index not in x_accum[:, fwd_idx]: break
-                if use_first_hitting:
-                    u = np.random.rand()
-                    num_masked = (x_accum[:, fwd_idx] == self.mask_index).sum(-1).item()
-                    if num_masked == 0: break
-                    t *= u ** (1.0 / num_masked)
+            for step in range(num_steps):
+                context = x_accum[:, start_idx:end_idx]  # (B, context_len)
+                cur_blk = context[:, -self.block_size:]
+                if not (cur_blk == self.mask_token_id).any(): break  # Block fully denoised
+
+                if self.first_hitting: # Geometric timestep: t *= u^(1/num_masked)
+                    u = torch.rand(1, device=device).item()
+                    n_masked = float((cur_blk == self.mask_token_id).sum())
+                    n_per_sample = max(n_masked / B, 1.0)
+                    t_val = t_val * (u ** (1.0 / n_per_sample))
                 else:
-                    t = 1.0 - step / diffusion_steps
+                    t_val = float(timesteps[step].item())
 
-                # Pass windowed context to _ddpm_caching_update (matches bd3lms line 1034-1038)
-                p_x0_cache, x_next = self._ddpm_caching_update(
-                    x=x_accum[:, fwd_idx], t=t * ones, dt=dt, p_x0=p_x0_cache,
-                    use_first_hitting=use_first_hitting)
-                x_accum[:, fwd_idx] = x_next  # Write back to accumulator (matches bd3lms line 1042)
+                t_tensor = max(t_val, 1e-10) * ones  # (B, 1)
+                p_x0_cache, context_new = self._ddpm_caching_update(
+                    x=context, t=t_tensor, dt=dt,
+                    enc_hidden=enc_hidden, enc_mask=enc_mask, p_x0=p_x0_cache,
+                )
+                x_accum[:, start_idx:end_idx] = context_new
 
-            if any(self.eos_index in x_accum[b, -self.block_size:] for b in range(B)):
-                break # Check for EOS in current block
-
-        self._clear_encoder_context()
-        self.clear_kv_cache()
-        return {'sequences': x_accum, 'decoded_sequences': None}
+            # Check for EOS in the newly finished block
+            cur_blk_final = x_accum[:, end_idx - self.block_size:end_idx]
+            for b in range(B):
+                if not finished[b] and (cur_blk_final[b] == self.eos_index).any(): finished[b] = True
+        return {'sequences': x_accum}
