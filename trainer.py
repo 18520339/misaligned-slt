@@ -101,11 +101,12 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, train_cfg, clip
     model.train()
     num_batches = 0
     total_loss, total_rec_loss, total_trans_loss = 0.0, 0.0, 0.0
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+    pbar = tqdm(total=len(dataloader), desc=f"Epoch {epoch + 1}/{train_cfg.get('epochs')}")
+    current_lr = optimizer.param_groups[0]['lr']
     
-    for step, src_input in enumerate(pbar):
+    for step, batch in enumerate(dataloader):
         optimizer.zero_grad()
-        output = model(src_input)
+        output = model(batch)
         loss = output['total_loss']
 
         # NaN/Inf guard
@@ -127,12 +128,15 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, train_cfg, clip
         total_rec_loss += rec_loss
         total_trans_loss += trans_loss
         num_batches += 1
-        pbar.set_postfix(loss=f'{loss_val:.3f}', rec=f'{rec_loss:.3f}', trans=f'{trans_loss:.3f}')
+        
+        pbar.set_postfix(loss=f'{loss_val:.3f}', rec=f'{rec_loss:.3f}', trans=f'{trans_loss:.3f}, lr={current_lr:.2e}')
+        pbar.update(1)
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_rec = total_rec_loss / max(num_batches, 1)
     avg_trans = total_trans_loss / max(num_batches, 1)
-    print(f'Epoch {epoch}: loss={avg_loss:.4f}, rec={avg_rec:.4f}, trans={avg_trans:.4f}')
+    pbar.set_postfix(loss=f'{avg_loss:.4f}', rec=f'{avg_rec:.4f}', trans=f'{avg_trans:.4f}, lr={current_lr:.2e}')
+    pbar.close()
     return {'loss': avg_loss, 'rec_loss': avg_rec, 'trans_loss': avg_trans}
 
 
@@ -148,9 +152,9 @@ def evaluate_one_epoch(model, dataloader, mska_cfg, generate_cfg=None, beam_size
     sample_results = defaultdict(dict)
     total_loss, total_rec_loss, total_trans_loss, num_batches = 0., 0., 0., 0
 
-    for src_input in tqdm(dataloader, desc=desc):
-        output = model(src_input) # Run forward pass to get recognition outputs + transformer_inputs + loss
-        collect_batch_predictions(model, src_input, output, sample_results, beam_size=beam_size, generate_cfg=generate_cfg)
+    for batch in tqdm(dataloader, desc=desc):
+        output = model(batch) # Run forward pass to get recognition outputs + transformer_inputs + loss
+        collect_batch_predictions(model, batch, output, sample_results, beam_size=beam_size, generate_cfg=generate_cfg)
 
         # Accumulate dev loss
         total_loss += output['total_loss'].item()
@@ -188,8 +192,9 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
     generate_cfg = model_cfg.get('validation', {}).get('translation', {'length_penalty': 1, 'max_length': 100, 'num_beams': 5})
     if model_cfg.get('decoder_type') == 'bd':
         bd_cfg = model_cfg.get('block_diffusion', {})
-        # bd3lms Section C.5: 5K diffusion steps (early stopping makes this fast)
-        generate_cfg['diffusion_steps'] = bd_cfg.get('diffusion_steps', 5000)
+        # Use diffusion_steps from validation config; fall back to block_diffusion config or 128
+        if 'diffusion_steps' not in generate_cfg:
+            generate_cfg['diffusion_steps'] = bd_cfg.get('diffusion_steps', 128)
     beam_size = model_cfg.get('validation', {}).get('recognition', {}).get('beam_size', 1)
 
     # Build dataloaders
@@ -221,11 +226,11 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
         print(f'Resuming from {resume_from}')
         ckpt = torch.load(resume_from, map_location='cpu')
         model.load_state_dict(ckpt['model'], strict=False)
-        if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
-        if 'scheduler' in ckpt and ckpt['scheduler'] is not None: scheduler.load_state_dict(ckpt['scheduler'])
-        if 'ema' in ckpt and ckpt['ema'] is not None and ema is not None:
-            ema.load_state_dict(ckpt['ema'])
-            ema.move_shadow_params_to_device(device)
+        # if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
+        # if 'scheduler' in ckpt and ckpt['scheduler'] is not None: scheduler.load_state_dict(ckpt['scheduler'])
+        # if 'ema' in ckpt and ckpt['ema'] is not None and ema is not None:
+        #     ema.load_state_dict(ckpt['ema'])
+        #     ema.move_shadow_params_to_device(device)
         start_epoch = ckpt.get('epoch', 0) + 1
         best_bleu4 = ckpt.get('best_bleu4', 0.0)
 
