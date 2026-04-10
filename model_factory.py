@@ -51,9 +51,9 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
                 sampling_eps_max=bd_cfg.get('sampling_eps_max', 1.0),
                 antithetic_sampling=bd_cfg.get('antithetic_sampling', True),
                 ignore_bos=bd_cfg.get('ignore_bos', True),
-                first_hitting=bd_cfg.get('first_hitting', True),
-                nucleus_p=bd_cfg.get('nucleus_p', 1.0),
-                time_conditioning=bd_cfg.get('time_conditioning', False)
+                temperature=bd_cfg.get('temperature', 0.0),
+                remasking=bd_cfg.get('remasking', 'low_confidence'),
+                steps_per_block=bd_cfg.get('steps_per_block', None),
             )
             # Remove the original TranslationNetwork from mska_model to avoid
             # duplicate parameters (bd_decoder already holds refs to its submodules).
