@@ -285,16 +285,8 @@ def mode_train(args, proj_cfg, mska_cfg, device): # Phase 2 training: train AR+A
         else:
             print('train_from_scratch=True: all components initialized randomly.')
     else:
-        resume_from = train_cfg.get('resume_from')
-        if resume_from: # Resume from Phase 2 checkpoint (e.g., bd_aug resumes from bd_clean)
-            full_resume = os.path.join(PROJECT_ROOT, resume_from)
-            if os.path.exists(full_resume):
-                print(f'Loading Phase 2 checkpoint: {full_resume}')
-                ckpt = torch.load(full_resume, map_location='cpu')
-                model.load_state_dict(ckpt['model'], strict=False)
-        else:
-            ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
-            model.load_pretrained(ckpt_path, strict=False)
+        ckpt_path = os.path.join(PROJECT_ROOT, proj_cfg['paths']['checkpoint'])
+        model.load_pretrained(ckpt_path, strict=False)
 
     # Build training dataset
     prev_cwd = os.getcwd()

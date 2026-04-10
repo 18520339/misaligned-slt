@@ -232,7 +232,7 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
         #     ema.load_state_dict(ckpt['ema'])
         #     ema.move_shadow_params_to_device(device)
         # start_epoch = ckpt.get('epoch', 0) + 1
-        # best_bleu4 = ckpt.get('best_bleu4', 0.0)
+        best_bleu4 = ckpt.get('best_bleu4', 0.0)
 
     # Patience is counted in eval cycles, not epochs
     eval_cycles_without_improvement = 0
@@ -274,7 +274,7 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
             
             dev_metrics = evaluate_one_epoch( # Generate translations and compute BLEU (no redundant loss computation)
                 model, dev_loader, mska_cfg, generate_cfg=generate_cfg,
-                beam_size=beam_size, desc=f'Dev (epoch {epoch})'
+                beam_size=beam_size, desc=f'Dev (epoch {epoch + 1})'
             )
             if ema is not None: ema.restore(model.parameters()) # EMA: restore original params
             
