@@ -20,10 +20,51 @@ from torch.utils.data import DataLoader
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'bd3lms'))
-
 from evaluator import compute_metrics, collect_batch_predictions
-from models.ema import ExponentialMovingAverage
+
+
+class ExponentialMovingAverage: # Maintains (exponential) moving average of a set of parameters.
+    def __init__(self, parameters, decay, use_num_updates=True):
+        if decay < 0.0 or decay > 1.0: raise ValueError('Decay must be between 0 and 1')
+        self.decay = decay
+        self.num_updates = 0 if use_num_updates else None
+        self.shadow_params = [p.clone().detach() for p in parameters if p.requires_grad]
+        self.collected_params = []
+
+    def move_shadow_params_to_device(self, device):
+        self.shadow_params = [i.to(device) for i in self.shadow_params]
+
+    def update(self, parameters):
+        decay = self.decay
+        if self.num_updates is not None:
+            self.num_updates += 1
+            decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
+            
+        one_minus_decay = 1.0 - decay
+        with torch.no_grad():
+            parameters = [p for p in parameters if p.requires_grad]
+            for s_param, param in zip(self.shadow_params, parameters):
+                s_param.sub_(one_minus_decay * (s_param - param))
+
+    def copy_to(self, parameters):
+        parameters = [p for p in parameters if p.requires_grad]
+        for s_param, param in zip(self.shadow_params, parameters):
+            if param.requires_grad: param.data.copy_(s_param.data)
+
+    def store(self, parameters):
+        self.collected_params = [param.clone() for param in parameters]
+
+    def restore(self, parameters):
+        for c_param, param in zip(self.collected_params, parameters):
+            param.data.copy_(c_param.data)
+
+    def state_dict(self):
+        return dict(decay=self.decay, num_updates=self.num_updates, shadow_params=self.shadow_params)
+
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict['decay']
+        self.num_updates = state_dict['num_updates']
+        self.shadow_params = state_dict['shadow_params']
 
 
 def build_optimizer(model, train_cfg):
@@ -79,21 +120,22 @@ def build_scheduler(optimizer, train_cfg):
     t_max = train_cfg.get('t_max', 40)
     warmup_epochs = train_cfg.get('warmup_epochs', 0)
 
-    if scheduler_name == 'cosineannealing':
-        if warmup_epochs > 0: # Warmup + cosine: use SequentialLR
-            warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-            cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(t_max - warmup_epochs, 1), eta_min=0)
-            scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
-            print(f'Scheduler: {warmup_epochs}-epoch warmup + cosine annealing (T_max={t_max})')
-        else:
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=0)
-            print(f'Scheduler: cosine annealing (T_max={t_max})')
-    elif scheduler_name == 'plateau':
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
-        print(f'Scheduler: ReduceLROnPlateau')
+    if scheduler_name == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+        scheduler_str = f'ReduceLROnPlateau (mode=max, factor=0.5, patience=3)'
     else:
+        t_max = max(t_max - warmup_epochs, 1)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=0)
-        print(f"Warning: unknown scheduler '{scheduler_name}', using cosine annealing")
+        if scheduler_name == 'cosineannealing': scheduler_str = f'CosineAnnealingLR (T_max={t_max})' 
+        else: scheduler_str = f"UNKNOWN scheduler '{scheduler_name}', using CosineAnnealingLR (T_max={t_max})"
+
+    if warmup_epochs > 0:
+        warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, scheduler], milestones=[warmup_epochs])
+        scheduler_str = f'Scheduler: {warmup_epochs}-epoch warmup + {scheduler_str}'
+    else: scheduler_str = f'Scheduler: {scheduler_str}'
+
+    print(scheduler_str)
     return scheduler
 
 

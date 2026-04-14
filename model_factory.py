@@ -6,7 +6,9 @@ Creates an SLTModel with either:
 
 Both share the same Recognition network and VLMapper from MSKA.
 '''
-import os, sys, torch
+import os, sys
+import torch
+import torch.nn as nn
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
@@ -15,7 +17,7 @@ from model import SignLanguageModel
 from block_diffusion import BlockDiffusionDecoder
 
 
-class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD decoders.
+class SLTModel(nn.Module): # Unified SLT model supporting both AR and BD decoders.
     # Wraps MSKA's Recognition + VLMapper + a decoder (AR or BD). Provides a consistent interface for training and evaluation
     def __init__(self, mska_cfg, args, model_cfg, decoder_type='ar'):
         super().__init__()
@@ -28,7 +30,12 @@ class SLTModel(torch.nn.Module): # Unified SLT model supporting both AR and BD d
         self.vl_mapper = self.mska_model.vl_mapper
         self.gloss_tokenizer = self.mska_model.gloss_tokenizer
         self.text_tokenizer = self.mska_model.text_tokenizer
-
+        
+        # Re-initialize Recognition and VLMapper parameters (keep tokenizers and pretrained TranslationNetwork for BD)
+        reset_parameters_fn = lambda m: isinstance(m, nn.Module) and hasattr(m, 'reset_parameters') and m.reset_parameters()
+        self.recognition_network.apply(reset_parameters_fn)
+        self.vl_mapper.apply(reset_parameters_fn)
+        
         # Loss weights — read from model_cfg training section (Phase 2 configs)
         train_section = model_cfg.get('training', {})
         self.recognition_weight = train_section.get('recognition_weight', 1.0)
