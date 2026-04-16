@@ -1,8 +1,8 @@
-import json, os, csv
+import json, csv
 from pathlib import Path
 from collections import OrderedDict
 import numpy as np
-from analysis.knee_point import detect_all_knee_points, compute_degradation_rate
+from analysis.knee_point import detect_all_knee_points
 from analysis.failure_modes import classify_all_predictions, failure_mode_distribution
 
 BASIC_ORDER = ['HT', 'TT', 'HC', 'TC']
@@ -39,24 +39,20 @@ def table1_knee_points(results: dict, severity_levels: list) -> str:
 
     lines = ['# Table 1: Knee Point Summary\n']
     lines.append('| Condition | Knee Severity | BLEU at Knee | Clean BLEU | '
-                 'Abs Drop | Rel Drop (%) | WER at Knee | Dominant Failure Mode |')
+                 'Abs Drop | Rel Drop (%) | Dominant Failure Mode |')
     lines.append('|-----------|--------------|-------------|-----------|'
-                 '---------|-------------|------------|----------------------|')
+                 '---------|-------------|----------------------|')
 
     for ctype in ['HT', 'TT', 'HC', 'TC']:
         k = knees.get(ctype, {}).get('bleu4')
         if not k:
-            lines.append(f'| {ctype} | N/A | N/A | {clean_bleu:.1f} | - | - | - | - |')
+            lines.append(f'| {ctype} | N/A | N/A | {clean_bleu:.1f} | - | - | - |')
             continue
 
         knee_sev = k['knee_severity']
         knee_bleu = k['knee_value']
         abs_drop = clean_bleu - knee_bleu
         rel_drop = abs_drop / max(clean_bleu, 0.01) * 100
-
-        # WER at knee
-        wer_k = knees.get(ctype, {}).get('wer')
-        wer_at_knee = wer_k['knee_value'] if wer_k else 'N/A'
 
         # Dominant failure mode at knee severity
         cond_at_knee = f'{ctype}_{int(knee_sev * 100):02d}'
@@ -68,7 +64,6 @@ def table1_knee_points(results: dict, severity_levels: list) -> str:
         lines.append(
             f"| {ctype} | {knee_sev*100:.0f}% | {knee_bleu:.1f} | {clean_bleu:.1f} | "
             f"{abs_drop:.1f} | {rel_drop:.1f}% | "
-            f"{wer_at_knee if isinstance(wer_at_knee, str) else f'{wer_at_knee:.1f}'} | "
             f"{dom_mode} |")
     return '\n'.join(lines)
 
@@ -76,7 +71,6 @@ def table1_knee_points(results: dict, severity_levels: list) -> str:
 # Table 2: Cross-Metric Robustness Summary (aggregated; non-duplicate of CSV)
 def table2_executive_summary(results: dict, severity_levels: list) -> str:
     clean_m = results.get('clean', {}).get('metrics', {})
-    clean_wer = clean_m.get('wer', 0.0)
     clean_bleu = clean_m.get('bleu4', 0.0)
     clean_rouge = clean_m.get('rouge_l', 0.0)
 
@@ -85,8 +79,8 @@ def table2_executive_summary(results: dict, severity_levels: list) -> str:
         'This table is intentionally aggregated (mean ± std across selected severities), '
         'so it complements the CSV instead of duplicating row-level metrics.\n'
     )
-    lines.append('| Group | Mean ΔBLEU (pp) | Mean ΔWER (pp) | Mean ΔROUGE (pp)  | Worst cond (ΔBLEU) |')
-    lines.append('|-------|----------------:|---------------:|------------------:|--------------------|')
+    lines.append('| Group | Mean ΔBLEU (pp) | Mean ΔROUGE (pp)  | Worst cond (ΔBLEU) |')
+    lines.append('|-------|----------------:|------------------:|--------------------|')
 
     groups = OrderedDict({
         'HT': [], 'TT': [], 'HC': [], 'TC': [],
@@ -101,7 +95,6 @@ def table2_executive_summary(results: dict, severity_levels: list) -> str:
         return {
             'cond': cond_name,
             'd_bleu': clean_bleu - bleu,
-            'd_wer': (m.get('wer', clean_wer) - clean_wer) if clean_wer else 0.0,
             'd_rouge': (clean_rouge - m.get('rouge_l', clean_rouge)) if clean_rouge else 0.0,
         }
 
@@ -126,13 +119,11 @@ def table2_executive_summary(results: dict, severity_levels: list) -> str:
     for gname, rows in groups.items():
         if not rows: continue
         d_bleu = [r['d_bleu'] for r in rows]
-        d_wer = [r['d_wer'] for r in rows]
         d_rouge = [r['d_rouge'] for r in rows]
         worst = max(rows, key=lambda r: r['d_bleu'])
         lines.append(
             f"| {gname} | "
             f"{sum(d_bleu)/len(d_bleu):.2f} ± {np.std(d_bleu):.2f} | "
-            f"{sum(d_wer)/len(d_wer):.2f} ± {np.std(d_wer):.2f} | "
             f"{sum(d_rouge)/len(d_rouge):.2f} ± {np.std(d_rouge):.2f} | "
             f"{worst['cond']} ({worst['d_bleu']:.2f}) |"
         )
@@ -147,20 +138,20 @@ def table3_severity_ranking(results: dict, severity_levels: list) -> str:
     
     for cond in all_conds:
         m = results[cond].get('metrics', {})
-        bleu, wer = m.get('bleu4'), m.get('wer')
+        bleu = m.get('bleu4')
         if bleu is not None: rankings.append({
             'condition': cond, 'bleu4': bleu, 'bleu_drop': clean_bleu - bleu,
-            'wer': wer if wer is not None else 0, 'rouge_l': m.get('rouge_l', 0),
+            'rouge_l': m.get('rouge_l', 0),
         })
 
     rankings.sort(key=lambda x: x['bleu_drop'], reverse=True)
     lines = ['# Table 3: Condition Severity Ranking (by BLEU-4 drop)\n']
-    lines.append('| Rank | Condition | BLEU-4 | BLEU Drop | WER | ROUGE |')
-    lines.append('|------|-----------|--------|-----------|-----|-------|')
+    lines.append('| Rank | Condition | BLEU-4 | BLEU Drop | ROUGE-L |')
+    lines.append('|------|-----------|--------|-----------|---------|')
     for i, r in enumerate(rankings, 1):
         lines.append(
             f"| {i} | {r['condition']} | {r['bleu4']:.1f} | "
-            f"-{r['bleu_drop']:.1f} | {r['wer']:.1f} | {r['rouge_l']:.1f} |")
+            f"-{r['bleu_drop']:.1f} | {r['rouge_l']:.1f} |")
 
     # Key finding
     basic_avgs = {}
@@ -188,17 +179,17 @@ def table4_group_metrics(results: dict) -> str:
         summary = _compute_group_summaries(results)
 
     lines = ['# Table 4: Group-Level Absolute Metrics\n']
-    lines.append('| Group | BLEU-4 | WER | ROUGE-L | # Conditions |')
-    lines.append('|-------|-------:|----:|--------:|-------------:|')
+    lines.append('| Group | BLEU-4 | ROUGE-L | # Conditions |')
+    lines.append('|-------|-------:|--------:|-------------:|')
 
     # Clean baseline
     lines.append(
-        f"| Clean | {clean_m.get('bleu4', 0):.2f} | {clean_m.get('wer', 0):.2f} | "
+        f"| Clean | {clean_m.get('bleu4', 0):.2f} | "
         f"{clean_m.get('rouge_l', 0):.2f} | 1 |")
 
     for gname, gdata in summary.items():
         lines.append(
-            f"| {gname} | {gdata['bleu4']:.2f} | {gdata['wer']:.2f} | "
+            f"| {gname} | {gdata['bleu4']:.2f} | "
             f"{gdata['rouge_l']:.2f} | {gdata['n_conditions']} |")
     return '\n'.join(lines)
 
@@ -213,7 +204,7 @@ def export_metrics_csv(results: dict, output_path: str):
             'condition': cond_name, 
             'delta_s': cond_data.get('delta_s', 0), 'delta_e': cond_data.get('delta_e', 0),
             'num_evaluated': cond_data.get('num_evaluated', 0),
-            'wer': m.get('wer', ''), 'bleu4': m.get('bleu4', ''), 'rouge_l': m.get('rouge_l', ''), 
+            'bleu4': m.get('bleu4', ''), 'rouge_l': m.get('rouge_l', ''), 
         }
         rows.append(row)
 

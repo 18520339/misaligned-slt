@@ -3,16 +3,8 @@
 Selects representative samples showing different failure modes and formats
 them for inclusion in the paper.
 '''
-import json, os
-import numpy as np
+import json
 from pathlib import Path
-from collections import defaultdict
-
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.table import Table
-
 from analysis.failure_modes import classify_failure_mode
 
 # Failure mode abbreviations for compact display
@@ -142,7 +134,6 @@ def format_example_table(sample_name: str, results_json: dict, conditions_to_sho
     # Format a single sample's predictions across conditions as a markdown table
     clean_sample = results_json.get('clean', {}).get('predictions', {}).get(sample_name, {})
     ref_text = clean_sample.get('txt_ref', 'N/A')
-    ref_gloss = clean_sample.get('gls_ref', '')
 
     if conditions_to_show is None:
         conditions_to_show = ['clean']
@@ -153,16 +144,14 @@ def format_example_table(sample_name: str, results_json: dict, conditions_to_sho
     lines = [
         f"### Sample: {sample_name}\n",
         f"**Reference:** {ref_text}\n",
-        f"**Reference Gloss:** {ref_gloss}\n",
-        "| Condition | Gloss Prediction | Translation | sBLEU | Mode |",
-        "|-----------|------------------|-------------|-------|------|",
+        "| Condition | Translation | sBLEU | Mode |",
+        "|-----------|-------------|-------|------|",
     ]
     for cond in conditions_to_show:
         if cond not in results_json: continue
         sample = results_json.get(cond, {}).get('predictions', {}).get(sample_name, {})
         if not sample: continue
 
-        gls = sample.get('gls_hyp', '')[:60]
         txt = sample.get('txt_hyp', '')[:80]
         sbleu = sample.get('sentence_bleu', 0)
         mode = classify_failure_mode(
@@ -171,7 +160,7 @@ def format_example_table(sample_name: str, results_json: dict, conditions_to_sho
             sample.get('output_length_ratio', 1),
             sample.get('has_repetition', False))
         mode_abbrev = MODE_ABBREV.get(mode, mode[:5])
-        lines.append(f"| {cond} | {gls} | {txt} | {sbleu:.2f} | {mode_abbrev} |")
+        lines.append(f"| {cond} | {txt} | {sbleu:.2f} | {mode_abbrev} |")
     return '\n'.join(lines)
 
 
