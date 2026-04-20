@@ -1,0 +1,20 @@
+# Phoenix-2014T dataset configuration
+# 8,257 train / 2,571 dev / 2,889 test — German Sign Language (DGS) to German text.
+dataset_name: phoenix2014t
+
+# Input modality for experiments (paper reproduction default = rgb).
+input_modality: rgb         # 'rgb' or 'pose'
+frame_dims: [210, 260]      # (width, height) for pose normalization
+frames_dir: data/PHOENIX-2014-T-release-v3/features/fullFrame-210x260px
+input_size: 224
+resize: 256
+max_length: 300             # max frames per video (matches original GFSLT-VLP)
+
+# Tokenizer language settings.
+tgt_lang: de_DE
+src_lang: de_DE
+
+# Data file paths (gzip pickle with {key: {'keypoint', 'imgs_path', 'text', 'name', 'num_frames'}}).
+train_label_path: data/phoenix/Phoenix-2014T.train
+dev_label_path: data/phoenix/Phoenix-2014T.dev
+test_label_path: data/phoenix/Phoenix-2014T.test

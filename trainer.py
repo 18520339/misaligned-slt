@@ -1,31 +1,55 @@
-'''Unified training loop for Phase 2 models (AR+Aug, BD Clean, BD+Aug):
+'''Training for GFSLT-VLP models, matching the original paper.
 
-- Training with optional misalignment augmentation
-- Validation on clean dev set (controlled by eval_every_n_epochs)
-- Best checkpoint saving by dev BLEU-4
-- Early stopping with patience (counted in eval cycles)
-- EMA (Exponential Moving Average) for diffusion training stability
-- Linear warmup + cosine annealing scheduler
-- WandB logging + print
+Stage 1 (VLP): SLRCLIP contrastive + optional MLM via TextDecoder.
+    - Main optimizer: AdamW, lr=5e-4, wd=1e-4, betas=(0.9, 0.98).
+    - TextDecoder optimizer (separate, VLP-v2): AdamW, lr=1e-3, wd=0, betas=(0.9, 0.98),
+      stepped every 5 iterations.
+    - Scheduler: CosineAnnealingLR(T_max=epochs, eta_min=0). No warmup, no grad clip.
+    - Label smoothing = 0.2 on MLM CE.
+
+Stage 2 (Translation): External CrossEntropyLoss(label_smoothing=0.2, ignore_index=1)
+on GFSLT logits.
+    - Optimizer: SGD lr=0.01 momentum=0.9 wd=0 (paper default). Configurable via
+      train_cfg.optimizer / learning_rate.{default, ...}.
+    - Scheduler: CosineAnnealingLR(T_max=epochs, eta_min=1e-8). No warmup, no grad clip.
+    - Per-component learning rates supported via substring matching on parameter names.
+    - EMA optional (used for diffusion training stability).
 '''
-import os, sys, time, json
+import os
+import sys
+import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
-from evaluator import compute_metrics, collect_batch_predictions
+GFSLT_DIR = os.path.join(PROJECT_ROOT, 'gfslt-pose-trainer')
+if GFSLT_DIR not in sys.path:
+    sys.path.insert(0, GFSLT_DIR)
+
+from loader import collate_fn
+from models import SLRCLIP, TextDecoder
+from evaluator import collect_batch_predictions, compute_metrics
 
 
-class ExponentialMovingAverage: # Maintains (exponential) moving average of a set of parameters.
+PAD_IDX = 1  # mBART <pad>
+LABEL_SMOOTHING = 0.2
+
+
+# ─── EMA ─────────────────────────────────────────────────────────────────────
+class ExponentialMovingAverage:
+    '''Maintains exponential moving average of a set of parameters.'''
     def __init__(self, parameters, decay, use_num_updates=True):
-        if decay < 0.0 or decay > 1.0: raise ValueError('Decay must be between 0 and 1')
+        if decay < 0.0 or decay > 1.0:
+            raise ValueError('Decay must be between 0 and 1')
         self.decay = decay
         self.num_updates = 0 if use_num_updates else None
         self.shadow_params = [p.clone().detach() for p in parameters if p.requires_grad]
@@ -39,7 +63,6 @@ class ExponentialMovingAverage: # Maintains (exponential) moving average of a se
         if self.num_updates is not None:
             self.num_updates += 1
             decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
-            
         one_minus_decay = 1.0 - decay
         with torch.no_grad():
             parameters = [p for p in parameters if p.requires_grad]
@@ -49,7 +72,8 @@ class ExponentialMovingAverage: # Maintains (exponential) moving average of a se
     def copy_to(self, parameters):
         parameters = [p for p in parameters if p.requires_grad]
         for s_param, param in zip(self.shadow_params, parameters):
-            if param.requires_grad: param.data.copy_(s_param.data)
+            if param.requires_grad:
+                param.data.copy_(s_param.data)
 
     def store(self, parameters):
         self.collected_params = [param.clone() for param in parameters]
@@ -67,295 +91,477 @@ class ExponentialMovingAverage: # Maintains (exponential) moving average of a se
         self.shadow_params = state_dict['shadow_params']
 
 
-def build_optimizer(model, train_cfg):
-    '''Build optimizer with per-component learning rates.
+# ─── Stage 1: VLP Pretraining ────────────────────────────────────────────────
 
-    Matches MSKA's optimizer.build_optimizer pattern: iterates over
-    named_parameters() and assigns LR based on which config key matches
-    the parameter name. This correctly handles nested module hierarchies
-    (e.g., SLTModel.mska_model.vl_mapper.xxx).
+def train_vlp(
+    gfslt_config, tokenizer, train_dataset, output_dir,
+    vlp_cfg=None, device='cuda', wandb_run=None,
+):
+    '''Stage 1: Visual-Language Pretraining (SLRCLIP + optional MLM).
+
+    Matches GFSLT-VLP v2 paper:
+      - Main (SLRCLIP): AdamW(lr=5e-4, wd=1e-4, betas=(0.9, 0.98)).
+      - TextDecoder: separate AdamW(lr=1e-3, wd=0, betas=(0.9, 0.98)),
+                     stepped every 5 iterations.
+      - CosineAnnealingLR(T_max=epochs, eta_min=0) on both.
+      - No warmup, no grad clip. MLM CE uses label_smoothing=0.2.
     '''
-    lr_cfg = train_cfg['learning_rate']
-    base_lr = lr_cfg.get('default', 1e-5)
+    vlp_cfg = vlp_cfg or {}
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Group parameters by matching LR config keys against parameter names
-    param_groups_dict = defaultdict(list)  # group_name -> list of params
-    param_group_lrs = {}  # group_name -> lr
+    epochs = vlp_cfg.get('epochs', 80)
+    batch_size = vlp_cfg.get('batch_size', 32)
+    num_workers = vlp_cfg.get('num_workers', 4)
 
-    for param_name, param in model.named_parameters():
-        if not param.requires_grad: continue
+    lr = vlp_cfg.get('learning_rate', 5.0e-4)
+    weight_decay = vlp_cfg.get('weight_decay', 1.0e-4)
+    betas = tuple(vlp_cfg.get('betas', [0.9, 0.98]))
+
+    use_text_decoder = vlp_cfg.get('use_text_decoder', True)
+    mlm_loss_weight = vlp_cfg.get('mlm_loss_weight', 1.0)
+    td_lr = vlp_cfg.get('text_decoder_lr', 1.0e-3)
+    td_weight_decay = vlp_cfg.get('text_decoder_weight_decay', 0.0)
+    td_step_every = vlp_cfg.get('text_decoder_step_every', 5)
+
+    # Build models
+    slrclip = SLRCLIP(gfslt_config).to(device)
+    text_decoder = TextDecoder(gfslt_config).to(device) if use_text_decoder else None
+    pad_token_id = tokenizer.pad_token_id
+
+    # Optimizers
+    main_optimizer = optim.AdamW(
+        slrclip.parameters(), lr=lr, weight_decay=weight_decay, betas=betas,
+    )
+    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        main_optimizer, T_max=epochs, eta_min=0,
+    )
+    td_optimizer, td_scheduler = None, None
+    if text_decoder is not None:
+        td_optimizer = optim.AdamW(
+            text_decoder.parameters(), lr=td_lr,
+            weight_decay=td_weight_decay, betas=betas,
+        )
+        td_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            td_optimizer, T_max=epochs, eta_min=0,
+        )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=collate_fn,
+        pin_memory=True, drop_last=True,
+    )
+
+    n_main = sum(p.numel() for p in slrclip.parameters() if p.requires_grad)
+    n_td = sum(p.numel() for p in text_decoder.parameters() if p.requires_grad) if text_decoder else 0
+    print(f'\nVLP Stage 1: SLRCLIP={n_main / 1e6:.2f}M, TextDecoder={n_td / 1e6:.2f}M')
+    print(f'  epochs={epochs}, batch_size={batch_size}, lr={lr}, td_lr={td_lr}, '
+          f'td_step_every={td_step_every}\n')
+
+    global_step = 0
+    for epoch in range(epochs):
+        slrclip.train()
+        if text_decoder is not None:
+            text_decoder.train()
+        total_clip_loss, total_mlm_loss, num_batches = 0.0, 0.0, 0
+        pbar = tqdm(train_loader, desc=f'VLP Epoch {epoch + 1}/{epochs}')
+
+        for batch in pbar:
+            pixel_values = batch['pixel_values'].to(device)
+            pixel_mask = batch['pixel_mask'].to(device)
+            labels_list = batch['labels']
+
+            paragraph_tokens = torch.stack([l['paragraph_tokens'] for l in labels_list]).to(device)
+            paragraph_attention_mask = (paragraph_tokens != pad_token_id).long()
+
+            # CLIP contrastive forward
+            outputs = slrclip(
+                pixel_values=pixel_values, pixel_mask=pixel_mask,
+                paragraph_tokens=paragraph_tokens,
+                paragraph_attention_mask=paragraph_attention_mask,
+            )
+            clip_loss = outputs['loss']
+            loss = clip_loss
+            mlm_loss_val = 0.0
+
+            # MLM loss (re-encode masked text via slrclip.model_txt, then decode clean)
+            if text_decoder is not None:
+                masked_tokens = torch.stack(
+                    [l['masked_paragraph_tokens'] for l in labels_list]
+                ).to(device)
+                masked_attention_mask = (masked_tokens != pad_token_id).long()
+                _, enc_hidden = slrclip.model_txt(masked_tokens, masked_attention_mask)
+                lm_logits = text_decoder(
+                    input_ids=paragraph_tokens,
+                    attention_mask=paragraph_attention_mask,
+                    encoder_hidden_states=enc_hidden,
+                    encoder_attention_mask=masked_attention_mask,
+                )
+                mlm_loss = F.cross_entropy(
+                    lm_logits.view(-1, lm_logits.size(-1)),
+                    paragraph_tokens.view(-1),
+                    ignore_index=pad_token_id,
+                    label_smoothing=LABEL_SMOOTHING,
+                )
+                loss = loss + mlm_loss_weight * mlm_loss
+                mlm_loss_val = mlm_loss.item()
+
+            if not torch.isfinite(loss):
+                main_optimizer.zero_grad()
+                if td_optimizer is not None:
+                    td_optimizer.zero_grad()
+                continue
+
+            main_optimizer.zero_grad()
+            if td_optimizer is not None:
+                td_optimizer.zero_grad()
+            loss.backward()
+            main_optimizer.step()
+
+            # TextDecoder update every N iterations (VLP-v2)
+            if td_optimizer is not None and ((global_step + 1) % td_step_every == 0):
+                td_optimizer.step()
+
+            total_clip_loss += clip_loss.item()
+            total_mlm_loss += mlm_loss_val
+            num_batches += 1
+            global_step += 1
+            pbar.set_postfix(clip=f'{clip_loss.item():.3f}', mlm=f'{mlm_loss_val:.3f}')
+
+        main_scheduler.step()
+        if td_scheduler is not None:
+            td_scheduler.step()
+
+        avg_clip = total_clip_loss / max(num_batches, 1)
+        avg_mlm = total_mlm_loss / max(num_batches, 1)
+        print(f'  VLP Epoch {epoch + 1}: clip_loss={avg_clip:.4f}, mlm_loss={avg_mlm:.4f}')
+        if wandb_run:
+            wandb_run.log({
+                'vlp/epoch': epoch, 'vlp/clip_loss': avg_clip,
+                'vlp/mlm_loss': avg_mlm,
+                'vlp/lr_main': main_scheduler.get_last_lr()[0],
+                'vlp/lr_td': td_scheduler.get_last_lr()[0] if td_scheduler is not None else 0.0,
+            })
+
+    # Save VLP checkpoint (SLRCLIP state_dict; wrap with base_module. for legacy).
+    wrapped_state = {'base_module.' + k: v for k, v in slrclip.state_dict().items()}
+    ckpt = {'model': wrapped_state, 'epoch': epochs}
+    torch.save(ckpt, output_dir / 'vlp_checkpoint.pth')
+    print(f'VLP checkpoint saved to {output_dir / "vlp_checkpoint.pth"}')
+    return slrclip
+
+
+# ─── Stage 2: Translation Training ───────────────────────────────────────────
+
+def build_optimizer(model, train_cfg):
+    '''Build optimizer with per-component learning rates (substring matching).
+
+    Paper default: SGD lr=0.01 momentum=0.9 weight_decay=0.
+    '''
+    lr_cfg = train_cfg.get('learning_rate', {'default': 0.01})
+    if not isinstance(lr_cfg, dict):
+        lr_cfg = {'default': float(lr_cfg)}
+    base_lr = lr_cfg.get('default', 0.01)
+
+    groups_dict = defaultdict(list)
+    group_lrs = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         matched_key, matched_len = 'default', 0
-        
-        for key in lr_cfg: # Find the best matching LR key (longest match wins)
-            if key == 'default': continue
-            if key in param_name and len(key) > matched_len:
+        for key in lr_cfg:
+            if key == 'default':
+                continue
+            if key in name and len(key) > matched_len:
                 matched_key, matched_len = key, len(key)
-
         lr = lr_cfg[matched_key] if matched_key != 'default' else base_lr
-        param_groups_dict[matched_key].append(param)
-        param_group_lrs[matched_key] = lr
+        groups_dict[matched_key].append(param)
+        group_lrs[matched_key] = lr
 
-    # Build param group list
     param_groups = []
-    for group_name in sorted(param_groups_dict.keys()):
-        params = param_groups_dict[group_name]
-        lr = param_group_lrs.get(group_name, base_lr)
-        param_groups.append({'params': params, 'lr': lr, 'name': group_name})
+    for gname in sorted(groups_dict.keys()):
+        param_groups.append({
+            'params': groups_dict[gname],
+            'lr': group_lrs.get(gname, base_lr),
+            'name': gname,
+        })
+    if not param_groups:
+        raise ValueError('No trainable parameters found.')
 
-    if not param_groups: raise ValueError('No trainable parameters found when building optimizer.')
-    optimizer_name = train_cfg.get('optimizer', 'Adam').lower()
-    betas = tuple(train_cfg.get('betas', [0.9, 0.998]))
-    weight_decay = train_cfg.get('weight_decay', 0.001)
+    optimizer_name = train_cfg.get('optimizer', 'SGD').lower()
+    weight_decay = train_cfg.get('weight_decay', 0.0)
 
-    if optimizer_name == 'adamw': optimizer = optim.AdamW(param_groups, lr=base_lr, betas=betas, weight_decay=weight_decay)
-    else: optimizer = optim.Adam(param_groups, lr=base_lr, betas=betas, weight_decay=weight_decay)
+    if optimizer_name == 'sgd':
+        momentum = train_cfg.get('momentum', 0.9)
+        optimizer = optim.SGD(
+            param_groups, lr=base_lr, momentum=momentum, weight_decay=weight_decay,
+        )
+    elif optimizer_name == 'adamw':
+        betas = tuple(train_cfg.get('betas', [0.9, 0.98]))
+        optimizer = optim.AdamW(param_groups, lr=base_lr, betas=betas, weight_decay=weight_decay)
+    else:
+        betas = tuple(train_cfg.get('betas', [0.9, 0.999]))
+        optimizer = optim.Adam(param_groups, lr=base_lr, betas=betas, weight_decay=weight_decay)
 
-    print(f'Optimizer: {optimizer_name}, base_lr={base_lr}')
-    for pg in param_groups: print(f"  {pg['name']}: lr={pg['lr']:.1e}, params={sum(p.numel() for p in pg['params']):,}")
+    print(f'Optimizer: {optimizer_name}, base_lr={base_lr}, wd={weight_decay}')
+    for pg in param_groups:
+        n = sum(p.numel() for p in pg['params'])
+        print(f"  {pg['name']}: lr={pg['lr']:.1e}, params={n:,}")
     return optimizer
 
 
 def build_scheduler(optimizer, train_cfg):
-    scheduler_name = train_cfg.get('scheduler', 'cosineannealing').lower()
-    t_max = train_cfg.get('t_max', 40)
-    warmup_epochs = train_cfg.get('warmup_epochs', 0)
-
-    if scheduler_name == 'plateau':
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
-        scheduler_str = f'ReduceLROnPlateau (mode=max, factor=0.5, patience=3)'
-    else:
-        t_max = max(t_max - warmup_epochs, 1)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=0)
-        if scheduler_name == 'cosineannealing': scheduler_str = f'CosineAnnealingLR (T_max={t_max})' 
-        else: scheduler_str = f"UNKNOWN scheduler '{scheduler_name}', using CosineAnnealingLR (T_max={t_max})"
-
-    if warmup_epochs > 0:
-        warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, scheduler], milestones=[warmup_epochs])
-        scheduler_str = f'Scheduler: {warmup_epochs}-epoch warmup + {scheduler_str}'
-    else: scheduler_str = f'Scheduler: {scheduler_str}'
-
-    print(scheduler_str)
+    '''Cosine annealing with eta_min=1e-8 (paper default). No warmup.'''
+    epochs = train_cfg.get('t_max', train_cfg.get('epochs', 200))
+    eta_min = train_cfg.get('eta_min', 1.0e-8)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=eta_min,
+    )
+    print(f'Scheduler: CosineAnnealingLR (T_max={epochs}, eta_min={eta_min})')
     return scheduler
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch, train_cfg, clip_norm=None, ema=None):
+def _compute_loss_from_logits(logits, labels, criterion):
+    '''Compute CE loss with label smoothing on the flattened token axis.'''
+    V = logits.size(-1)
+    return criterion(logits.reshape(-1, V), labels.reshape(-1))
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch,
+                    train_cfg, criterion, ema=None):
+    '''Train one epoch of Stage 2 translation. External CE loss with label smoothing.'''
     model.train()
     num_batches = 0
-    total_loss, total_rec_loss, total_trans_loss = 0.0, 0.0, 0.0
-    pbar = tqdm(total=len(dataloader), desc=f"Epoch {epoch + 1}/{train_cfg.get('epochs')}")
+    total_loss = 0.0
+    pbar = tqdm(total=len(dataloader), desc=f"Epoch {epoch + 1}/{train_cfg.get('epochs', 200)}")
     current_lr = optimizer.param_groups[0]['lr']
-    
-    for step, batch in enumerate(dataloader):
-        optimizer.zero_grad()
-        output = model(batch)
-        loss = output['total_loss']
 
-        # NaN/Inf guard
+    for step, batch in enumerate(dataloader):
+        pixel_values = batch['pixel_values'].to(device)
+        pixel_mask = batch['pixel_mask'].to(device)
+        labels_list = batch['labels']
+
+        labels = torch.stack([l['paragraph_tokens'] for l in labels_list]).to(device)
+        labels_mask = (labels != PAD_IDX).long()
+
+        optimizer.zero_grad()
+        output = model(
+            pixel_values=pixel_values, pixel_mask=pixel_mask,
+            paragraph_tokens=labels, paragraph_attention_mask=labels_mask,
+            # Also provide labels/labels_mask for decoders that compute loss internally (BD).
+            labels=labels, labels_mask=labels_mask,
+        )
+
+        if 'loss' in output and output['loss'] is not None:
+            # BD decoder: loss computed internally (MDLM).
+            loss = output['loss']
+        else:
+            # AR decoder (GFSLT): compute external CE with label_smoothing=0.2.
+            loss = _compute_loss_from_logits(output['logits'], labels, criterion)
+
         if not torch.isfinite(loss):
             print(f'  WARNING: non-finite loss at step {step}, skipping batch')
             optimizer.zero_grad()
             continue
 
         loss.backward()
-        if clip_norm: torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         optimizer.step()
+        if ema is not None:
+            ema.update(model.parameters())
 
-        if ema is not None: ema.update(model.parameters())
         loss_val = loss.item()
-        rec_loss = output.get('recognition_loss', torch.tensor(0.0)).item()
-        trans_loss = output.get('translation_loss', torch.tensor(0.0)).item()
-
         total_loss += loss_val
-        total_rec_loss += rec_loss
-        total_trans_loss += trans_loss
         num_batches += 1
-        
-        pbar.set_postfix(loss=f'{loss_val:.3f}', rec=f'{rec_loss:.3f}', trans=f'{trans_loss:.3f}, lr={current_lr:.2e}')
+
+        pbar.set_postfix(loss=f'{loss_val:.3f}', lr=f'{current_lr:.2e}')
         pbar.update(1)
 
     avg_loss = total_loss / max(num_batches, 1)
-    avg_rec = total_rec_loss / max(num_batches, 1)
-    avg_trans = total_trans_loss / max(num_batches, 1)
-    pbar.set_postfix(loss=f'{avg_loss:.4f}', rec=f'{avg_rec:.4f}', trans=f'{avg_trans:.4f}, lr={current_lr:.2e}')
+    pbar.set_postfix(loss=f'{avg_loss:.4f}', lr=f'{current_lr:.2e}')
     pbar.close()
-    return {'loss': avg_loss, 'rec_loss': avg_rec, 'trans_loss': avg_trans}
+    return {'loss': avg_loss}
 
 
 @torch.no_grad()
-def evaluate_one_epoch(model, dataloader, mska_cfg, generate_cfg=None, beam_size=1, desc='Eval'):
-    '''Evaluate model: compute dev loss AND generate translations for BLEU.
-
-    Runs the full forward pass to get both loss values and generation metrics.
-    With first_hitting=True and block_size=4, diffusion sampling uses early
-    stopping (~4 steps per block instead of 5000), so 5K steps is fast.
-    '''
+def evaluate_one_epoch(model, dataloader, tokenizer, criterion,
+                       generate_cfg=None, desc='Eval'):
+    '''Evaluate: compute dev loss and generate translations for BLEU/ROUGE.'''
     model.eval()
-    sample_results = defaultdict(dict)
-    total_loss, total_rec_loss, total_trans_loss, num_batches = 0., 0., 0., 0
+    device = next(model.parameters()).device
+    sample_results = {}
+    total_loss, num_batches = 0.0, 0
 
     for batch in tqdm(dataloader, desc=desc):
-        output = model(batch) # Run forward pass to get recognition outputs + transformer_inputs + loss
-        collect_batch_predictions(model, batch, output, sample_results, beam_size=beam_size, generate_cfg=generate_cfg)
+        pixel_values = batch['pixel_values'].to(device)
+        pixel_mask = batch['pixel_mask'].to(device)
+        labels_list = batch['labels']
+        names = batch['names']
+        texts = batch['texts']
 
-        # Accumulate dev loss
-        total_loss += output['total_loss'].item()
-        total_rec_loss += output.get('recognition_loss', torch.tensor(0.0)).item()
-        total_trans_loss += output.get('translation_loss', torch.tensor(0.0)).item()
+        labels = torch.stack([l['paragraph_tokens'] for l in labels_list]).to(device)
+        labels_mask = (labels != PAD_IDX).long()
+
+        output = model(
+            pixel_values=pixel_values, pixel_mask=pixel_mask,
+            paragraph_tokens=labels, paragraph_attention_mask=labels_mask,
+            labels=labels, labels_mask=labels_mask,
+        )
+        if 'loss' in output and output['loss'] is not None:
+            total_loss += output['loss'].item()
+        else:
+            total_loss += _compute_loss_from_logits(output['logits'], labels, criterion).item()
         num_batches += 1
 
-    # Compute metrics using shared compute_metrics (no duplication)
-    eval_results = {k: v for k, v in sample_results.items() if 'txt_hyp' in v}
-    if not eval_results:
-        return {'wer': 200.0, 'bleu4': 0.0, 'rouge_l': 0.0, 'dev_loss': 0.0, 'dev_rec_loss': 0.0, 'dev_trans_loss': 0.0}
-    
-    metrics = compute_metrics(eval_results, mska_cfg)
+        collect_batch_predictions(
+            model, names, texts, pixel_values, pixel_mask,
+            sample_results, tokenizer, generate_cfg=generate_cfg,
+        )
+
+    if not sample_results:
+        return {'bleu4': 0.0, 'rouge_l': 0.0, 'dev_loss': 0.0}
+
+    metrics = compute_metrics(sample_results)
     metrics.pop('per_sample', None)
     metrics['dev_loss'] = total_loss / max(num_batches, 1)
-    metrics['dev_rec_loss'] = total_rec_loss / max(num_batches, 1)
-    metrics['dev_trans_loss'] = total_trans_loss / max(num_batches, 1)
     return metrics
 
 
-def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cfg, output_dir, device='cuda', wandb_run=None):
-    # Full training loop with validation and checkpointing
+def train_model(
+    model, train_dataset, dev_dataset, model_cfg, train_cfg,
+    output_dir, tokenizer, device='cuda', wandb_run=None,
+):
+    '''Full Stage 2 training loop with validation, EMA, best-ckpt-by-BLEU4,
+    early stopping, WandB + print logging.
+    '''
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    epochs = train_cfg.get('epochs', 40)
-    batch_size = train_cfg.get('batch_size', 8)
+    epochs = train_cfg.get('epochs', 200)
+    batch_size = train_cfg.get('batch_size', 16)
     num_workers = train_cfg.get('num_workers', 4)
-    clip_norm = train_cfg.get('gradient_clip_norm', None)
     patience = train_cfg.get('early_stopping_patience', 10)
     save_every = train_cfg.get('save_every_n_epochs', 5)
     eval_every = train_cfg.get('eval_every_n_epochs', 1)
 
-    # Generation config for validation
-    generate_cfg = model_cfg.get('validation', {}).get('translation', {'length_penalty': 1, 'max_length': 100, 'num_beams': 5})
+    # Generation config for validation (paper: max_new_tokens=150, num_beams=4).
+    generate_cfg = dict(model_cfg.get('validation', {}).get('translation', {
+        'max_new_tokens': 150, 'num_beams': 4, 'length_penalty': 1.0,
+    }))
     if model_cfg.get('decoder_type') == 'bd':
         bd_cfg = model_cfg.get('block_diffusion', {})
-        # Use diffusion_steps from validation config; fall back to block_diffusion config or 128
-        if 'diffusion_steps' not in generate_cfg:
-            generate_cfg['diffusion_steps'] = bd_cfg.get('diffusion_steps', 128)
-    beam_size = model_cfg.get('validation', {}).get('recognition', {}).get('beam_size', 1)
+        generate_cfg.setdefault('diffusion_steps', bd_cfg.get('diffusion_steps', 128))
+        generate_cfg.setdefault('max_length', 100)
 
-    # Build dataloaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, collate_fn=train_dataset.collate_fn,
-        pin_memory=True, drop_last=True)
+        num_workers=num_workers, collate_fn=collate_fn,
+        pin_memory=True, drop_last=True,
+    )
     dev_loader = DataLoader(
         dev_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, collate_fn=dev_dataset.collate_fn,
-        pin_memory=True)
+        num_workers=num_workers, collate_fn=collate_fn,
+        pin_memory=True,
+    )
 
     model.to(device)
     optimizer = build_optimizer(model, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
 
-    # EMA for diffusion training stability
+    # Criterion (external CE for AR models).
+    label_smoothing = train_cfg.get('label_smoothing', LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=PAD_IDX, label_smoothing=label_smoothing,
+    )
+
+    # EMA (used for diffusion training).
     ema_decay = train_cfg.get('ema', 0.0)
     ema = None
-    if ema_decay > 0:
+    if ema_decay and ema_decay > 0:
         ema = ExponentialMovingAverage(model.parameters(), decay=ema_decay)
         ema.move_shadow_params_to_device(device)
         print(f'EMA enabled: decay={ema_decay}')
 
-    # Resume from checkpoint
     start_epoch, best_bleu4 = 0, 0.0
     resume_from = train_cfg.get('resume_from')
     if resume_from and os.path.exists(resume_from):
         print(f'Resuming from {resume_from}')
-        ckpt = torch.load(resume_from, map_location='cpu')
+        ckpt = torch.load(resume_from, map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model'], strict=False)
-        # if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
-        # if 'scheduler' in ckpt and ckpt['scheduler'] is not None: scheduler.load_state_dict(ckpt['scheduler'])
-        # if 'ema' in ckpt and ckpt['ema'] is not None and ema is not None:
-        #     ema.load_state_dict(ckpt['ema'])
-        #     ema.move_shadow_params_to_device(device)
-        # start_epoch = ckpt.get('epoch', 0) + 1
         best_bleu4 = ckpt.get('best_bleu4', 0.0)
 
-    # Patience is counted in eval cycles, not epochs
-    eval_cycles_without_improvement = 0
+    eval_cycles_no_improve = 0
     log_file = output_dir / 'training_log.jsonl'
 
-    print(f'\nStarting training: {epochs} epochs, batch_size={batch_size}, '
-          f'eval_every={eval_every} epochs, patience={patience} eval cycles')
-    print(f'Output: {output_dir}\n')
+    print(f'\nStage 2 training: {epochs} epochs, batch_size={batch_size}, '
+          f'eval_every={eval_every}, patience={patience} eval cycles')
+    print(f'Output: {output_dir}, label_smoothing={label_smoothing}\n')
 
     for epoch in range(start_epoch, epochs):
         t_start = time.time()
-        train_stats = train_one_epoch(model, train_loader, optimizer, device, epoch, train_cfg, clip_norm=clip_norm, ema=ema)
+        train_stats = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, train_cfg,
+            criterion=criterion, ema=ema,
+        )
+        scheduler.step()
 
-        # Step scheduler (epoch-level)
-        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau): pass  # stepped after eval
-        else: scheduler.step()
-
-        # Save periodic checkpoint
         if (epoch + 1) % save_every == 0:
             ckpt_data = {
-                'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(), 'epoch': epoch, 'best_bleu4': best_bleu4,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'epoch': epoch, 'best_bleu4': best_bleu4,
             }
-            if ema is not None: ckpt_data['ema'] = ema.state_dict()
+            if ema is not None:
+                ckpt_data['ema'] = ema.state_dict()
             torch.save(ckpt_data, output_dir / 'checkpoint.pth')
 
         log_entry = {
             'epoch': epoch,
             'train_loss': train_stats['loss'],
-            'train_rec_loss': train_stats['rec_loss'],
-            'train_trans_loss': train_stats['trans_loss'],
             'lr': optimizer.param_groups[0]['lr'],
         }
-        do_eval = (epoch + 1) % eval_every == 0 # Eval at epoch eval_every-1, 2*eval_every-1, ...
+
+        do_eval = (epoch + 1) % eval_every == 0
         if do_eval:
-            if ema is not None: # EMA: swap to shadow params for evaluation
+            if ema is not None:
                 ema.store(model.parameters())
                 ema.copy_to(model.parameters())
-            
-            dev_metrics = evaluate_one_epoch( # Generate translations and compute BLEU (no redundant loss computation)
-                model, dev_loader, mska_cfg, generate_cfg=generate_cfg,
-                beam_size=beam_size, desc=f'Dev (epoch {epoch + 1})'
+            dev_metrics = evaluate_one_epoch(
+                model, dev_loader, tokenizer, criterion,
+                generate_cfg=generate_cfg, desc=f'Dev (epoch {epoch + 1})',
             )
-            if ema is not None: ema.restore(model.parameters()) # EMA: restore original params
-            
+            if ema is not None:
+                ema.restore(model.parameters())
+
             elapsed = time.time() - t_start
-            print(f"  Dev loss={dev_metrics.get('dev_loss', 0):.4f} "
-                  f"(rec={dev_metrics.get('dev_rec_loss', 0):.4f}, "
-                  f"trans={dev_metrics.get('dev_trans_loss', 0):.4f})")
-            print(f"  Dev metrics: WER={dev_metrics['wer']:.2f}, "
-                  f"BLEU-4={dev_metrics['bleu4']:.2f}, ROUGE-L={dev_metrics['rouge_l']:.2f} ({elapsed:.0f}s)")
+            print(f"  Dev loss={dev_metrics.get('dev_loss', 0):.4f}")
+            print(f"  Dev metrics: BLEU-4={dev_metrics['bleu4']:.2f}, "
+                  f"ROUGE-L={dev_metrics['rouge_l']:.2f} ({elapsed:.0f}s)")
 
             log_entry.update({
                 'dev_loss': dev_metrics.get('dev_loss', 0),
-                'dev_rec_loss': dev_metrics.get('dev_rec_loss', 0),
-                'dev_trans_loss': dev_metrics.get('dev_trans_loss', 0),
-                'dev_wer': dev_metrics['wer'],
                 'dev_bleu4': dev_metrics['bleu4'],
                 'dev_rouge_l': dev_metrics['rouge_l'],
                 'elapsed': elapsed,
             })
-            wandb_run.log({
-                'epoch': epoch,
-                'train/loss': train_stats['loss'],
-                'train/rec_loss': train_stats['rec_loss'],
-                'train/trans_loss': train_stats['trans_loss'],
-                'dev/loss': dev_metrics.get('dev_loss', 0),
-                'dev/rec_loss': dev_metrics.get('dev_rec_loss', 0),
-                'dev/trans_loss': dev_metrics.get('dev_trans_loss', 0),
-                'dev/wer': dev_metrics['wer'],
-                'dev/bleu4': dev_metrics['bleu4'],
-                'dev/rouge_l': dev_metrics['rouge_l'],
-                'lr': optimizer.param_groups[0]['lr'],
-            })
-            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau): scheduler.step(dev_metrics['bleu4'])
-            if dev_metrics['bleu4'] > best_bleu4: # Best checkpoint
+            if wandb_run:
+                wandb_run.log({
+                    'epoch': epoch,
+                    'train/loss': train_stats['loss'],
+                    'dev/loss': dev_metrics.get('dev_loss', 0),
+                    'dev/bleu4': dev_metrics['bleu4'],
+                    'dev/rouge_l': dev_metrics['rouge_l'],
+                    'lr': optimizer.param_groups[0]['lr'],
+                })
+
+            if dev_metrics['bleu4'] > best_bleu4:
                 best_bleu4 = dev_metrics['bleu4']
-                eval_cycles_without_improvement = 0
+                eval_cycles_no_improve = 0
                 best_ckpt = {
-                    'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(), 'epoch': epoch, 'best_bleu4': best_bleu4,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'epoch': epoch, 'best_bleu4': best_bleu4,
                 }
                 if ema is not None:
                     ema.store(model.parameters())
@@ -364,26 +570,27 @@ def train_model(model, train_dataset, dev_dataset, mska_cfg, model_cfg, train_cf
                     ema.restore(model.parameters())
                     best_ckpt['ema'] = ema.state_dict()
                 torch.save(best_ckpt, output_dir / 'best_checkpoint.pth')
-                print(f'  ★ New best BLEU-4: {best_bleu4:.2f} (saved)')
+                print(f'  New best BLEU-4: {best_bleu4:.2f} (saved)')
             else:
-                eval_cycles_without_improvement += 1
-                print(f'  No improvement for {eval_cycles_without_improvement}/{patience} eval cycles (best={best_bleu4:.2f})')
+                eval_cycles_no_improve += 1
+                print(f'  No improvement for {eval_cycles_no_improve}/{patience} eval cycles '
+                      f'(best={best_bleu4:.2f})')
         else:
             elapsed = time.time() - t_start
             log_entry['elapsed'] = elapsed
-            wandb_run.log({
-                'epoch': epoch,
-                'train/loss': train_stats['loss'],
-                'train/rec_loss': train_stats['rec_loss'],
-                'train/trans_loss': train_stats['trans_loss'],
-                'lr': optimizer.param_groups[0]['lr'],
-            })
+            if wandb_run:
+                wandb_run.log({
+                    'epoch': epoch,
+                    'train/loss': train_stats['loss'],
+                    'lr': optimizer.param_groups[0]['lr'],
+                })
+
         with open(log_file, 'a') as f:
             f.write(json.dumps(log_entry) + '\n')
 
-        # Early stopping (patience counted in eval cycles)
-        if do_eval and eval_cycles_without_improvement >= patience:
-            print(f'Early stopping at epoch {epoch} ({eval_cycles_without_improvement} eval cycles without improvement)')
+        if do_eval and eval_cycles_no_improve >= patience:
+            print(f'Early stopping at epoch {epoch} '
+                  f'({eval_cycles_no_improve} eval cycles without improvement)')
             break
 
     print(f'\nTraining complete. Best dev BLEU-4: {best_bleu4:.2f}')

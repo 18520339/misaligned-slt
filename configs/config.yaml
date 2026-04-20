@@ -2,21 +2,31 @@ task: S2T
 device: cuda
 seed: 42
 
-paths: # MSKA paths (relative to project root)
-    mska_root: MSKA
-    mska_config: MSKA/configs/phoenix-2014t_s2t.yaml
-    checkpoint: MSKA/pretrained_models/phoenix-2014T_slt.pth
+paths:
     results_dir: results
+    checkpoint: null       # pretrained Stage 2 checkpoint for Phase 1 analysis
+    vlp_checkpoint: null   # pretrained VLP checkpoint for Phase 1 analysis
 
+# Dataset-specific values loaded from configs/datasets/<dataset_name>.yaml.
 data:
-    dataset_name: Phoenix-2014T
-    train_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.train
-    dev_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.dev
-    test_label_path: MSKA/data/Phoenix-2014T/Phoenix-2014T.test
+    dataset_name: phoenix2014t
+    config_path: configs/datasets/phoenix2014t.yaml
+
+model:
+    mbart_name: facebook/mbart-large-cc25
+    input_modality: rgb        # overridable via dataset/model config
+    embed_dim: 1024
+    hidden_size: 1024
+    temporal_kernel: 3
+    temporal_conv_type: 2
+    num_keypoints: 77
+    input_channels: 3
+    rgb_backbone: resnet18
+    scale_embedding: false
 
 misalignment:
-    min_frames: 8
-    max_input_length: 400 # MSKA clip_len
+    min_frames: 4              # CoSign + TemporalConv1D conv_type=2 ~4x downsampling
+    max_input_length: 300      # max frames per video (matches original GFSLT-VLP)
 
     knee_point:
         severity_levels: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
@@ -32,16 +42,15 @@ misalignment:
         subsample_size: 1000
 
 evaluation:
-    batch_size: 128
+    batch_size: 64
     num_workers: 4
-    beam_size: 5
     translation:
-        length_penalty: 1
-        max_length: 100
-        num_beams: 5
+        max_new_tokens: 150    # paper default
+        num_beams: 4           # paper default
+        length_penalty: 1.0
 
-expected_clean: # Expected clean baseline (from MSKA paper - Phoenix-2014T)
-    wer: 19.8
-    bleu4: 29.03
-    rouge_l: 53.54
-    tolerance: 2.0 # acceptable deviation from reported numbers
+# Expected clean baseline for Phoenix-2014T test set (paper: RGB + AR + VLP).
+expected_clean:
+    bleu4: 22.0
+    rouge_l: 48.0
+    tolerance: 3.0

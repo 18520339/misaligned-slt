@@ -1,134 +1,117 @@
+'''Evaluation for GFSLT-VLP sign language translation models.
+
+Runs inference under various misalignment conditions and collects results
+(text predictions, metrics) into a structured JSON file.
+
+Metrics: BLEU-4 (sacrebleu), ROUGE-L, per-sample sentence BLEU.
+No gloss/WER/CTC — this is a gloss-free pipeline.
 '''
-Runs MSKA inference under various misalignment conditions and collects all results
-(text predictions, gloss predictions, CTC logits, metrics) into a structured JSON file.
-'''
-import os, sys, json, time
+import os, json, time
 from collections import defaultdict, OrderedDict
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import torch
 
-# MSKA imports
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'MSKA'))
-
-from data.misalign import generate_conditions, parse_condition_name
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from metrics import wer_single, wer_list, bleu, rouge
-from phoenix_cleanup import clean_phoenix_2014_trans
-from utils import MetricLogger
+
+# Use sacrebleu for corpus BLEU (standard in MT research)
+import sacrebleu
+from rouge_score import rouge_scorer
 
 
-def _select_primary_gls_hyp(sample_row: dict) -> str:
-    # Select the canonical gloss hypothesis used in exported predictions.'''
-    if sample_row.get('ensemble_last_gls_hyp'): return sample_row['ensemble_last_gls_hyp']
-    if sample_row.get('fuse_gls_hyp'): return sample_row['fuse_gls_hyp']
+def compute_bleu(references, hypotheses):
+    '''Compute corpus-level BLEU-4 using sacrebleu.'''
+    refs = [references]  # sacrebleu expects list of ref lists
+    result = sacrebleu.corpus_bleu(hypotheses, refs)
+    return {
+        'bleu1': result.precisions[0],
+        'bleu2': result.precisions[1],
+        'bleu3': result.precisions[2],
+        'bleu4': result.score,
+    }
 
-    # Fallback for other recognition-head outputs.
-    gls_keys = sorted(k for k in sample_row if 'gls_hyp' in k and sample_row.get(k))
-    if gls_keys: return sample_row.get(gls_keys[0], '')
-    return ''
+
+def compute_rouge(references, hypotheses):
+    '''Compute corpus-level ROUGE-L.'''
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
+    scores = [scorer.score(ref, hyp) for ref, hyp in zip(references, hypotheses)]
+    rouge_l = np.mean([s['rougeL'].fmeasure for s in scores]) * 100
+    return rouge_l
 
 
-def collect_batch_predictions(model, src_input, output, sample_results, beam_size=1, generate_cfg=None):
-    '''Collect recognition and translation predictions from one batch into sample_results.
+def collect_batch_predictions(
+    model, names, texts, pixel_values, pixel_mask,
+    sample_results, tokenizer, generate_cfg=None,
+):
+    '''Generate translations for one batch and collect into sample_results.
 
-    Shared between evaluator.run_evaluation and trainer.evaluate_with_loss to
-    avoid duplicating the CTC decoding + translation generation logic.
+    Args:
+        model: SLTModel instance (AR or BD decoder).
+        names: Tuple of sample names from batch.
+        texts: Tuple of reference texts from batch.
+        pixel_values: (B, T, 77, 3) on device.
+        pixel_mask: (B, T) on device.
+        sample_results: Dict to accumulate {name: {txt_hyp, txt_ref}}.
+        tokenizer: HuggingFace mBART tokenizer for decoding.
+        generate_cfg: Generation config dict.
     '''
-    tokenizer = model.gloss_tokenizer
-    batch_names = src_input['name']
+    gen_cfg = generate_cfg or {}
+    decoder_type = getattr(model, 'decoder_type', None)
+    if decoder_type is None:
+        # Heuristic: BD decoder wraps a BlockDiffusionDecoder; otherwise AR.
+        decoder_type = 'bd' if hasattr(model, 'bd_decoder') else 'ar'
 
-    # Recognition (CTC gloss decoding)
-    for k in output: # Use ensemble logits for best decoding
-        if 'gloss_logits' not in k: continue
-        ctc_out = model.recognition_network.decode(
-            gloss_logits=output[k], beam_size=beam_size,
-            input_lengths=output['input_lengths']
+    # Generate token IDs
+    if decoder_type == 'bd':
+        generated_ids = model.generate(
+            pixel_values=pixel_values, pixel_mask=pixel_mask,
+            max_length=gen_cfg.get('max_length', 100),
+            diffusion_steps=gen_cfg.get('diffusion_steps', 128),
         )
-        pred_glosses = tokenizer.convert_ids_to_tokens(ctc_out)
-        for name, gls_hyp, gls_ref in zip(batch_names, pred_glosses, src_input['gloss']):
-            if name not in sample_results: sample_results[name] = {}
-            logits_prefix = k.replace('gloss_logits', '')
-            sample_results[name][f'{logits_prefix}gls_hyp'] = (
-                ' '.join(gls_hyp).upper() if tokenizer.lower_case else ' '.join(gls_hyp)
-            )
-            sample_results[name]['gls_ref'] = gls_ref.upper() if tokenizer.lower_case else gls_ref
+    else:
+        tgt_lang = getattr(tokenizer, 'tgt_lang', None) or 'de_DE'
+        decoder_start_token_id = tokenizer.lang_code_to_id.get(
+            tgt_lang, tokenizer.bos_token_id,
+        )
+        generated_ids = model.generate(
+            pixel_values=pixel_values, pixel_mask=pixel_mask,
+            max_new_tokens=gen_cfg.get('max_new_tokens', gen_cfg.get('max_length', 150)),
+            num_beams=gen_cfg.get('num_beams', 4),
+            length_penalty=gen_cfg.get('length_penalty', 1.0),
+            decoder_start_token_id=decoder_start_token_id,
+        )
 
-    # Translation
-    gen_output = model.generate_txt(transformer_inputs=output['transformer_inputs'], generate_cfg=generate_cfg)
-    for name, txt_hyp, txt_ref in zip(batch_names, gen_output['decoded_sequences'], src_input['text']):
-        if name not in sample_results: sample_results[name] = {}
-        sample_results[name]['txt_hyp'] = txt_hyp
-        sample_results[name]['txt_ref'] = txt_ref
+    # Decode generated tokens
+    pred_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+    for name, txt_hyp, txt_ref in zip(names, pred_texts, texts):
+        sample_results[name] = {
+            'txt_hyp': txt_hyp.strip(),
+            'txt_ref': txt_ref.strip(),
+        }
 
 
-def compute_metrics(results: dict, config: dict) -> dict:
+def compute_metrics(results):
     '''Compute corpus-level and per-sample metrics from collected predictions.
 
-    Replicates MSKA's evaluate() exactly for WER: finds all keys that contain
-    'gls_hyp' (one per recognition head), computes WER for each, and takes the
-    minimum — matching the MSKA paper's reported numbers.
+    Args:
+        results: Dict of {name: {txt_hyp: str, txt_ref: str}}.
+    Returns:
+        Dict with bleu4, rouge_l, and per_sample metrics.
     '''
     names = list(results.keys())
     txt_ref = [results[n]['txt_ref'] for n in names]
     txt_hyp = [results[n]['txt_hyp'] for n in names]
 
-    level = config['data'].get('level', 'word')
-    dataset_name = config['data']['dataset_name'].lower()
-    metrics = {} # Corpus-level metrics
-    
-    # WER: replicate MSKA's approach — iterate over every *_gls_hyp key,
-    # compute WER per head, keep the minimum (= best head).
-    # Collect all gloss-hypothesis key names present in ANY sample
-    all_gls_hyp_keys = set()
-    for n in names:
-        for k in results[n]:
-            if 'gls_hyp' in k:
-                all_gls_hyp_keys.add(k)
-
-    if all_gls_hyp_keys:
-        best_wer = 200.0
-        best_wer_details = {}
-        per_head_wer = {}
-
-        # Reference is the same regardless of head
-        gls_ref_raw = [results[n].get('gls_ref', '') for n in names]
-        if dataset_name == 'phoenix-2014t':
-            gls_ref_clean = [clean_phoenix_2014_trans(g) for g in gls_ref_raw]
-        else:
-            gls_ref_clean = gls_ref_raw
-
-        for hyp_key in sorted(all_gls_hyp_keys):
-            gls_hyp_raw = [results[n].get(hyp_key, '') for n in names]
-            if dataset_name == 'phoenix-2014t':
-                gls_hyp_clean = [clean_phoenix_2014_trans(g) for g in gls_hyp_raw]
-            else:
-                gls_hyp_clean = gls_hyp_raw
-
-            wer_res = wer_list(references=gls_ref_clean, hypotheses=gls_hyp_clean)
-            head_name = hyp_key.replace('gls_hyp', '').strip('_') or 'default'
-            per_head_wer[head_name] = wer_res
-
-            if wer_res['wer'] < best_wer:
-                best_wer = wer_res['wer']
-                best_wer_details = wer_res
-
-        metrics['wer'] = best_wer
-        metrics['del_rate'] = best_wer_details.get('del_rate', 0)
-        metrics['ins_rate'] = best_wer_details.get('ins_rate', 0)
-        metrics['sub_rate'] = best_wer_details.get('sub_rate', 0)
-        metrics['per_head_wer'] = {k: v['wer'] for k, v in per_head_wer.items()}
-        metrics['best_wer_head'] = min(per_head_wer, key=lambda k: per_head_wer[k]['wer'])
+    metrics = {}
 
     # BLEU
-    bleu_dict = bleu(references=txt_ref, hypotheses=txt_hyp, level=level)
+    bleu_dict = compute_bleu(references=txt_ref, hypotheses=txt_hyp)
     for k, v in bleu_dict.items(): metrics[k] = v
 
     # ROUGE
-    rouge_score = rouge(references=txt_ref, hypotheses=txt_hyp, level=level)
-    metrics['rouge_l'] = rouge_score
+    metrics['rouge_l'] = compute_rouge(references=txt_ref, hypotheses=txt_hyp)
 
     # Per-sample metrics
     per_sample = {}
@@ -139,24 +122,11 @@ def compute_metrics(results: dict, config: dict) -> dict:
         ref_tokens = ref.split() if ref else ['']
 
         s_bleu = sentence_bleu([ref_tokens], hyp_tokens, smoothing_function=smooth) * 100
-        gls_hyp = _select_primary_gls_hyp(results[n])
-        gls_ref = results[n].get('gls_ref', '')
-        if dataset_name == 'phoenix-2014t':
-            gls_hyp = clean_phoenix_2014_trans(gls_hyp)
-            gls_ref = clean_phoenix_2014_trans(gls_ref)
-
-        # sentence_wer is gloss-level WER to match gls_hyp/gls_ref inspection.
-        if gls_ref or gls_hyp:
-            sent_wer_res = wer_single(r=gls_ref, h=gls_hyp)
-        else:
-            sent_wer_res = wer_single(r=ref, h=hyp)
-        sent_wer = (sent_wer_res['num_err'] / max(sent_wer_res['num_ref'], 1)) * 100
         ref_set = set(ref_tokens)
         novel_tokens = [t for t in hyp_tokens if t not in ref_set]
         novel_rate = len(novel_tokens) / max(len(hyp_tokens), 1)
         len_ratio = len(hyp_tokens) / max(len(ref_tokens), 1)
 
-        # Check for repetition (any token repeated >= 3 times consecutively)
         has_repetition = False
         if len(hyp_tokens) >= 3:
             for i in range(len(hyp_tokens) - 2):
@@ -165,52 +135,53 @@ def compute_metrics(results: dict, config: dict) -> dict:
                     break
 
         per_sample[n] = {
-            'sentence_bleu': s_bleu, 'sentence_wer': sent_wer,
-            'novel_token_rate': novel_rate, 'output_length_ratio': len_ratio,
-            'has_repetition': has_repetition, 'hyp_length': len(hyp_tokens), 'ref_length': len(ref_tokens),
+            'sentence_bleu': s_bleu,
+            'novel_token_rate': novel_rate,
+            'output_length_ratio': len_ratio,
+            'has_repetition': has_repetition,
+            'hyp_length': len(hyp_tokens),
+            'ref_length': len(ref_tokens),
         }
+
     metrics['per_sample'] = per_sample
     return metrics
 
 
 @torch.no_grad()
 def run_evaluation(
-    model, dataset, conditions: list, config: dict, output_path: str,
-    batch_size: int = 8, num_workers: int = 4, beam_size: int = 5,
-    generate_cfg: dict = None, collect_logits: bool = False,
+    model, dataset, conditions, output_path,
+    tokenizer, batch_size=8, num_workers=4,
+    generate_cfg=None,
 ):
     '''Run model inference across all misalignment conditions.
 
     Args:
-        model: Loaded MSKA SignLanguageModel (already on device, eval mode).
-        dataset: MisalignedDataset instance.
+        model: SLTModel (already on device, eval mode).
+        dataset: EvalDataset instance (with set_condition method).
         conditions: List of (name, delta_s, delta_e) tuples.
-        config: MSKA config dict.
         output_path: Path to save results JSON.
+        tokenizer: HuggingFace mBART tokenizer.
         batch_size: Batch size for DataLoader.
         num_workers: Number of DataLoader workers.
-        beam_size: CTC beam search width.
         generate_cfg: Translation generation config.
-        collect_logits: Whether to store CTC log-probabilities.
 
     Returns:
         Dict with all results.
     '''
     from torch.utils.data import DataLoader
-    from Tokenizer import GlossTokenizer_S2G
-
-    if generate_cfg is None: generate_cfg = config.get(
-        'testing', {}).get('translation', {
-        'length_penalty': 1, 'max_length': 100, 'num_beams': 5
-    })
+    import sys as _sys, os as _os
+    _gfslt_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'gfslt-pose-trainer')
+    if _gfslt_dir not in _sys.path:
+        _sys.path.insert(0, _gfslt_dir)
+    from loader import collate_fn
 
     model.eval()
-    metric_logger = MetricLogger(delimiter='  ')
+    device = next(model.parameters()).device
 
     all_results = OrderedDict()
     all_results['meta'] = {
         'num_samples': len(dataset), 'num_conditions': len(conditions),
-        'beam_size': beam_size, 'generate_cfg': generate_cfg,
+        'generate_cfg': generate_cfg,
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
     }
     output_path = Path(output_path)
@@ -218,47 +189,42 @@ def run_evaluation(
 
     for cond_name, delta_s, delta_e in tqdm(conditions):
         t_start = time.time()
-        dataset.set_condition(cond_name, delta_s, delta_e) # Set misalignment condition on dataset
+        dataset.set_condition(cond_name, delta_s, delta_e)
         loader = DataLoader(
             dataset, batch_size=batch_size,
-            num_workers=num_workers, collate_fn=dataset.collate_fn,
+            num_workers=num_workers, collate_fn=collate_fn,
             shuffle=False, pin_memory=True, drop_last=False,
         )
-        skipped_names = set() # Get the set of skipped sample names
+        skipped_names = set()
         for idx in dataset._skipped_indices:
             skipped_names.add(dataset.list[idx])
 
         sample_results = OrderedDict()
-        for src_input in metric_logger.log_every(loader, 1, f'{cond_name}'):
-            output = model(src_input)
-            batch_names = src_input['name']
-            collect_batch_predictions(model, src_input, output, sample_results, beam_size=beam_size, generate_cfg=generate_cfg)
+        for batch in loader:
+            pixel_values = batch['pixel_values'].to(device)
+            pixel_mask = batch['pixel_mask'].to(device)
+            names = batch['names']
+            texts = batch['texts']
 
-            # Collect CTC logits for confidence analysis (evaluator-specific)
-            if collect_logits and 'ensemble_last_gloss_logits' in output:
-                logits = output['ensemble_last_gloss_logits']
-                probs = logits.softmax(dim=-1)
-                max_conf = probs.max(dim=-1).values  # (B, T)
-                for i, name in enumerate(batch_names):
-                    valid_len = output['input_lengths'][i].item()
-                    mean_conf = max_conf[i, :valid_len].mean().item()
-                    sample_results[name]['mean_ctc_confidence'] = mean_conf
+            collect_batch_predictions(
+                model, names, texts, pixel_values, pixel_mask,
+                sample_results, tokenizer, generate_cfg=generate_cfg,
+            )
 
-        # --- Compute metrics for this condition ---
-        # Filter out skipped samples
+        # Compute metrics (excluding skipped samples)
         metrics = {}
         per_sample_metrics = {}
-        eval_results = {k: v for k, v in sample_results.items() if k not in skipped_names and 'txt_hyp' in v}
+        eval_results = {k: v for k, v in sample_results.items()
+                        if k not in skipped_names and 'txt_hyp' in v}
         if eval_results:
-            metrics = compute_metrics(eval_results, config)
+            metrics = compute_metrics(eval_results)
             per_sample_metrics = metrics.pop('per_sample', {})
 
         merged_predictions = OrderedDict()
         for n, v in sample_results.items():
             merged_entry = {
-                'txt_hyp': v.get('txt_hyp', ''), 'txt_ref': v.get('txt_ref', ''),
-                'gls_hyp': _select_primary_gls_hyp(v), 'gls_ref': v.get('gls_ref', ''),
-                'mean_ctc_confidence': v.get('mean_ctc_confidence', None),
+                'txt_hyp': v.get('txt_hyp', ''),
+                'txt_ref': v.get('txt_ref', ''),
             }
             merged_entry.update(per_sample_metrics.get(n, {}))
             merged_predictions[n] = merged_entry
@@ -270,25 +236,23 @@ def run_evaluation(
             'elapsed_seconds': round(elapsed, 1), 'metrics': metrics,
             'predictions': merged_predictions,
         }
-        with open(output_path, 'w', encoding='utf-8') as f: # Save incrementally
+        with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
 
-        print(f"{cond_name}: WER={metrics.get('wer', 0):.2f}; BLEU-4={metrics.get('bleu4', 0):.2f}; "
-              f"ROUGE-L={metrics.get('rouge_l', 0):.2f} ({elapsed:.1f}s, {len(eval_results)} samples)\n")
+        print(f"{cond_name}: BLEU-4={metrics.get('bleu4', 0):.2f}; "
+              f"ROUGE-L={metrics.get('rouge_l', 0):.2f} "
+              f"({elapsed:.1f}s, {len(eval_results)} samples)")
 
-    # ── Group-level summaries ─────────────────────────────────────────────────
-    # Compute mean metrics for each misalignment group (4 basic + compound + overall)
+    # Group-level summaries
     group_summary = _compute_group_summaries(all_results)
     all_results['group_summary'] = group_summary
 
-    # Print group summary
     print('\n=== Group-Level Summary ===')
     for gname, gdata in group_summary.items():
         print(f"  {gname:12s}: BLEU-4={gdata['bleu4']:.2f}, "
-              f"WER={gdata['wer']:.2f}, ROUGE-L={gdata['rouge_l']:.2f} "
+              f"ROUGE-L={gdata['rouge_l']:.2f} "
               f"({gdata['n_conditions']} conditions)")
 
-    # Save final version with summaries
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
 
@@ -296,79 +260,67 @@ def run_evaluation(
 
 
 def _compute_group_summaries(all_results):
-    '''Compute mean metrics for each misalignment group.
-
-    - 4 basic: HT, TT, HC, TC (averaged over all severities)
-    - compound groups: HT+TT, HC+TC, HT+TC, HC+TT (averaged over all severity combos)
-    - All_Basic: mean over all basic conditions
-    - All_Compound: mean over all compound conditions
-    - Overall: mean over all misaligned conditions (basic + compound)
-    '''
+    '''Compute mean metrics for each misalignment group.'''
     groups = defaultdict(lambda: defaultdict(list))
     for cond_name, cond_data in all_results.items():
         if cond_name in ('meta', 'clean', 'group_summary'): continue
         m = cond_data.get('metrics', {})
         bleu4 = m.get('bleu4')
         if bleu4 is None: continue
-        wer = m.get('wer', 0)
         rouge_l = m.get('rouge_l', 0)
 
-        if '+' in cond_name: # Compound condition — extract group from first parts
+        if '+' in cond_name:
             parts = cond_name.split('+')
             a_type = parts[0].rsplit('_', 1)[0]
             b_type = parts[1].rsplit('_', 1)[0]
             group = f'{a_type}+{b_type}'
             groups[group]['bleu4'].append(bleu4)
-            groups[group]['wer'].append(wer)
             groups[group]['rouge_l'].append(rouge_l)
             groups['All_Compound']['bleu4'].append(bleu4)
-            groups['All_Compound']['wer'].append(wer)
             groups['All_Compound']['rouge_l'].append(rouge_l)
-        else: # Basic condition
+        else:
             ctype = cond_name.rsplit('_', 1)[0]
             groups[ctype]['bleu4'].append(bleu4)
-            groups[ctype]['wer'].append(wer)
             groups[ctype]['rouge_l'].append(rouge_l)
             groups['All_Basic']['bleu4'].append(bleu4)
-            groups['All_Basic']['wer'].append(wer)
             groups['All_Basic']['rouge_l'].append(rouge_l)
 
         groups['Overall']['bleu4'].append(bleu4)
-        groups['Overall']['wer'].append(wer)
         groups['Overall']['rouge_l'].append(rouge_l)
 
-    # Deterministic order: basic groups, compound groups, aggregates
-    ordered_keys = ['HT', 'TT', 'HC', 'TC', 'HT+TT', 'HC+TC', 'HT+TC', 'HC+TT', 'All_Basic', 'All_Compound', 'Overall']
+    ordered_keys = ['HT', 'TT', 'HC', 'TC', 'HT+TT', 'HC+TC', 'HT+TC', 'HC+TT',
+                    'All_Basic', 'All_Compound', 'Overall']
     summary = OrderedDict()
-    
     for gname in ordered_keys:
         if gname in groups:
             g = groups[gname]
             summary[gname] = {
-                'wer': float(np.mean(g['wer'])), 'bleu4': float(np.mean(g['bleu4'])),
-                'rouge_l': float(np.mean(g['rouge_l'])), 'n_conditions': len(g['bleu4']),
+                'bleu4': float(np.mean(g['bleu4'])),
+                'rouge_l': float(np.mean(g['rouge_l'])),
+                'n_conditions': len(g['bleu4']),
             }
     return summary
 
 
 def verify_clean_baseline(
-    model, dataset, config, output_dir, batch_size=8, 
-    num_workers=4, beam_size=5, generate_cfg=None, expected=None
-): # Run clean evaluation and verify against MSKA's reported numbers
+    model, dataset, output_dir, tokenizer,
+    batch_size=8, num_workers=4, generate_cfg=None, expected=None,
+):
+    '''Run clean evaluation and verify against expected numbers.'''
     output_path = os.path.join(output_dir, 'raw', 'verify_clean.json')
     conditions = [('clean', 0.0, 0.0)]
     results = run_evaluation(
-        model, dataset, conditions, config, output_path,
-        batch_size=batch_size, num_workers=num_workers, beam_size=beam_size, 
-        generate_cfg=generate_cfg, collect_logits=True
+        model, dataset, conditions, output_path,
+        tokenizer=tokenizer, batch_size=batch_size,
+        num_workers=num_workers, generate_cfg=generate_cfg,
     )
     metrics = results['clean']['metrics']
-    
+
     print("=== Clean Baseline Verification ===")
     if expected:
         tol = expected.get('tolerance', 2.0)
         checks = []
-        for metric_name in ['wer', 'bleu4', 'rouge_l']:
+        for metric_name in ['bleu4', 'rouge_l']:
             if metric_name in expected and metric_name in metrics:
                 diff = abs(metrics[metric_name] - expected[metric_name])
                 ok = diff <= tol
@@ -376,6 +328,6 @@ def verify_clean_baseline(
                 print(f'{metric_name}: expected {expected[metric_name]:.2f}, '
                       f'got {metrics[metric_name]:.2f}, diff={diff:.2f} [{status}]')
                 checks.append(ok)
-        if all(checks): print('\nVerification PASSED - metrics match MSKA paper within tolerance.')
+        if all(checks): print('\nVerification PASSED - metrics match within tolerance.')
         else: print('WARNING: Some metrics differ from expected values.')
     return results

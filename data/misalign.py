@@ -12,25 +12,25 @@ Misalignment types:
 import numpy as np
 from typing import Optional, Tuple, Dict, List
 
-MIN_FRAMES_DEFAULT = 8 # Default: DSTA-Net has strides [2,1,1,1,2,1,1,1] -> 4x -> min_frames=8
+MIN_FRAMES_DEFAULT = 4 # Default: CoSign + TemporalConv1D (conv_type=2) has ~4x downsampling
 
-def compute_min_frames(temporal_strides, min_encoder_len=2):
-    '''Compute minimum input frames from encoder architecture.
+def compute_min_frames(temporal_conv_type=2, min_encoder_len=2):
+    '''Compute minimum input frames from visual encoder architecture.
 
-    DSTA-Net's temporal strides determine how many input frames map to one
-    encoder timestep. With strides [2, 1, 1, 1, 2, 1, 1, 1] the total
-    downsampling is 4x, so T=8 -> T_enc=2 (minimum for relative position).
+    For GFSLT-VLP with CoSign backbone + TemporalConv1D:
+      conv_type=0 (K3):          ~1x downsampling -> min_frames=2
+      conv_type=1 (K5+P2):       ~2x downsampling -> min_frames=4
+      conv_type=2 (K5+P2+K5+P2): ~4x downsampling -> min_frames=8
 
     Args:
-        temporal_strides: List of stride values from DSTA-Net layer config. Each entry is 
-             the 5th element of that layer's config tuple (e.g., [64,64,16,7,2] has stride=2).
+        temporal_conv_type: TemporalConv1D conv_type (0, 1, or 2).
         min_encoder_len: Minimum encoder output length (default 2).
     Returns:
         int: minimum input frames.
     '''
-    total_downsample = 1
-    for s in temporal_strides: total_downsample *= s
-    return total_downsample * min_encoder_len
+    # Approximate downsampling factor from TemporalConv1D
+    downsample = {0: 1, 1: 2, 2: 4}.get(temporal_conv_type, 4)
+    return downsample * min_encoder_len
 
 
 def apply_misalignment(

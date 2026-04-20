@@ -1,0 +1,60 @@
+# Model: AR decoder (mBART) + Clean training (no augmentation).
+# Baseline for fair comparison with original GFSLT-VLP paper.
+model_name: ar_clean
+decoder_type: ar
+
+model:
+    mbart_name: facebook/mbart-large-cc25
+    input_modality: rgb
+    embed_dim: 1024
+    hidden_size: 1024
+    temporal_kernel: 3
+    rgb_backbone: resnet18
+
+# Stage 1: VLP pretraining (paper: 80 epochs).
+vlp:
+    epochs: 80
+    batch_size: 32
+    num_workers: 4
+    learning_rate: 5.0e-04
+    weight_decay: 1.0e-04
+    betas: [0.9, 0.98]
+    use_text_decoder: true
+    mlm_loss_weight: 1.0
+    noise_rate: 0.15
+    text_decoder_lr: 1.0e-03          # VLP-v2: separate AdamW for TextDecoder
+    text_decoder_weight_decay: 0.0
+    text_decoder_step_every: 5
+
+# Path to VLP checkpoint (populated after `run.py --mode vlp`).
+vlp_checkpoint: null
+
+# Stage 2: translation training (paper: 200 epochs, SGD 0.01, mom=0.9).
+training:
+    epochs: 200
+    batch_size: 16
+    num_workers: 4
+    optimizer: SGD
+    momentum: 0.9
+    learning_rate:
+        default: 0.01
+    weight_decay: 0.0
+    label_smoothing: 0.2
+
+    t_max: 200
+    eta_min: 1.0e-08
+    # No warmup, no gradient clipping (paper defaults).
+
+    save_every_n_epochs: 10
+    early_stopping_patience: 10
+    eval_every_n_epochs: 2
+
+augmentation:
+    enabled: false
+    p_aug: 0.0
+
+validation:
+    translation:
+        max_new_tokens: 150
+        num_beams: 4
+        length_penalty: 1.0

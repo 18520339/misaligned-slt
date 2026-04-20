@@ -285,7 +285,7 @@ def generate_phase2_figures(results_dir, output_dir):
         if data is not None:
             all_results[model_name] = data
             clean = data.get('clean', {}).get('metrics', {})
-            print(f"  Loaded {model_name}: BLEU-4={clean.get('bleu4', '?'):.2f}, WER={clean.get('wer', '?'):.2f}")
+            print(f"  Loaded {model_name}: BLEU-4={clean.get('bleu4', '?'):.2f}, ROUGE-L={clean.get('rouge_l', '?'):.2f}")
         else: print(f'  {model_name}: not found (skipping)')
 
     if len(all_results) < 2:

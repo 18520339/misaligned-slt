@@ -16,8 +16,8 @@ def detect_knee_point(
     Args:
         severities: X-axis values (severity percentages).
         values: Y-axis values (metric values at each severity).
-        direction: 'decreasing' for BLEU-like (lower = worse),
-                   'increasing' for WER-like (higher = worse).
+        direction: 'decreasing' for metrics where lower = worse (e.g. BLEU),
+                   'increasing' for metrics where higher = worse.
         clean_baseline: Clean-condition metric value. If None, uses values[0].
         retention_ratio: Fraction of clean baseline used as threshold. Example: 0.70 means "70% of clean baseline".
 

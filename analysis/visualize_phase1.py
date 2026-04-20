@@ -1,19 +1,16 @@
 '''Visualization for misalignment analysis.
 • Every figure covers BOTH basic (HT, TT, HC, TC) AND compound conditions
   where applicable (compound means are added as dashed overlay curves).
-• Three core metrics are shown consistently in every figure:
-    – BLEU-4  (↑ better)    – WER (↑ worse, annotated)    – ROUGE-L (↑ better)
-• WER direction convention
-    – Standalone WER plots: raw values, y-axis labelled "WER (%) ↑ worse".
-    – Combined / multi-metric views: ALL metrics shown as *relative degradation %*
-      from clean baseline (positive = more degraded), so ΔBLEU% and ΔWER% are directly comparable on the same axis.
-      Formula:  ΔM% = (clean−val)/|clean|×100  for BLEU/ROUGE/chrF
-                ΔM% = (val−clean)/|clean|×100  for WER/TER
+• Two core metrics are shown consistently in every figure:
+    – BLEU-4  (↑ better)    – ROUGE-L (↑ better)
+• Combined / multi-metric views: metrics shown as *relative degradation %*
+  from clean baseline (positive = more degraded).
+  Formula:  ΔM% = (clean−val)/|clean|×100  for BLEU/ROUGE
 • Figures 6 and 9 are completely redesigned per reviewer feedback:
     – Fig 6: per-sample failure-mode transition matrices (clean → each severity).
     – Fig 9: scatter of predicted-additive vs actual compound drop, revealing
               super-/sub-additive interaction for every compound condition and severity in the dataset.
-• Fig 11 ranks ALL conditions (basic + compound) by BLEU drop with multi-metric bars.
+• Fig 10 ranks ALL conditions (basic + compound) by BLEU drop with multi-metric bars.
 '''
 import os, json
 import numpy as np
@@ -61,8 +58,8 @@ FOUR_MODE_ABBREV = {
     'Acceptable': 'Acc', 'Under-generation': 'Under',
     'Hallucination': 'Hall', 'Incoherent': 'Incoh',
 }
-METRIC_LABELS = {'wer': 'WER (%)', 'bleu4': 'BLEU-4', 'rouge_l': 'ROUGE-L'}
-METRIC_HIGHER_IS_BETTER = {'wer': False, 'bleu4': True, 'rouge_l': True}
+METRIC_LABELS = {'bleu4': 'BLEU-4', 'rouge_l': 'ROUGE-L'}
+METRIC_HIGHER_IS_BETTER = {'bleu4': True, 'rouge_l': True}
 
 matplotlib.use('Agg')
 plt.rcParams.update({
@@ -204,9 +201,8 @@ def fig01_bleu_degradation(results, severity_levels, output_dir, clean_bleu=None
 def fig02_unified_dashboard_heatmap(results, severity_levels, output_dir, clean_metrics=None):
     # Unified Figure: top dashboard + bottom heatmap
     if clean_metrics is None: clean_metrics = results.get('clean', {}).get('metrics', {})
-    line_metrics = [('wer', 'WER'), ('bleu4', 'BLEU-4'), ('rouge_l', 'ROUGE-L')]
+    line_metrics = [('bleu4', 'BLEU-4'), ('rouge_l', 'ROUGE-L')]
     heat_metrics = [
-        ('wer', 'WER Increase (pp)', 'YlGnBu'),
         ('bleu4', 'BLEU-4 Drop (pp)', 'YlOrRd'),
         ('rouge_l', 'ROUGE-L Drop (pp)', 'YlOrRd'),
     ]
@@ -216,7 +212,7 @@ def fig02_unified_dashboard_heatmap(results, severity_levels, output_dir, clean_
     n_types = len(BASIC_ORDER)
     n_sevs = len(severity_levels)
     sev_labels = [f'{int(s * 100)}' for s in severity_levels]
-    clean_vals = {m: clean_metrics.get(m, 0) for m in ('bleu4', 'wer', 'rouge_l')}
+    clean_vals = {m: clean_metrics.get(m, 0) for m in ('bleu4', 'rouge_l')}
     matrices = {}
     for metric, _, _ in heat_metrics:
         mat = np.full((n_types, n_sevs), np.nan)
@@ -235,9 +231,9 @@ def fig02_unified_dashboard_heatmap(results, severity_levels, output_dir, clean_
                     mat[r_i, c_i] = val - cval
         matrices[metric] = mat
 
-    fig_w = max(16, n_sevs * 1.3 + 6)
+    fig_w = max(12, n_sevs * 1.3 + 6)
     fig, axes = plt.subplots(
-        2, 3, figsize=(fig_w, 14),
+        2, 2, figsize=(fig_w, 14),
         gridspec_kw={'height_ratios': [1.0, 1.08], 'hspace': 0.2, 'wspace': 0.22},
     )
 
@@ -321,7 +317,6 @@ def fig02_unified_dashboard_heatmap(results, severity_levels, output_dir, clean_
                 ax.text(c_i, r_i, f'{v:.1f}', ha='center', va='center', fontsize=9, color=txt_color, fontweight='bold')
 
     clean_str = (
-        f"WER={clean_vals.get('wer', 0):.1f}%  "
         f"BLEU-4={clean_vals.get('bleu4', 0):.1f}  "
         f"ROUGE-L={clean_vals.get('rouge_l', 0):.1f}"
     )
@@ -336,55 +331,55 @@ def fig02_unified_dashboard_heatmap(results, severity_levels, output_dir, clean_
     _save_fig(fig, output_dir, 'fig02_unified_dashboard_heatmap')
 
 
-# Figure 3: Recognition vs Translation Diagnostic
-def fig03_recog_vs_translation(results, severity_levels, output_dir):
-    '''Recognition vs translation diagnostics in two complementary views.
+# Figure 3: BLEU vs ROUGE Degradation Diagnostic
+def fig03_bleu_vs_rouge(results, severity_levels, output_dir):
+    '''BLEU-4 vs ROUGE-L degradation diagnostics.
 
     Top row (4 panels):
-      Relative degradation curves on a common axis, preserving bottleneck labels.
+      Relative degradation curves for BLEU-4 and ROUGE-L on a common axis.
 
     Bottom row (4 panels):
-      Raw WER-vs-BLEU scatter across severities for each condition, with a
-      fitted slope line to reveal error-propagation pattern.
+      Raw ROUGE-L vs BLEU-4 scatter across severities for each condition,
+      with a fitted slope line to reveal metric coupling.
     '''
     clean_metrics = results.get('clean', {}).get('metrics', {})
-    clean_wer = clean_metrics.get('wer')
     clean_bleu = clean_metrics.get('bleu4')
+    clean_rouge = clean_metrics.get('rouge_l')
     fig, axes = plt.subplots(2, 4, figsize=(22, 11), gridspec_kw={'hspace': 0.15, 'wspace': 0.15})
     sevs_pct = [s * 100 for s in severity_levels]
 
     # Precompute per-condition series for both top (relative) and bottom (raw) rows.
     by_type = {}
     global_rel_vals = []
-    all_raw_wer, all_raw_bleu = [], []
+    all_raw_rouge, all_raw_bleu = [], []
     for ctype in BASIC_ORDER:
-        xs, wer_deg, bleu_deg = [], [], []
-        raw_wer, raw_bleu, raw_sev = [], [], []
+        xs, rouge_deg, bleu_deg = [], [], []
+        raw_rouge, raw_bleu, raw_sev = [], [], []
 
         for sev, sev_pct in zip(severity_levels, sevs_pct):
             cond = f'{ctype}_{int(sev * 100):02d}'
             m = results.get(cond, {}).get('metrics', {})
-            w = m.get('wer')
+            r = m.get('rouge_l')
             b = m.get('bleu4')
-            if w is None or b is None: continue
+            if r is None or b is None: continue
 
-            raw_wer.append(w)
+            raw_rouge.append(r)
             raw_bleu.append(b)
             raw_sev.append(sev_pct)
-            all_raw_wer.append(w)
+            all_raw_rouge.append(r)
             all_raw_bleu.append(b)
 
-            if clean_wer and clean_bleu:
+            if clean_rouge and clean_bleu:
                 xs.append(sev_pct)
-                wer_rel = _relative_degradation(clean_wer, w, 'wer')
+                rouge_rel = _relative_degradation(clean_rouge, r, 'rouge_l')
                 bleu_rel = _relative_degradation(clean_bleu, b, 'bleu4')
-                wer_deg.append(wer_rel)
+                rouge_deg.append(rouge_rel)
                 bleu_deg.append(bleu_rel)
-                global_rel_vals.extend([wer_rel, bleu_rel])
+                global_rel_vals.extend([rouge_rel, bleu_rel])
 
         by_type[ctype] = {
-            'xs': xs, 'wer_deg': wer_deg, 'bleu_deg': bleu_deg,
-            'raw_wer': raw_wer, 'raw_bleu': raw_bleu, 'raw_sev': raw_sev,
+            'xs': xs, 'rouge_deg': rouge_deg, 'bleu_deg': bleu_deg,
+            'raw_rouge': raw_rouge, 'raw_bleu': raw_bleu, 'raw_sev': raw_sev,
         }
 
     # Shared y-limits for top-row relative-degradation panels.
@@ -398,20 +393,20 @@ def fig03_recog_vs_translation(results, severity_levels, output_dir):
 
     # Shared axes for bottom-row raw scatter panels.
     raw_xlim = raw_ylim = None
-    if all_raw_wer and all_raw_bleu:
-        x_lo, x_hi = min(all_raw_wer), max(all_raw_wer)
+    if all_raw_rouge and all_raw_bleu:
+        x_lo, x_hi = min(all_raw_rouge), max(all_raw_rouge)
         y_lo, y_hi = min(all_raw_bleu), max(all_raw_bleu)
         x_pad = max(0.5, (x_hi - x_lo) * 0.12)
         y_pad = max(0.5, (y_hi - y_lo) * 0.12)
         raw_xlim = (max(0.0, x_lo - x_pad), x_hi + x_pad)
         raw_ylim = (max(0.0, y_lo - y_pad), y_hi + y_pad)
 
-    # ── Top row: existing relative-degradation lines (keep bottleneck labels). ──
+    # ── Top row: relative-degradation lines. ──
     for idx, ctype in enumerate(BASIC_ORDER):
         ax = axes[0][idx]
         series = by_type.get(ctype, {})
         xs = series.get('xs', [])
-        wer_deg = series.get('wer_deg', [])
+        rouge_deg = series.get('rouge_deg', [])
         bleu_deg = series.get('bleu_deg', [])
 
         if len(xs) < 2:
@@ -421,70 +416,66 @@ def fig03_recog_vs_translation(results, severity_levels, output_dir):
             ax.set_xlim(left=0)
             continue
 
-        l1, = ax.plot(xs, wer_deg, color='#c0392b', marker='o', label='WER degradation (%)', linewidth=2.2, markersize=7)
-        l2, = ax.plot(xs, bleu_deg, color='#2980b9', marker='s', label='BLEU degradation (%)', linewidth=2.2, markersize=7)
+        l1, = ax.plot(xs, bleu_deg, color='#2980b9', marker='s', label='BLEU-4 degradation (%)', linewidth=2.2, markersize=7)
+        l2, = ax.plot(xs, rouge_deg, color='#27ae60', marker='^', label='ROUGE-L degradation (%)', linewidth=2.2, markersize=7)
         ax.axhline(0, color='gray', linestyle='--', linewidth=1.1, alpha=0.6)
         ax.set_ylim(*rel_limits)
         ax.set_xlim(left=0)
 
-        if len(wer_deg) >= 3:
-            corr = np.corrcoef(wer_deg, bleu_deg)[0, 1]
-            # Three explicit regions (fixed thresholds):
-            #   corr >= 0.9 -> recognition bottleneck
-            #   0.7 < corr < 0.9 -> mixed
-            #   corr <= 0.7 -> translation amplification
-            if not np.isfinite(corr): bottleneck = 'Mixed'
-            elif corr >= 0.9: bottleneck = 'Recognition Bottleneck'
-            elif corr <= 0.7: bottleneck = 'Translation Amplification'
-            else: bottleneck = 'Mixed'
-            title_detail = f'r = {corr:.3f}  ({bottleneck})'
+        if len(bleu_deg) >= 3:
+            corr = np.corrcoef(bleu_deg, rouge_deg)[0, 1]
+            if not np.isfinite(corr): coupling = 'Uncorrelated'
+            elif corr >= 0.9: coupling = 'Strongly coupled'
+            elif corr >= 0.7: coupling = 'Moderately coupled'
+            else: coupling = 'Weakly coupled'
+            title_detail = f'r = {corr:.3f}  ({coupling})'
         else:
             title_detail = ''
 
         ax.set_title(f'{CONDITION_LABELS[ctype]}\n{title_detail}', fontsize=11)
         ax.set_xlabel('Severity (%)')
-        ax.legend([l1, l2], ['WER degradation (%)', 'BLEU degradation (%)'], loc='upper left', fontsize=8.6)
+        ax.legend([l1, l2], ['BLEU-4 degradation (%)', 'ROUGE-L degradation (%)'], loc='upper left', fontsize=8.6)
     axes[0][0].set_ylabel('Relative Degradation from Clean (%)\n(higher = worse)')
 
-    # ── Bottom row: raw WER vs BLEU scatter with slope. ─────────────────────
+    # ── Bottom row: raw ROUGE-L vs BLEU-4 scatter with slope. ─────────────────────
     cbar_vmin = min(sevs_pct) if sevs_pct else 0
     cbar_vmax = max(sevs_pct) if sevs_pct else 1
     for idx, ctype in enumerate(BASIC_ORDER):
         ax = axes[1][idx]
         series = by_type.get(ctype, {})
-        raw_wer = series.get('raw_wer', [])
+        raw_rouge = series.get('raw_rouge', [])
         raw_bleu = series.get('raw_bleu', [])
         raw_sev = series.get('raw_sev', [])
 
-        if len(raw_wer) < 2:
+        if len(raw_rouge) < 2:
             ax.set_title(f'{CONDITION_LABELS[ctype]}\n(raw scatter: insufficient data)', fontsize=10.8)
-            ax.set_xlabel('Raw WER (%)  (higher = worse)')
-            if idx == 0: ax.set_ylabel('Raw BLEU-4  (higher = better)')
+            ax.set_xlabel('Raw ROUGE-L')
+            if idx == 0: ax.set_ylabel('Raw BLEU-4')
             if raw_xlim: ax.set_xlim(*raw_xlim)
             if raw_ylim: ax.set_ylim(*raw_ylim)
             continue
 
         scatter = ax.scatter(
-            raw_wer, raw_bleu, c=raw_sev, cmap='viridis_r', vmin=cbar_vmin, vmax=cbar_vmax,
+            raw_rouge, raw_bleu, c=raw_sev, cmap='viridis_r', vmin=cbar_vmin, vmax=cbar_vmax,
             s=60, alpha=0.86, edgecolor='white', linewidth=0.55,
             marker=CONDITION_MARKERS[ctype], zorder=3,
         )
-        if clean_wer is not None and clean_bleu is not None: ax.scatter(
-            [clean_wer], [clean_bleu], marker='*', s=130,
+        if clean_rouge is not None and clean_bleu is not None: ax.scatter(
+            [clean_rouge], [clean_bleu], marker='*', s=130,
             color='#f1c40f', edgecolor='black', linewidth=0.6, zorder=4,
         )
         slope = None
         corr_raw = np.nan
-        if len(raw_wer) >= 2:
-            slope, intercept = np.polyfit(raw_wer, raw_bleu, 1)
-            x_fit = np.linspace(min(raw_wer), max(raw_wer), 60)
+        if len(raw_rouge) >= 2:
+            slope, intercept = np.polyfit(raw_rouge, raw_bleu, 1)
+            x_fit = np.linspace(min(raw_rouge), max(raw_rouge), 60)
             y_fit = slope * x_fit + intercept
             ax.plot(x_fit, y_fit, color=CONDITION_COLORS[ctype], linewidth=2.1, alpha=0.95, zorder=2)
-            if len(raw_wer) >= 3: corr_raw = np.corrcoef(raw_wer, raw_bleu)[0, 1]
+            if len(raw_rouge) >= 3: corr_raw = np.corrcoef(raw_rouge, raw_bleu)[0, 1]
 
         if np.isfinite(corr_raw):
-            if corr_raw <= -0.9: pattern = 'strong coupling'
-            elif corr_raw <= -0.7: pattern = 'moderate coupling'
+            if corr_raw >= 0.9: pattern = 'strong coupling'
+            elif corr_raw >= 0.7: pattern = 'moderate coupling'
             else: pattern = 'weak/nonlinear'
             diag_text = f'slope={slope:.2f}\nr={corr_raw:.3f} ({pattern})'
         else:
@@ -494,23 +485,21 @@ def fig03_recog_vs_translation(results, severity_levels, output_dir):
             0.5, 0.96, diag_text, transform=ax.transAxes, va='top', ha='left', fontsize=8.8,
             bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.86),
         )
-        for w, b, s in zip(raw_wer, raw_bleu, raw_sev):
-            ax.annotate(f'{int(round(s))}%', (w, b), textcoords='offset points', xytext=(4, 3), fontsize=7.2, alpha=0.80)
+        for r, b, s in zip(raw_rouge, raw_bleu, raw_sev):
+            ax.annotate(f'{int(round(s))}%', (r, b), textcoords='offset points', xytext=(4, 3), fontsize=7.2, alpha=0.80)
 
-        # ax.set_title(f'{CONDITION_LABELS[ctype]}\nRaw WER vs BLEU', fontsize=10.8)
-        ax.set_xlabel('Raw WER (%)  (higher = worse)')
-        if idx == 0: ax.set_ylabel('Raw BLEU-4  (higher = better)')
+        ax.set_xlabel('Raw ROUGE-L')
+        if idx == 0: ax.set_ylabel('Raw BLEU-4')
         if raw_xlim: ax.set_xlim(*raw_xlim)
         if raw_ylim: ax.set_ylim(*raw_ylim)
 
     fig.suptitle(
-        'Recognition vs Translation Diagnostics\n'
-        'Top: Relative degradation from clean (with bottleneck labels)   '
-        'Bottom: Raw WER vs BLEU scatter with fitted slope\n'
-        '(fixed top-row bottleneck thresholds: low=0.7, high=0.9)',
+        'BLEU-4 vs ROUGE-L Degradation Diagnostics\n'
+        'Top: Relative degradation from clean   '
+        'Bottom: Raw ROUGE-L vs BLEU-4 scatter with fitted slope',
         fontsize=12.8, y=0.99,
     )
-    _save_fig(fig, output_dir, 'fig03_recog_vs_translation')
+    _save_fig(fig, output_dir, 'fig03_bleu_vs_rouge')
 
 
 # Figure 4: Train vs Dev Structural Vulnerability
@@ -1014,24 +1003,24 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
     This layout spreads points vertically around y=0 so super/sub-additive structure is immediately visible 
     unlike a (pred, actual) scatter where all points cluster near the y=x diagonal.
 
-    Both BLEU-4 drop and WER increase shown in side-by-side panels.
+    BLEU-4 drop and ROUGE-L drop shown in side-by-side panels.
     Colour = compound pair family; marker = severity combo (sa, sb).
     '''
     if clean_metrics is None: clean_metrics = results.get('clean', {}).get('metrics', {})
-    clean_wer  = clean_metrics.get('wer',   0)
-    clean_bleu = clean_metrics.get('bleu4', 0)
+    clean_bleu  = clean_metrics.get('bleu4', 0)
+    clean_rouge = clean_metrics.get('rouge_l', 0)
     if not clean_bleu: return
 
-    fig, (ax_wer, ax_bleu) = plt.subplots(1, 2, figsize=(15, 7), sharey=True)
+    fig, (ax_rouge, ax_bleu) = plt.subplots(1, 2, figsize=(15, 7), sharey=True)
     all_sev_combos = {}
-    wer_data  = defaultdict(list)
-    bleu_data = defaultdict(list)  # pair → [(pred, deviation, a_sev, b_sev, lbl)]
+    rouge_data = defaultdict(list)
+    bleu_data  = defaultdict(list)  # pair → [(pred, deviation, a_sev, b_sev, lbl)]
 
     for cond_name, cond_data in results.items():
         if '+' not in cond_name or cond_name in ('clean', 'meta'): continue
         p = _parse_compound_name(cond_name)
         if p is None: continue
-        
+
         a_type, a_sev, b_type, b_sev = p
         pair  = _canonical_pair(a_type, b_type)
         cond_a = f'{a_type}_{int(a_sev * 100):02d}'
@@ -1056,16 +1045,16 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
             dev     = actual - pred          # >0 superadditive
             bleu_data[pair].append((pred, dev, a_sev, b_sev, short_lbl))
 
-        # WER deviation
-        if clean_wer:
-            wer_c = mc.get('wer')
-            if wer_c is not None:
-                inc_a  = ma.get('wer', clean_wer) - clean_wer
-                inc_b  = mb.get('wer', clean_wer) - clean_wer
-                pred_w = inc_a + inc_b
-                act_w  = wer_c - clean_wer
-                dev_w  = act_w - pred_w
-                wer_data[pair].append((pred_w, dev_w, a_sev, b_sev, short_lbl))
+        # ROUGE-L deviation
+        if clean_rouge:
+            rouge_c = mc.get('rouge_l')
+            if rouge_c is not None:
+                drop_a_r = clean_rouge - ma.get('rouge_l', clean_rouge)
+                drop_b_r = clean_rouge - mb.get('rouge_l', clean_rouge)
+                pred_r   = drop_a_r + drop_b_r
+                act_r    = clean_rouge - rouge_c
+                dev_r    = act_r - pred_r
+                rouge_data[pair].append((pred_r, dev_r, a_sev, b_sev, short_lbl))
 
     # Ensure unique marker per severity pair (no reuse ambiguity).
     unique_pairs = sorted(all_sev_combos.keys())
@@ -1075,9 +1064,9 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
         if i < len(marker_catalog): marker_map[sev_key] = marker_catalog[i]
         else: marker_map[sev_key] = marker_catalog[i % len(marker_catalog)]
 
-    # Share one y-scale so WER/BLEU interaction strength is directly comparable.
+    # Share one y-scale so ROUGE/BLEU interaction strength is directly comparable.
     all_dev_vals = [dev for pts in bleu_data.values() for _, dev, *_ in pts]
-    all_dev_vals += [dev for pts in wer_data.values() for _, dev, *_ in pts]
+    all_dev_vals += [dev for pts in rouge_data.values() for _, dev, *_ in pts]
     shared_ylim = None
     if all_dev_vals:
         y_abs_global = max(abs(v) for v in all_dev_vals)
@@ -1142,8 +1131,8 @@ def fig09_interaction_scatter(results, output_dir, clean_metrics=None):
         ax.legend(loc='lower left', fontsize=8.8, ncol=2, framealpha=0.9)
 
     _draw_deviation_scatter(
-        ax_wer, wer_data, 'WER: Deviation from Additivity',
-        'Predicted additive WER increase (pp)\n= inc_A + inc_B',
+        ax_rouge, rouge_data, 'ROUGE-L: Deviation from Additivity',
+        'Predicted additive ROUGE-L drop (pp)\n= drop_A + drop_B',
         'Deviation (actual − predicted)  pp\n> 0 = superadditive  |  < 0 = subadditive',
         shared_ylim=shared_ylim
     )
@@ -1181,17 +1170,12 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
         • 1 row per basic condition type (mean across selected benchmark severities present in data).
         • 1 row per compound pair (mean across all sa/sb combos for that pair) — typically 4-6 rows, marked with diagonal hatching.
 
-    Three-metric encoding:
-        ▲  WER increase  (pp, red dots, separate top axis)
+    Two-metric encoding:
         ▬  BLEU-4 drop   (pp, colored bar, bottom axis)
         ◆  ROUGE-L drop  (pp, dark dots, same bottom axis)
-
-    Uses absolute pp so WER and BLEU share a common scale. WER on a
-    separate top axis because its absolute range differs from BLEU/ROUGE.
     '''
     if clean_metrics is None: clean_metrics = results.get('clean', {}).get('metrics', {})
     clean_bleu  = clean_metrics.get('bleu4', 0)
-    clean_wer   = clean_metrics.get('wer',   0)
     clean_rouge = clean_metrics.get('rouge_l', 0)
     if not clean_bleu: return
 
@@ -1208,7 +1192,7 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
     # ── Build rows: aggregated basic + aggregated compound ────────────────────
     rankings = []
     for ctype in BASIC_ORDER: # Basic: one averaged row per basic condition type across selected severities
-        basic_bleu, basic_wer, basic_rouge = [], [], []
+        basic_bleu, basic_rouge = [], []
         for sev_pct in show_sevs:
             cond = f'{ctype}_{sev_pct:02d}'
             m    = results.get(cond, {}).get('metrics', {})
@@ -1216,43 +1200,39 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
             if bleu is None: continue
 
             basic_bleu.append(clean_bleu - bleu)
-            if clean_wer and m.get('wer') is not None: basic_wer.append(m['wer'] - clean_wer)
             if clean_rouge and m.get('rouge_l') is not None: basic_rouge.append(clean_rouge - m['rouge_l'])
 
         if not basic_bleu: continue
         rankings.append({
             'label':      f"{ctype} (avg)",
             'color':      CONDITION_COLORS.get(ctype, '#7f8c8d'),
-            'wer_inc':    float(np.mean(basic_wer)) if basic_wer else None,
             'bleu_drop':  float(np.mean(basic_bleu)),
             'rouge_drop': float(np.mean(basic_rouge)) if basic_rouge else None,
             'hatch':      '',
         })
 
-    pair_buckets = defaultdict(lambda: {'wer': [], 'bleu': [], 'rouge_l': []})
+    pair_buckets = defaultdict(lambda: {'bleu': [], 'rouge_l': []})
     for cond_name, cond_data in results.items(): # Compound: one averaged row per canonical pair
         if '+' not in cond_name or cond_name in ('clean', 'meta'): continue
         p = _parse_compound_name(cond_name)
         if p is None: continue
-        
+
         pair = _canonical_pair(p[0], p[2])
         m    = cond_data.get('metrics', {})
         bleu = m.get('bleu4')
         if bleu is None: continue
-        
+
         pair_buckets[pair]['bleu'].append(clean_bleu - bleu)
-        if clean_wer and m.get('wer') is not None: pair_buckets[pair]['wer'].append(m['wer'] - clean_wer)
         if clean_rouge and m.get('rouge_l') is not None: pair_buckets[pair]['rouge_l'].append(clean_rouge - m['rouge_l'])
 
     for pair, buckets in pair_buckets.items():
         if not buckets['bleu']: continue
         mean_bleu  = float(np.mean(buckets['bleu']))
-        mean_wer   = float(np.mean(buckets['wer']))   if buckets['wer']   else None
         mean_rouge = float(np.mean(buckets['rouge_l'])) if buckets['rouge_l'] else None
         rankings.append({
             'label': f"{COMPOUND_PAIR_LABELS.get(pair, pair)} (avg)",
             'color': COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d'),
-            'bleu_drop': mean_bleu, 'wer_inc': mean_wer, 'rouge_drop': mean_rouge, 'hatch': '///',
+            'bleu_drop': mean_bleu, 'rouge_drop': mean_rouge, 'hatch': '///',
         })
 
     rankings.sort(key=lambda x: x['bleu_drop'], reverse=True)
@@ -1279,20 +1259,8 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
         zorder=5, alpha=0.85, label='ROUGE-L drop (pp, bottom axis)'
     )
     ax.set_xlabel('BLEU-4 drop (pp)  ▬     ROUGE-L drop (pp)  ◆\n'
-                  '(bottom axis — absolute point-change from clean baseline)', fontsize=10)
+                  '(absolute point-change from clean baseline)', fontsize=10)
     ax.set_xlim(left=0)
-
-    # ── WER increase ▲ on secondary top axis ─────────────────────────────────
-    wer_vals = [r['wer_inc'] for r in rankings]
-    wer_ys   = list(y_pos)
-    wv_valid = [(wv, wy) for wv, wy in zip(wer_vals, wer_ys) if wv is not None]
-    if wv_valid:
-        ax2 = ax.twiny()
-        ax2.scatter(*zip(*[(wv, wy) for wv, wy in wv_valid]), marker='^', s=45, color='#c0392b', zorder=5, alpha=0.85)
-        ax2.set_xlabel('WER increase (pp)  ▲ (top axis — separate scale from BLEU/ROUGE)', fontsize=10, color='#c0392b')
-        ax2.tick_params(axis='x', labelcolor='#c0392b')
-        ax2.set_xlim(left=0)
-        ax2.grid(True)
 
     # ── Y-axis labels ─────────────────────────────────────────────────────────
     ax.set_yticks(y_pos)
@@ -1306,7 +1274,7 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
     for thr in thr_guides: ax.axvline(thr, color='gray', linestyle=':', linewidth=0.9, alpha=0.4)
     ax.set_title(
         f'Sensitivity Ranking — {N} entries  (basic means + compound pair means, worst first)\n'
-        f'▲ WER increase   ▬ BLEU-4 drop   ◆ ROUGE-L drop   (/// = compound mean, solid = basic mean)',
+        f'▬ BLEU-4 drop   ◆ ROUGE-L drop   (/// = compound mean, solid = basic mean)',
         fontsize=11, pad=10
     )
     compound_pairs_present = {
@@ -1319,8 +1287,7 @@ def fig10_sensitivity_ranking(results, output_dir, clean_metrics=None):
         *[Patch(color=CONDITION_COLORS[c], label=f'{c} avg') for c in BASIC_ORDER],
         *[Patch(color=COMPOUND_PAIR_COLORS.get(pair, '#7f8c8d'), hatch='///', 
                 label=f'{COMPOUND_PAIR_LABELS.get(pair, pair)} avg') for pair in sorted(compound_pairs_present)],
-        Line2D([0], [0], marker='D', color='#2c3e50', linestyle='None', markersize=6, label='ROUGE-L drop (◆, bottom)'),
-        Line2D([0], [0], marker='^', color='#c0392b', linestyle='None', markersize=6, label='WER increase (▲, top)'),
+        Line2D([0], [0], marker='D', color='#2c3e50', linestyle='None', markersize=6, label='ROUGE-L drop (◆)'),
     ]
     ax.legend(handles=legend_handles, loc='lower right', fontsize=8.8, ncol=2, framealpha=0.92)
     fig.subplots_adjust(left=0.28, right=0.98, top=0.90, bottom=0.12)
@@ -1368,53 +1335,6 @@ def fig11_output_length_ratio(results, severity_levels, output_dir):
     _save_fig(fig, output_dir, 'fig11_output_length_ratio')
 
 
-# Figure 12: CTC Recognition Confidence
-def fig12_ctc_confidence(results, severity_levels, output_dir):
-    '''Mean CTC confidence per condition.
-
-    Solid lines = single-noise basic conditions.
-    Confidence drop foreshadows recognition collapse before BLEU fully degrades.
-    '''
-    fig, ax = plt.subplots(figsize=(11, 6))
-    sevs_pct  = [s * 100 for s in severity_levels]
-    has_data  = False
-
-    # Basic conditions
-    for ctype in BASIC_ORDER:
-        confs, xs = [], []
-        for sev, sev_pct in zip(severity_levels, sevs_pct):
-            cond  = f'{ctype}_{int(sev * 100):02d}'
-            preds = _get_condition_samples(results, cond)
-            cc    = [v['mean_ctc_confidence'] for v in preds.values() if v.get('mean_ctc_confidence') is not None]
-            if cc:
-                confs.append(float(np.mean(cc)))
-                xs.append(sev_pct)
-                has_data = True
-        if xs: ax.plot(
-            xs, confs, linewidth=2.2, markersize=7, color=CONDITION_COLORS[ctype], 
-            marker=CONDITION_MARKERS[ctype], label=CONDITION_LABELS[ctype],
-        )
-
-    if not has_data:
-        plt.close(fig)
-        return
-
-    # Clean baseline
-    clean_preds = _get_condition_samples(results, 'clean')
-    clean_cc = [v['mean_ctc_confidence'] for v in clean_preds.values() if v.get('mean_ctc_confidence') is not None]
-    if clean_cc:
-        cl_mean = float(np.mean(clean_cc))
-        ax.axhline(cl_mean, color='gray', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Clean ({cl_mean:.3f})')
-
-    ax.set_xlabel('Severity (%)')
-    ax.set_ylabel('Mean CTC Frame Confidence')
-    ax.set_title('CTC Recognition Confidence Under Temporal Misalignment\n'
-                 '(early confidence drop = recognition bottleneck; dashed = compound)')
-    ax.legend(ncol=2, fontsize=10)
-    ax.set_xlim(left=0)
-    _save_fig(fig, output_dir, 'fig12_ctc_confidence')
-
-
 # Master function
 def generate_all_figures(results_dir: str, output_dir: str):
     '''Load result JSON files and generate all analysis figures.
@@ -1443,14 +1363,13 @@ def generate_all_figures(results_dir: str, output_dir: str):
 
         fig01_bleu_degradation(knee_results, knee_sevs, output_dir, clean_bleu=cm.get('bleu4'))
         fig02_unified_dashboard_heatmap(knee_results, knee_sevs, output_dir, clean_metrics=cm)
-        fig03_recog_vs_translation(knee_results, knee_sevs, output_dir)
+        fig03_bleu_vs_rouge(knee_results, knee_sevs, output_dir)
         
         # fig5: compound bottom row deferred until after bench block.
         fig06_transition_matrices(knee_results, knee_sevs, output_dir)
         fig07_length_vs_bleu_drop(knee_results, knee_sevs, output_dir)
         fig08_vulnerability_profile(knee_results, knee_sevs, output_dir)
         fig11_output_length_ratio(knee_results, knee_sevs, output_dir)
-        fig12_ctc_confidence(knee_results, knee_sevs, output_dir)
 
     # ── Benchmark figures (all 49 conditions; compound interactions) ──────────
     if bench_path.exists():
