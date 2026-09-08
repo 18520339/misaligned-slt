@@ -9,11 +9,11 @@ import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutput
 
 from train.helpers import eval_mode
-from train.losses import bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
+from train.losses import bio_anchor_loss, bio_nll_dice_loss, confidence_bound_gate, confidence_bound_loss
 from models.bio_head import RoPEBIOHead
 from models.front_end import SLTFrontEnd
 from models.membership_gate import build_omega, omega_cross_bias
-from infer.commit_gate import open_span_start, select_target_span
+from infer.commit_gate import bio_complete_spans, open_span_start, select_target_span
 from infer.duration_decode import deployed_decode_tags
 
 
@@ -57,6 +57,8 @@ class SLTLossOutput:
     # BIO head logits from this forward (None on the lambda_bio=0 clean-floor path). Exposed so dev eval can score
     # metrics without a second pose-encoder + head forward on identical inputs.
     bio_logits: torch.Tensor | None = None
+    reference_logits: torch.Tensor | None = None  # frozen S1 posteriors on the same batch (KD target), for dev diagnostics
+    vetoed: torch.Tensor | None = None  # (B,) rows whose Omega was rebuilt from GT: their decode and target do not share a mask
 
 
 class MisalignedSLTModel(nn.Module):
@@ -134,14 +136,16 @@ class MisalignedSLTModel(nn.Module):
         self, bio_logits: torch.Tensor, bio_labels: torch.Tensor | None, frame_mask: torch.Tensor, memory_len: int, 
         commit_mask: torch.Tensor | None = None, delta: int = 3, eps: float = 1e-4, min_span_frames: int = 0,
         gt_anchored: bool = False, timestamps_s: torch.Tensor | None = None, seam_is_terminator: bool = True,
-        stream_start: bool = False, anchor_override: torch.Tensor | None = None,
+        stream_start: bool = False, anchor_override: torch.Tensor | None = None, iou_veto: float = 0.5, gt_spans: list | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """Membership-gate cross-attention bias (B,1,1,M) for a batch (docs/membership_gate.md).
 
-        The span (s, τ) is ON-POLICY — BIO head's OWN argmax via `select_target_span`, the rule FSM uses — in training & 
-        inference alike; a window with no predicted anchor stays neutral. `bio_labels` (window-relative B/I/O) serves only 
-        the `anchor_hit_rate` diagnostic (closed on-policy span at tIoU ≥ 0.5 with GT target, over windows that have one) 
-        and the `gt_anchored=True` ablation, which forces GT span with ±δ jitter.
+        The span (s, τ) is ON-POLICY — BIO head's OWN decoded span via `select_target_span`, the rule FSM uses. Training (`bio_labels` 
+        given): a span that overlaps GT target at tIoU >= `iou_veto`, and shows no OTHER whole sentence, is kept — Ω dims the part it 
+        misses, which is the span FSM commits and the protocol scores against that sentence. Anything worse is rebuilt from GT span, 
+        the rate logged as `veto_rate`; `anchor_hit_rate` measures the policy itself (closed on-policy span at tIoU ≥ 0.5, over windows 
+        with a GT target). Inference (`bio_labels=None`) and `anchor_override` rows: predicted span verbatim. `gt_anchored=True` forces 
+        the GT span with ±δ jitter (ablation).
         """
         B, T, _ = bio_logits.shape
         device = bio_logits.device
@@ -154,7 +158,9 @@ class MisalignedSLTModel(nn.Module):
             seam_is_terminator=seam_is_terminator, stream_start=stream_start, delta=int(delta),
         )
         starts, terms, has_term, has_anchor = [], [], [], []
-        hits, n_gt = 0, 0  # anchor_hit_rate is over windows that HAVE a GT target (§1.6 diagnostic; no effect on Ω)
+        hits, n_gt = 0, 0        # anchor_hit_rate: closed on-policy span at tIoU >= 0.5, over windows with a closed GT target
+        vetoed, n_gt_any = 0, 0  # veto_rate: windows whose Ω was rebuilt from GT, over windows with any GT target (closed or open)
+        veto_flags = [False] * B
         for b in range(B):
             n = int(lengths[b].item())
             # χ-frontier filter mirroring the FSM (χ = in-buffer frame count): a span terminating before the commit
@@ -169,20 +175,39 @@ class MisalignedSLTModel(nn.Module):
                 if ov_t >= 0: span = (ov_s, min(ov_t, n - 1))
                 else: span, forced_open = None, ov_s
             if bio_labels is not None:
-                gt = select_target_span(bio_labels[b, :n], min_span_frames)
+                # The GT anchor is the sentence the text supervises (batch frames) when the caller has it; the label-derived
+                # first-complete span otherwise. fps augmentation can shrink a >= Lambda_min sentence below Lambda_min label
+                # frames, and the two rules would then name different sentences.
+                gt = gt_spans[b] if gt_spans is not None and gt_spans[b] is not None \
+                                 else select_target_span(bio_labels[b, :n], min_span_frames)
                 if gt is not None:
-                    n_gt += 1
+                    n_gt += 1; n_gt_any += 1
                     hits += int(span is not None and MisalignedSLTModel._span_iou(span, gt) >= 0.5)
-                if gt_anchored:                 # ablation row: "GT-anchored with ±δ jitter" (gate-doc §3 table)
+                if gt_anchored:  # ablation row: "GT-anchored with ±δ jitter" (gate-doc §3 table)
                     # Jitter is part of ablation: exact GT anchors would hand the gate boundary info the on-policy head can never supply, 
                     # conflating "teacher-forced m" with "oracle boundaries". δ-imprecision is the tolerance the gate's ramp/bands assume.
                     span = gt
+                    if gt is not None: vetoed += 1; veto_flags[b] = True   # every GT-anchored window counts as rebuilt from GT
                     if gt is not None and n > 2 and delta > 0:
                         j_s = int(torch.randint(-int(delta), int(delta) + 1, (1,)).item())
                         j_t = int(torch.randint(-int(delta), int(delta) + 1, (1,)).item())
                         s_j = min(max(int(gt[0]) + j_s, 0), n - 2)
                         t_j = min(max(int(gt[1]) + j_t, s_j + 1), n - 1)
                         span = (s_j, t_j)
+                elif anchor_override is None and gt is not None:
+                    # A near miss is KEPT: Ω dims the part of the sentence the span misses, FSM commits exactly this span and is scored 
+                    # against exactly this sentence, and these rows are the only ones whose training anchor matches the one deployment 
+                    # produces. A span that shows ANOTHER whole sentence is not a near miss — its target would name 1 sentence while its 
+                    # mask holds 2, so it's rebuilt from GT like any worse span. "Another sentence" = a complete label span that does NOT 
+                    # overlap target. Sentences are disjoint in time, so an overlapping label span IS target (frame-derived & label-derived 
+                    # spans of 1 sentence can differ by a frame or 2, and comparing tuples would read that as a second sentence).
+                    shows_other = span is not None and any(
+                        min(t, int(gt[1])) - max(a, int(gt[0])) <= 0 and t - a >= int(min_span_frames)
+                        and a >= int(span[0]) - int(delta) and t <= int(span[1]) + int(delta)
+                        for a, t in bio_complete_spans(bio_labels[b, :n])
+                    )
+                    if span is None or shows_other or MisalignedSLTModel._span_iou(span, gt) < float(iou_veto):
+                        span = gt; vetoed += 1; veto_flags[b] = True
 
             if span is not None: starts.append(int(span[0])); terms.append(int(span[1])); has_term.append(True); has_anchor.append(True)
             else:
@@ -190,6 +215,12 @@ class MisalignedSLTModel(nn.Module):
                 # s (doc §2.8 forced path: γ≡γ_s, no right cliff → Ω≈0 for all-I interior); frame 0 would sweep the opening B and floor 
                 # the span the gate must OPEN (attention ×0.01). A buffer-start I-run never opens → no anchor, neutral row.
                 open_s = forced_open if forced_open is not None else open_span_start(pred_tags[b, :n])
+                if bio_labels is not None and anchor_override is None and not gt_anchored:
+                    # Single-endpoint veto for an open span: keep the predicted start when it is within δ of the GT start.
+                    gt_open = open_span_start(bio_labels[b, :n])
+                    if gt_open is not None: n_gt_any += 1
+                    if open_s is not None and (gt_open is None or abs(int(open_s) - int(gt_open)) <= int(delta)): pass
+                    elif gt_open is not None: open_s = gt_open; vetoed += 1; veto_flags[b] = True
                 if gt_anchored and bio_labels is not None:   # ablation row: GT-anchored open spans too, jittered like the closed case
                     open_s = open_span_start(bio_labels[b, :n])
                     if open_s is not None and n > 2 and delta > 0:
@@ -209,7 +240,10 @@ class MisalignedSLTModel(nn.Module):
         omega = torch.where(anchor_mask.view(B, 1), out.omega, torch.zeros_like(out.omega))
         omega_bias = omega_cross_bias(omega, memory_len=int(memory_len), dtype=bio_logits.dtype)
         gamma_mean = out.gamma_s[anchor_mask].mean() if anchor_mask.any() else out.gamma_s.new_zeros(())
-        stats = {"anchor_hit_rate": hits / max(1, n_gt), "gamma_s_mean": float(gamma_mean)}
+        stats = {
+            "anchor_hit_rate": hits / max(1, n_gt), "veto_rate": vetoed / max(1, n_gt_any), "gamma_s_mean": float(gamma_mean),
+            "anchors": (starts_t, terms_t, has_term_t), "vetoed": torch.tensor(veto_flags, device=device),
+        }
         return omega_bias, stats
 
 
@@ -254,7 +288,7 @@ class MisalignedSLTModel(nn.Module):
         """Gradient-carrying AR logits on the truncated path.
 
         `generate_from_bio_tap` picks the prefix under no-grad; this forward replays it for the gradients the confidence-bound CE needs. 
-        Generation and replay share one Ω — that gradient into the BIO logits is part of the Mode-2a coupling.
+        Generation and replay share one Ω, built from detached logits (conditioning only).
         """
         # eval_mode: the selection decode must be the distribution inference sees (dropout-free, BN stats untouched);
         # only the grad-bearing replay below trains under dropout.
@@ -318,6 +352,38 @@ class MisalignedSLTModel(nn.Module):
         return bio_logits, tokens, confidence, gate_skip
 
 
+    @staticmethod
+    def _candidate_frames(cands: list[dict], ts: torch.Tensor, n: int) -> list[dict]:
+        # Window-relative seconds -> frame indices with the label convention: B = first frame at or after the start, 
+        # terminator = first frame at or after the end (n when the sentence ends at the window edge).
+        t = ts[:n].detach().float().cpu()
+        out = []
+        for c in cands:
+            b = int(torch.searchsorted(t, torch.tensor(float(c["start_s"]), dtype=t.dtype)).item())
+            e = int(torch.searchsorted(t, torch.tensor(float(c["end_s"]), dtype=t.dtype)).item())
+            out.append({**c, "b_idx": min(b, n), "t_idx": min(e, n)})
+        return out
+
+
+    def gt_target_spans(self, batch: dict, timestamps, bio_mask) -> list | None:
+        """Per-row frame span (B, terminator) of the sentence the collated text supervises, from the window's candidate list; 
+        None for rows without a text target. The gate's GT anchor, so the veto and the target name the same sentence."""
+        cands, firsts = batch.get("candidate_sentences"), batch.get("translation_targets")
+        if cands is None or firsts is None or timestamps is None: return None
+        out = []
+        for b in range(len(cands)):
+            first = firsts[b]
+            first_text = (first["text"] if isinstance(first, dict) else getattr(first, "text", None)) if first is not None else None
+            span = None
+            if first_text:
+                n = int(bio_mask[b].long().sum())
+                for c in self._candidate_frames(cands[b], timestamps[b], n):
+                    if c["text"] == first_text and c["t_idx"] > c["b_idx"]: 
+                        span = (int(c["b_idx"]), int(min(c["t_idx"], n - 1))); break
+            out.append(span)
+        return out
+
+
     def forward_loss(
         self, batch: dict, lambda_trans: float = 1.0, lambda_bio: float = 1.0,
         dice_weight: float = 1.5, bio_class_weights: torch.Tensor | None = None,
@@ -329,14 +395,16 @@ class MisalignedSLTModel(nn.Module):
         cb_dcd_decode_algo: str = "threshold", cb_dcd_decode_param: int | float | None = None, cb_dcd_sample_top_k: int | None = None,
         cb_dcd_top_p: float | None = None, cb_dcd_cache_type: str = "none", cb_spd_top_k: int = 1, cb_spd_renormalize: bool = True, 
         cb_spd_revision: bool = True, cb_temperature: float = 0.0, gate_enabled: bool = False, gate_delta: int = 3, 
-        gate_eps: float = 1e-4, gate_min_span_frames: int = 0, gate_gt_anchored: bool = False,
+        gate_eps: float = 1e-4, gate_min_span_frames: int = 0, gate_gt_anchored: bool = False, gate_iou_veto: float = 0.5,
+        bio_anchor_alpha: float = 0.2, bio_anchor_temperature: float = 2.0,
     ) -> SLTLossOutput:
         """Stage-2 training loss for one mixed-mode batch.
 
         ``L = lambda_bio * L_BIO + lambda_trans * L_translation``, translation routed per window mode (`mode_names` from sampler) to 
         enforce premise P1: a truncated visual input never receives a partial text label.
 
-        - BIO (all modes): Dice(1.5)+CE over in-window frames; padding/UNK ignored.
+        - BIO (all modes): alpha*(CE+Dice on GT) + (1-alpha)*T^2*KL(S1 || head) with an S1 init (bio_anchor), else Dice(1.5)+CE;
+          over in-window frames, padding/UNK ignored.
         - Mode 1 / Mode 3 (complete-anchor / first-complete-span): OPUT under fixed full conditioning (`dlm_decoder.oput_forward`; 
           plain CE for AR). Raises if any other mode reaches that path.
         - Mode 2a (right-truncated): confidence-bound term only — gated CE toward the model's own no-grad full-evidence decode, 
@@ -348,15 +416,30 @@ class MisalignedSLTModel(nn.Module):
         Per-mode losses logged separately.
         """
         bio_tap, bio_mask, enc_hidden, enc_mask, timestamps = self.encode_visual(batch)
-        if float(lambda_bio) == 0.0 and not gate_enabled: # Clean-floor recipe
-            # BIO branch SKIPPED, not zero-weighted — no head forward, no graph, no backward. 
-            # The gate is its only other logits consumer and is off here.
-            bio_out, bio_loss = None, bio_tap.new_zeros(())
+        reference_logits = None
+        if float(lambda_bio) == 0.0 and not gate_enabled: bio_out, bio_loss = None, bio_tap.new_zeros(()) # Clean-floor recipe
         else:
             bio_out = self.bio_head(bio_tap, timestamps_s=timestamps, frame_mask=bio_mask)
-            bio_loss = bio_nll_dice_loss(bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights)
+            reference = getattr(self, "bio_reference", None)   # frozen copy of the best head so far (train/slt.py attaches it)
+            a = float(bio_anchor_alpha)
+            gt_term = bio_nll_dice_loss( # always computed: at alpha 0 it is the unmonitorable quantity the decay is measured against
+                bio_out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=bio_class_weights
+            )
+            if reference is not None and float(lambda_bio) != 0.0 and a < 1.0:
+                with torch.no_grad():
+                    reference_logits = reference.to(bio_tap.device)(batch["poses"], batch["frame_mask"], timestamps_s=timestamps).logits
+                # The KL branch detaches the student tap: this loss updates the BIO head only.
+                # GT and translation losses can still update the pose encoder.
+                anchor_logits = self.bio_head(bio_tap.detach(), timestamps_s=timestamps, frame_mask=bio_mask).logits
+                kd = bio_anchor_loss(anchor_logits, reference_logits, bio_mask, temperature=bio_anchor_temperature)
+                bio_loss = a * gt_term + (1.0 - a) * kd
+            else: bio_loss = gt_term
+
         translation_loss = bio_tap.sum() * 0.0
         logs: dict[str, torch.Tensor] = {"bio_loss": bio_loss.detach()}
+        if bio_out is not None: logs["bio_gt_loss"] = gt_term.detach()
+        if reference_logits is not None: logs["bio_kd_loss"] = kd.detach()
+
         # REALIZED mode mix (materialize() relabels windows jitter reshapes, so the drawn ratios are not what trains).
         realized = batch.get("mode_names")
         if isinstance(realized, list) and realized:
@@ -365,19 +448,22 @@ class MisalignedSLTModel(nn.Module):
         target_tokens = batch.get("target_tokens")
         supervised = batch.get("translation_supervised")
 
-        # Membership gate (docs/membership_gate.md): Ω from BIO posteriors + on-policy span conditions the decoder on the segmentation 
-        # belief — the coupling, since translation-loss gradient reaches the BIO logits through Ω. BOTH arms inject same Ω (DLM manual
-        # decode, AR via front_end.ar_omega_context) → §9.3 stays gated-vs-gated. None → pre-gate.
-        omega_bias = None
-        if gate_enabled:
-            omega_bias, gate_stats = self.build_gate_omega(
-                bio_out.logits, batch["bio_labels"], batch.get("frame_mask"), memory_len=int(enc_hidden.shape[1]),
+        # Membership gate (docs/membership_gate.md): Ω from BIO posteriors + on-policy span conditions the decoder on the segmentation
+        # belief. Built from DETACHED logits: conditioning only, no translation gradient into the head (the head is trained by its own
+        # objective). BOTH arms inject the same Ω (DLM manual decode, AR via front_end.ar_omega_context). None → pre-gate.
+        omega_bias, gate_stats = None, {}
+        if bio_out is not None: # Construct the conditioning and diagnostics before applying the gate switch.
+            gate_omega, gate_stats = self.build_gate_omega(
+                bio_out.logits.detach(), batch["bio_labels"], batch.get("frame_mask"), memory_len=int(enc_hidden.shape[1]),
                 commit_mask=batch.get("commit_mask"), delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
-                gt_anchored=gate_gt_anchored, timestamps_s=timestamps,
+                gt_anchored=gate_gt_anchored, timestamps_s=timestamps, iou_veto=gate_iou_veto,
+                gt_spans=self.gt_target_spans(batch, timestamps, bio_mask),
             )
+            omega_bias = gate_omega if gate_enabled else None
             logs["gate_anchor_hit_rate"] = bio_tap.new_tensor(gate_stats["anchor_hit_rate"])
+            logs["gate_veto_rate"] = bio_tap.new_tensor(gate_stats["veto_rate"])
             logs["gate_gamma_s_mean"] = bio_tap.new_tensor(gate_stats["gamma_s_mean"])
-
+            
         if target_tokens is not None and supervised is not None and supervised.any():
             idx = supervised.to(device=bio_tap.device).nonzero(as_tuple=False).flatten()
             mode_names = batch.get("mode_names")
@@ -434,7 +520,7 @@ class MisalignedSLTModel(nn.Module):
             full_batch = batch["full_evidence"]
             # no_grad: the full-evidence view feeds only the self-target decode and its Ω, both no-grad. Without this
             # the pose encoder built a graph over the LONGER full-evidence window that nothing ever backwards through.
-            # eval_mode: teacher-side forward — dropout off, and BN running stats must not absorb the longer
+            # eval_mode: reference-side forward — dropout off, and BN running stats must not absorb the longer
             # full-evidence windows (BN updates in forward even under no_grad).
             with torch.no_grad(), eval_mode(self):
                 full_bio_tap, full_mask, full_timestamps = self.front_end.extract_bio_tap(
@@ -452,12 +538,12 @@ class MisalignedSLTModel(nn.Module):
                 prompt_len = self.front_end.prompt_length()
                 chi = batch.get("commit_mask")
                 cb_omega_trunc, _ = self.build_gate_omega(
-                    bio_out.logits[cb_indices],
+                    bio_out.logits.detach()[cb_indices],
                     batch.get("bio_labels")[cb_indices] if batch.get("bio_labels") is not None else None,
                     bio_mask[cb_indices], memory_len=prompt_len + int(bio_tap.shape[1]),
                     commit_mask=chi[cb_indices] if chi is not None else None,
                     delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
-                    gt_anchored=gate_gt_anchored,  # must match the main call: else the gt_anchored ablation
+                    gt_anchored=gate_gt_anchored, iou_veto=gate_iou_veto,  # must match the main call: else the gt_anchored ablation
                     # trains its CB decode under a differently-anchored Omega than the OPUT rows.
                     timestamps_s=timestamps[cb_indices],  # real fps for the duration re-split (else 24fps fallback)
                 )
@@ -469,9 +555,8 @@ class MisalignedSLTModel(nn.Module):
                     full_cb_bio_logits, full_batch.get("bio_labels"), full_mask, memory_len=prompt_len + int(full_bio_tap.shape[1]),
                     # χ on BOTH views: a committed predecessor tail at the left edge must be
                     # floored here too, else the views differ by more than the right-truncation.
-                    commit_mask=full_batch.get("commit_mask"),
-                    delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
-                    gt_anchored=gate_gt_anchored, timestamps_s=full_timestamps,
+                    commit_mask=full_batch.get("commit_mask"), delta=gate_delta, eps=gate_eps, min_span_frames=gate_min_span_frames,
+                    gt_anchored=gate_gt_anchored, timestamps_s=full_timestamps, iou_veto=gate_iou_veto,
                 )
 
             if self.decoder_type == "dlm": # Encode the trunc path ONCE: the no-grad decode won't track it, remasked_logits will.
@@ -577,4 +662,7 @@ class MisalignedSLTModel(nn.Module):
         total = float(lambda_bio) * bio_loss + float(lambda_trans) * translation_loss
         logs["translation_loss"] = translation_loss.detach()
         logs["loss"] = total.detach()
-        return SLTLossOutput(total, bio_loss, translation_loss, logs, bio_logits=bio_out.logits if bio_out is not None else None)
+        return SLTLossOutput(
+            total, bio_loss, translation_loss, logs, bio_logits=bio_out.logits if bio_out is not None else None,
+            reference_logits=reference_logits, vetoed=gate_stats.get("vetoed")
+        )

@@ -13,9 +13,6 @@
 
 Offset the doc glosses: the BIO head reads the pose tap (T) but the decoder cross-attends
 `mT5_encoder([prompt | pose_tokens])` (M = prompt_len + T) — see `omega_cross_bias`.
-
-Gradient reaches only contested, above-floor frames in K_t, scaled by γ_t; γ_t (stop-grad), χ_t and 
-the argmax selection of (s, τ) carry none.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -159,9 +156,23 @@ def build_omega(
     ln_eps = torch.log(torch.tensor(float(eps), device=device, dtype=logm.dtype))
     logm = torch.where(right_wall, ln_eps.expand_as(logm), logm)
 
-    # ── fact: commit mask, unconditional, OUTSIDE γ (doc §2.7) ────────────────
-    omega = gamma * logm
-    if commit_mask is not None:
+    # ── redistribute, never suppress (doc §2.9) ───────────────────────────────
+    # Ω is added to cross-attention scores of POSE columns only, and softmax also spans the prompt columns, which carry 
+    # no Ω. Attention is a share-out, so pushing out-of-span frames down doesn't only move attention from outside the 
+    # sentence to inside it, it also moves attention onto the prompt. The longer buffer, the more frames are pushed down 
+    # and the more is lost that way, even when span is right. Shift whole belief so that pose columns keep total weight 
+    # they would have ungated (exp-sum = number of columns, exact for equal content scores, the best a query-independent 
+    # bias can do). Every frame-to-frame difference is untouched: only the level moves.
+    belief = gamma * logm
+    movable = torch.ones_like(belief, dtype=torch.bool) if lengths is None else \
+             (torch.arange(T, device=device).view(1, T) < lengths.view(B, 1))
+    if commit_mask is not None: movable = movable & ~commit_mask.to(device).bool()  # χ is a fact, not a belief to level
+    n_movable = movable.sum(dim=1, keepdim=True).clamp(min=1)
+    filled = torch.where(movable, belief, torch.full_like(belief, float("-inf")))
+    level = torch.logsumexp(filled, dim=1, keepdim=True) - torch.log(n_movable.to(belief.dtype))
+    omega = torch.where(movable, belief - level, belief)
+
+    if commit_mask is not None: # Fact: commit mask, unconditional, OUTSIDE γ and outside the centring (doc §2.7)
         chi = commit_mask.to(device).float()
         omega = omega + torch.log(1.0 - chi + eps)
     return OmegaOutput(omega=omega, logm=logm, gamma=gamma, gamma_s=gamma_s, gamma_tau=gamma_tau)

@@ -81,12 +81,12 @@ def save_train_state(
         "scaler": scaler_state,
         "control": control_state,
         "rng": { # Best-effort determinism: epoch-boundary RNG for the main process. Worker RNGs reseed per epoch anyway.
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            "numpy": np.random.get_state(),
-            "python": random.getstate(),
+            "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(), "python": random.getstate()
         },
     }
+    reference = getattr(model, "bio_reference", None)
+    if reference is not None: state["bio_reference"] = reference.state_dict()
     return _atomic_torch_save(state, Path(path))
 
 
@@ -95,6 +95,12 @@ def load_train_state(path: str | Path, model: nn.Module, optimizer: torch.optim.
     (scheduler/scaler/control/rng), since those objects live in the training loop."""
     import numpy as np, random
     state = torch.load(Path(path), map_location="cpu", weights_only=False)
+    reference = getattr(model, "bio_reference", None)
+    if reference is not None:
+        if "bio_reference" not in state:
+            raise ValueError("Resume checkpoint lacks segmentation reference. Start a fresh run or use a complete latest.pt.")
+        reference.load_state_dict(state["bio_reference"], strict=True)
+        reference.eval(); reference.requires_grad_(False)
     model.load_state_dict(state["model"])
     saved_groups, live_groups = len(state["optimizer"]["param_groups"]), len(optimizer.param_groups)
     if saved_groups != live_groups: raise SystemExit(

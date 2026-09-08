@@ -44,6 +44,23 @@ class StreamingEvent:
     terminator_commit: bool = False
 
 
+class S1RunnerAdapter(torch.nn.Module):
+    # Present a BioS1Model to StreamingSLTRunner: the FSM needs only the pose tap and the BIO head (gate off, no decoder).
+    def __init__(self, s1):
+        super().__init__()
+        self.s1 = s1
+        self.bio_head = s1.bio_head
+        self.duration_prior = None   # the runner writes the prior here (hasattr gate)
+        adapter = self
+        class _FrontEnd:
+            @staticmethod
+            def extract_bio_tap(poses, frame_mask, timestamps_s=None):
+                return adapter.s1.pose_encoder(poses, frame_mask), frame_mask, timestamps_s
+            @staticmethod
+            def prompt_length(): return 0
+        self.front_end = _FrontEnd()
+
+
 class StreamingSLTRunner:
     """Model-backed sawtooth inference runner.
 
@@ -58,7 +75,7 @@ class StreamingSLTRunner:
         dcd_decode_algo: str = "threshold", dcd_decode_param: int | float | None = None, dcd_sample_top_k: int | None = None,
         dcd_top_p: float | None = None, dcd_cache_type: str = "none", decode_conditioning: str = "window", min_span_frames: int | None = None, 
         forced_tail_policy: str = "skip", gate_enabled: bool = False, gate_delta: int | None = None, gate_eps: float = 1e-4, 
-        duration_prior=None, record_trace: bool = False, translate: bool = True, commit_lag_s: float = 0.0,
+        duration_prior=None, record_trace: bool = False, translate: bool = True, commit_lag_s: float = 0.0, cascade_model=None
     ):
         # decode_conditioning: "window" (default) decodes under the FULL buffer — the training conditioning (Mode 1/3 feed
         # the whole jittered window; right-context is learned to be disregarded, not cropped). "span" crops to the BIO span,
@@ -76,6 +93,8 @@ class StreamingSLTRunner:
         self.decode_conditioning = str(decode_conditioning)
         self.forced_tail_policy = str(forced_tail_policy)
         self.model = model
+        self.cascade_model = cascade_model
+        if cascade_model is not None and gate_enabled: raise ValueError("The online cascade uses an ungated clean translator.")
         self.stride_s = float(stride_s)
         self.buffer_cap_s = float(buffer_cap_s)
         self.max_text_tokens = int(max_text_tokens)
@@ -146,8 +165,15 @@ class StreamingSLTRunner:
     def _decode_span(self, bio_tap: torch.Tensor, mask: torch.Tensor, span_slice: slice, omega_bias: torch.Tensor | None = None):
         if not self.translate:
             return torch.zeros((1, 0), dtype=torch.long, device=bio_tap.device), torch.ones((1, 1), dtype=torch.float32, device=bio_tap.device)
-        if self.decode_conditioning == "span": bio_tap, mask = bio_tap[:, span_slice], mask[:, span_slice]
-        tokens, confidence = self.model.generate_from_bio_tap(
+        decoder = self.cascade_model if self.cascade_model is not None else self.model
+        if self.cascade_model is not None: # The clean translator encodes its own raw span, normalized like its training clips.
+            raw = self._raw_buffer[span_slice]
+            poses = torch.from_numpy(normalize_keypoints_unisign(raw)).unsqueeze(0).to(bio_tap.device)
+            mask = torch.ones(poses.shape[:2], dtype=torch.bool, device=poses.device)
+            bio_tap, mask, _ = decoder.front_end.extract_bio_tap(poses, mask)
+            omega_bias = None
+        elif self.decode_conditioning == "span": bio_tap, mask = bio_tap[:, span_slice], mask[:, span_slice]
+        tokens, confidence = decoder.generate_from_bio_tap(
             bio_tap, mask, max_text_tokens=self.max_text_tokens, diffusion_steps=self.diffusion_steps, tau_dec=self.tau_dec,
             spd_top_k=self.spd_top_k, spd_renormalize=self.spd_renormalize, spd_revision=self.spd_revision, temperature=self.temperature,
             dcd_window_length=self.dcd_window_length, dcd_max_window_length=self.dcd_max_window_length, dcd_window_type=self.dcd_window_type,
@@ -156,7 +182,7 @@ class StreamingSLTRunner:
         )
         # DLM strips its synthetic BOS internally; the AR arm returns it raw (the training replay needs the start slot) — 
         # drop it here so the commit gate's confidence mean covers only produced tokens, like the DLM arm.
-        if getattr(self.model, "decoder_type", "dlm") == "ar": tokens, confidence = tokens[:, 1:], confidence[:, 1:]
+        if getattr(decoder, "decoder_type", "dlm") == "ar": tokens, confidence = tokens[:, 1:], confidence[:, 1:]
         return tokens, confidence
 
     def _stride_omega(self, bio_logits: torch.Tensor, mask: torch.Tensor, ts_b: torch.Tensor, start_s: float):
@@ -194,6 +220,7 @@ class StreamingSLTRunner:
         # Normalize only the active buffer, as training does. Future and retired frames cannot set its body scale.
         device = next(self.model.parameters()).device
         raw_buffer = poses[in_buffer].detach().float().cpu().numpy()
+        if self.cascade_model is not None: self._raw_buffer = raw_buffer
         poses_b = torch.from_numpy(normalize_keypoints_unisign(raw_buffer)).unsqueeze(0).to(device)
         ts_b = (timestamps_s[in_buffer] - start_s).unsqueeze(0).to(device)
         mask_b = torch.ones(poses_b.shape[:2], dtype=torch.bool, device=device)
@@ -354,8 +381,9 @@ class StreamingSLTRunner:
         self._committed_until_s = 0.0  # χ commit log resets per stream
         self._committed_is_terminator = False
         self._bio_timeline = torch.full((poses.shape[0],), int(BIO["UNK"]), dtype=torch.long)  # stitched tags
+        self._fps = float(fps)
 
-        def absorb(event: StreamingEvent) -> None:
+        def absorb(event) -> None:
             nonlocal last_commit_t
             events.append(event)
             # The ≤δ overlap the next buffer keeps must be attention-floored by membership gate (seam-duplication guard §2.7).

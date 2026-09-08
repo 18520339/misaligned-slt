@@ -220,8 +220,7 @@ def load_pose_frames(pose_index: PoseIndex, start_frame: int, end_frame: int) ->
 
 
 def load_pose_window(
-    pose_index: PoseIndex, start_s: float, end_s: float,
-    normalize: bool = True, augment=None,
+    pose_index: PoseIndex, start_s: float, end_s: float, normalize: bool = True, augment=None, box=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     # Load a real-timeline pose window + relative timestamps. `normalize` converts raw (T,133,3) DWPose to Uni-Sign 69-kp 
     # representation (poses.normalize_keypoints_unisign). `augment` (train only) is a callable (raw_poses, width, height) 
@@ -232,7 +231,7 @@ def load_pose_window(
     end_frame = int(np.ceil(end_s * pose_index.fps))
     poses = load_pose_frames(pose_index, start_frame, end_frame)
     if augment is not None and poses.shape[1:] == (133, 3): poses = augment(poses, pose_index.width, pose_index.height)
-    if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses)
+    if normalize and poses.shape[1:] == (133, 3): poses = normalize_keypoints_unisign(poses, box=box)
     timestamps = (np.arange(poses.shape[0], dtype=np.float32) + start_frame) / float(pose_index.fps)
     return poses.astype(np.float32, copy=False), timestamps
     
