@@ -55,7 +55,7 @@ torchrun --standalone --nproc-per-node=4 train.py --stage train-slt --language "
 - `mixed_precision: auto` picks bf16 on compute capability ≥ 8. Multi-GPU + fp16 is refused (per-rank scaler drift).
 - `latest.pt` is a full resumable snapshot, written every epoch. Continue an interrupted run of the same architecture and settings with `--resume`. Re-running without `--resume` over an existing `latest.pt` is refused.
 - CUDA compiles the membership recurrence on first use. Judge speed after warmup. Before another full run after a slowdown, run `python tests/test_membership_runtime.py` on the training GPU. This data-free check measures gate forward/backward time and checks gradients; it writes `outputs/membership_runtime.json`. It does not estimate total epoch time.
-- Eval and analysis stay single-process; use `--batch-size` there. Gradient averaging is explicit, not DDP ([`train/distributed.py`](train/distributed.py) explains why).
+- Eval and analysis stay single-process. Offline cascade translation honors `--batch-size`; streaming processes one active buffer per stride. Gradient averaging is explicit, not DDP ([`train/distributed.py`](train/distributed.py) explains why).
 
 ## The experiment sequence
 
@@ -242,6 +242,14 @@ python eval.py --rq 2 --stream --segmenter-arch s1 --method baseline \
     --checkpoint checkpoints/baseline_train/"$LANG"/model.pt --match-geometry checkpoints/ar/"$LANG" \
     --language "$LANG" --split test --allow-test
 #   Output: outputs/rq2_stream_events_s1_${LANG}_test.json. --no-translate is a segmentation diagnostic only.
+#   Row 9 — online Moryossef cascade, under the same comparison arm's streaming policy.
+#   Requires duration_model.moryossef.<language> from its B1a tune-decode run.
+#   --moryossef-config names the segmenter configuration; --checkpoint names the clean translator.
+python eval.py --rq 2 --stream --segmenter-arch moryossef --method baseline \
+    --checkpoint checkpoints/baseline_train/"$LANG"/model.pt --match-geometry checkpoints/ar/"$LANG" \
+    --language "$LANG" --split test --allow-test
+#   Output: outputs/rq2_stream_events_moryossef_${LANG}_test.json.
+
 #   Rows 7/8: the same trained model, offline (self-segments, one-shot) vs streaming (FSM).
 python eval.py --rq 2 --offline --method ar  --language "$LANG" --split test --allow-test   # row 7'
 python eval.py --rq 2 --offline --method dlm --language "$LANG" --split test --allow-test   # row 7
@@ -306,6 +314,7 @@ python report.py --language "$LANG" --split test --reference stream \
 | 6 | S1, online FSM | Clean AR | `--stream --segmenter-arch s1 --method baseline --match-geometry <arm>` |
 | 7 | Joint head, offline | Joint AR/DLM | `--offline --method ar/dlm` |
 | 8 | Joint head, online FSM | Joint AR/DLM | `--stream --method ar/dlm` |
+| 9 | Moryossef26, online FSM | Clean AR | `--stream --segmenter-arch moryossef --method baseline --match-geometry <arm>` |
 
 **Required same-span control** — re-translate row 7's saved spans with the clean translator ("clean translator + S2 spans"):
 
@@ -318,7 +327,7 @@ python eval.py --rq 2 --segments outputs/rq2_offline_events_dlm_${LANG}_test.jso
 
 - **2 vs 1; 4 vs 3:** translation at fixed oracle or Moryossef spans.
 - **5 vs 3:** segmentation pipelines with the same clean translator; report the input/context differences.
-- **8 vs 6:** full joint system against the online S1 cascade under matched streaming geometry and policy. Compare localization separately from text scores.
+- **8 vs 6; 8 vs 9:** the joint system against online S1 and Moryossef cascades under matched streaming geometry and policy. Compare localization separately from text scores.
 - **8 vs 7:** the same joint model under online and offline access. This includes the effect of future context.
 
 Notes that prevent misreading, in brief:
@@ -328,7 +337,9 @@ Notes that prevent misreading, in brief:
 - Row 7 chunks the head at its TRAINED cap (checkpoint meta), overlap-stitched, each chunk pose-normalized on its own frames (the head's training frame), and translates each span in a buffer-shaped window. No whole-video pass, no random sampling at eval; rows 7–8 are deterministic.
 - The misaligned AR twin runs the identical commands with `--method ar` (rows 2′,5′,7′,8′) to isolate the decoder family. The headline table stays DLM.
 
-**Metric.** The RQ2 headline is the original densevid_eval protocol (the metric set of our previous paper: temporal F1 at tIoU {0.3, 0.5, 0.7, 0.9}; BLEU-4, METEOR, ROUGE-L, CIDEr, BLEURT within the localized segments; every text number quoted as the threshold average), implemented FAITHFULLY (metrics.densevid_text_metrics): one evaluation instance per overlapping (prediction, gold) pair — many-to-many, single reference; an unmatched prediction scores against a random lowercase GARBAGE string (length 10–20, seeded for reproducible tables); scoring is per gold video (BLEU-4 corpus-style and CIDEr-D via the official COCO scorer over the video's pairs; ROUGE-L/METEOR/BLEURT per-pair means) then averaged over videos. It is RECALL-BLIND (a missed gold never enters any pair) and precision-heavy (every extra span is a garbage pair inside the video's corpus score), so the SODA fusion (Fujita et al. 2020: one-to-one tIoU matching plus a localization-aware text score) is printed beside it in every table (`--no-densevid` drops the headline rows). The tune-stream stage selects on segmentation F1, never on a text metric: a recall-blind criterion would reward emitting fewer spans. Neither is comparable to RQ1's corpus BLEU: SODA builds on smoothed sentence scores, which run ~1.6x corpus BLEU on identical pairs at this sentence length — the RQ2 runner prints this warning with every table. SODA per video and threshold _t_: n_p predicted spans, n_g gold sentences, M the matched set, s_ij per-pair sentence scores:
+**Metric.** RQ2 uses DVC-style text scoring: every prediction/reference pair above the tIoU threshold is a single-reference instance. Unmatched predictions receive a seeded random garbage reference. Scores are computed per gold video, averaged equally across videos, then averaged over the declared tIoU thresholds. The repository uses SacreBLEU 13a rather than the original toolkit's COCO BLEU/PTB tokenizer; describe this as DVC-style matching and aggregation with the stated text scorers, not a byte-identical reproduction.
+
+A missed gold caption creates no DVC pair, so report localization precision, recall and F1 alongside text scores. The companion SODA-style fusion uses one-to-one temporal matching and charges predicted/gold counts. Neither RQ2 BLEU column is numerically interchangeable with RQ1 corpus BLEU. Compare the clean GT-span control and cascades under the same RQ2 scorer, checkpoint, beam count and scoring floor. The tune-stream stage selects on segmentation F1 rather than text scores. SODA-style fusion per video and threshold uses the following counts:
 
 &nbsp;&nbsp;&nbsp;&nbsp;`segmentation.f1 = 2|M|/(n_p+n_g)` · `S = Σ_(i,j)∈M s_ij`, `p = S/n_p`, `r = S/n_g`, `text = 2pr/(p+r)`
 
@@ -380,8 +391,8 @@ An offline whole-video result remains a useful reference. The four-mode window t
 Use identical test-video windows for all models, fixed independently of their predictions; do not reuse training examples or choose mode weights after seeing results.
 For modes 1/3, evaluate eligible complete-sentence localization. In mode 2, distinguish visible-fragment labeling from the decision to wait for a complete sentence. In mode 4, report false spans/false commits.
 Report modes separately: their training mixture is a sampling design and need not match how often they occur in a real stream. A one-sentence crop can make an all-signing prediction score well by cutting it at the supplied window edges; it does not establish boundary detection or correct commit timing.
-The current CLI supplies whole-video segmentation and online S1/joint evaluation.
-Streaming capacity is enforced before encoding. EOF clock advances do not count as new boundary evidence; forced overrides are flagged. A common four-mode benchmark and online Moryossef adaptation are proposed comparisons, not implemented entry points.
+The current CLI supplies whole-video segmentation and online S1/Moryossef/joint evaluation.
+Streaming capacity is enforced before encoding. EOF clock advances do not count as new boundary evidence; forced overrides are flagged. A common four-mode benchmark remains a proposed comparison, not an implemented entry point.
 
 | Output | What it measures |
 | --- | --- |
@@ -477,7 +488,7 @@ Watch `gate_anchor_hit_rate` during stage-2 training (the head's own closed span
 | S1 and stage-2 training, RQ1 | Supplied training or controlled window |
 | Whole-video S1 and offline joint head | Each chunk, at the checkpoint's trained context |
 | Streaming joint model | Active raw buffer only |
-| Online S1 cascade | Active buffer for S1; selected raw crop for the clean translator |
+| Online S1/Moryossef cascades | Active buffer for segmentation; selected raw crop for the clean translator |
 | Offline Moryossef adaptation | Whole video, reused by each training chunk |
 
 The reference Moryossef code uses different landmarks and shoulder/mean-std normalization. Our model uses the Uni-Sign input transform.
@@ -514,3 +525,62 @@ See [membership gate §3.0](docs/membership_gate.md#30-ground-truth-access) for 
 
 After this evaluation-state correction, rerun joint RQ1 and generated-dev caption scores before reporting them. Existing fixed-checkpoint streaming events and segmentation scores do not change because of this correction. The training loss, S1, clean translator and decoder calibration are unchanged.
 The corrected dev monitor can select a different checkpoint. Re-evaluate saved candidates under the same corrected protocol; do not compare its scores with a cached best score from reference-assisted conditioning. Resume checks record `validation_conditioning` and refuse that incompatible selection history. Keep trained weights; use a separate checkpoint directory for any continuation under the corrected selection protocol.
+
+
+## Online Moryossef cascade
+
+Use `--rq 2 --stream --segmenter-arch moryossef --method baseline --match-geometry <arm checkpoint>`.
+The segmenter checkpoint comes from `--moryossef-config`; `--checkpoint` names the clean translator.
+With `--no-translate`, `--checkpoint` instead names the segmenter and `--match-geometry` is optional. This diagnostic does not test translation confidence or caption quality.
+Omit `--segmenter-arch` for the joint AR/DLM head. Standalone segmenter evaluation still defaults to Moryossef.
+
+Every online head uses duration-aware BIO decoding. The external baseline reads its own `duration_model.moryossef.<language>` row; it never borrows S1's duration scores. Missing calibration requires its existing B1a `tune-decode` stage. Plain decoding remains an offline control.
+The comparison checkpoint supplies cap, delta and minimum span. Stride, lag, confidence threshold and forced-tail policy come from the shared live inference configuration. These are matched comparison settings, not separately optimized Moryossef streaming settings.
+
+The adapter recomputes normalization and velocity from the active buffer at each stride. The clean translator encodes the selected raw crop with its own normalization. No future frames or GT boundaries enter either prediction.
+This is an online adaptation of the existing offline-trained Moryossef model. Its training/offline path uses a whole-video box, so the online row also changes the normalization context. Do not present that result as the original released online system or attribute all differences to boundary learning.
+
+No retraining or runbook reordering is needed to enable this row. Evaluate it with the same comparison arm and policy as the joint row. Events are saved as `outputs/rq2_stream_events_moryossef_<language>_<split>.json`; segmentation-only output adds `_segonly`.
+
+
+## Long cascade proposals and memory
+
+`--batch-size` limits the number of supplied spans translated together. It does not limit frames inside one span. A merged prediction can therefore exceed encoder memory even at batch size 1. The cascade prints the longest proposal and its video/time interval before translation.
+
+Large mT5 inference calls compute encoder attention in query blocks. Each query still attends to every key in the supplied segment; relative positions, padding masks, normalization and output interval stay the same. No proposal is split, shortened or dropped. The log reports the actual batch, token count and query-block size.
+
+This bounds the attention workspace, not the total computation: full attention still has quadratic time cost in sequence length. Long segmentation errors can therefore be slow even when they fit memory. Other encoder activations and model weights still need memory.
+The training/gradient path is unchanged, and no checkpoint or calibration change is required. Copy the updated code to the evaluation runtime and rerun the failed cascade command; `--batch-size 1` also avoids padding other clips to the longest proposal. Batch sizes above 1 remain supported; use the largest value that fits the full pipeline.
+
+
+## Reading BLEU across RQ1 and RQ2
+
+| Output column | Calculation |
+| --- | --- |
+| `translation_bleu4` | Corpus BLEU over the full RQ1 or generated-dev caption set |
+| `densevid_bleu4` | Corpus BLEU within each video's tIoU-paired captions, followed by an equal-weight mean over videos |
+| `soda_bleu4` | Smoothed sentence BLEU on one-to-one matches, normalized by predicted/gold counts, then averaged over videos |
+
+These columns answer different questions. Shared text preprocessing does not make their numbers interchangeable. DVC includes garbage references for unmatched predictions and no separate pair for each missed GT sentence. A threshold also changes which references enter the score.
+Compare a cascade with the existing GT-span baseline row using the same RQ2 column, clean checkpoint, beam count and scoring floor. Keep RQ1 corpus BLEU as its own robustness result. GT-span captions are an oracle-input control, not a mathematical upper bound on every caption metric. The repository's DVC-style scorer uses SacreBLEU 13a instead of the original toolkit's COCO BLEU/PTB tokenizer; disclose that choice.
+
+### Processing windows and sentence spans
+
+Both offline segmenter pipelines follow this sequence:
+
+`video → neural chunks → stitched frame scores → sentence spans → one caption per supplied span`
+
+| Setting or object | What it limits |
+| --- | --- |
+| S1 trained chunk / Moryossef `num_frames` | Temporal encoder context; chunk edges are not sentence boundaries |
+| Offline predicted span | Its predicted start and end; a span can cross many neural chunks |
+| Translation `--batch-size` | Number of spans processed together, not the frames inside each span |
+| Attention query block | Temporary attention memory; all keys in the supplied span remain visible |
+| Streaming buffer cap | Available evidence per FSM step, with explicit forced-partial handling |
+
+The soft duration model does not impose a maximum sentence length. If boundary evidence is weak, an offline prediction can merge many sentences. This is a localization error, not a reason to remove that prediction from evaluation.
+The S1 and Moryossef offline cascades use the same full-proposal translation path. For a bounded streaming comparison, use both online cascades under matched geometry. Do not add sentence boundaries at neural chunk edges or change only one baseline's caption context after inspecting test results.
+
+
+The joint `--offline` row also preserves each complete predicted interval. Its caption window includes the normal lead-in/context and extends when necessary to cover a long proposal. The live buffer cap limits only `--stream`; it must not shorten offline event timestamps. Given-interval captioning computes the interval mask directly, without an unused latent-span pass.
+After this correction, rerun joint `--offline` rows if their predicted spans exceed the context extent. Existing S1/Moryossef cascade rows and streaming events are unchanged. No training or decoder recalibration is required. Cascade event provenance records the resolved translator checkpoint, including when the CLI uses its default.

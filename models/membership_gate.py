@@ -235,11 +235,27 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         self, bio_logits, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, min_span_frames=1,
         seam_is_terminator=True, stream_start=False, anchor_override=None, timestamps_s=None, decoder=None,
     ):
+        if anchor_override is not None and bool((anchor_override[:, 0] >= 0).all()):
+            # A supplied interval replaces membership completely; there is no inferred posterior to compute or report.
+            if commit_mask is not None:
+                if commit_mask.shape != frame_mask.shape: raise ValueError("Commit mask must match the frame axes")
+                committed = commit_mask.bool() & frame_mask.bool()
+                prefix = torch.arange(frame_mask.shape[1], device=frame_mask.device)[None] < committed.sum(1)[:, None]
+                if not torch.equal(committed, prefix): raise ValueError("Committed frames must form a prefix")
+            membership = self._provided_membership(anchor_override, bio_logits.shape[1])
+            omega = membership_bias(membership, frame_mask, commit_mask, eps)
+            return omega_cross_bias(omega, int(memory_len), bio_logits.dtype), {"skip": torch.zeros(len(bio_logits), dtype=torch.bool)}
         return self._condition( # Inference uses predicted state or an explicitly supplied proposal; no supervision is accepted.
             bio_logits, frame_mask, memory_len, commit_mask=commit_mask, eps=eps, min_span_frames=min_span_frames,
             seam_is_terminator=seam_is_terminator, stream_start=stream_start, anchor_override=anchor_override,
             timestamps_s=timestamps_s, decoder=decoder,
         )
+
+    @staticmethod
+    def _provided_membership(anchors, length):
+        positions = torch.arange(length, device=anchors.device)[None]
+        start, end = anchors[:, :1], anchors[:, 1:2]
+        return ((positions >= start) & ((end < 0) | (positions < end))).float()
 
     def for_supervision( # Train/dev loss only: GT selects closed/open state and diagnostics, never mask boundaries.
         self, bio_logits, bio_labels, frame_mask, memory_len, *, commit_mask=None, eps=1e-4, 
@@ -289,10 +305,8 @@ class MembershipGate(torch.nn.Module): # First-eligible-span probabilities and d
         membership = torch.where(open_rows, posterior.open, posterior.closed)
 
         if anchor_override is not None: # Given-span evaluation conditions on supplied boundaries: a point-mass interval posterior.
-            positions = torch.arange(bio_logits.shape[1], device=bio_logits.device)[None]
-            start, end = anchor_override[:, :1], anchor_override[:, 1:2]
-            fixed = (positions >= start) & ((end < 0) | (positions < end))
-            membership = torch.where(start >= 0, fixed.to(membership.dtype), membership)
+            fixed = self._provided_membership(anchor_override, bio_logits.shape[1])
+            membership = torch.where(anchor_override[:, :1] >= 0, fixed, membership)
 
         omega = membership_bias(membership, frame_mask, commit_mask, eps)
         bias = omega_cross_bias(omega, memory_len=int(memory_len), dtype=bio_logits.dtype)

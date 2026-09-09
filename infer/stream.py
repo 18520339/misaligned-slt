@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 from data.windowing import BIO
@@ -44,6 +45,22 @@ class StreamingEvent:
     terminator_commit: bool = False
 
 
+class MoryossefRunnerAdapter(torch.nn.Module): # Run external segmenter on 1 normalized active buffer, with buffer-local velocity.
+    def __init__(self, segmenter, velocity: bool = True):
+        super().__init__()
+        self.segmenter, self.velocity = segmenter, bool(velocity)
+        self.front_end = SimpleNamespace(extract_bio_tap=lambda poses, mask, timestamps_s: (poses, mask, timestamps_s), prompt_length=lambda: 0)
+
+    def bio_head(self, poses, frame_mask, timestamps_s):
+        if poses.shape[0] != 1 or not bool(frame_mask.all()):
+            raise ValueError("Online Moryossef requires one unpadded active buffer")
+        if self.velocity:
+            from moryossef26.dataset import append_velocity
+            features = append_velocity(poses[0].detach().cpu().numpy(), timestamps_s[0].detach().cpu().numpy())
+            poses = torch.as_tensor(features, device=poses.device).unsqueeze(0)
+        return SimpleNamespace(logits=self.segmenter(poses, frame_mask=frame_mask, timestamps_s=timestamps_s)["phrase"])
+
+    
 class S1RunnerAdapter(torch.nn.Module):
     # Present a BioS1Model to StreamingSLTRunner: the FSM needs only the pose tap and the BIO head (gate off, no decoder).
     def __init__(self, s1):

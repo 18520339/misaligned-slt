@@ -348,7 +348,7 @@ def densevid_text_metrics(
     pairs_by_video: dict[str, list[tuple[str, str | None]]], *, char_level: bool | None = None,
     bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "densevid",
 ) -> dict[str, float]:
-    """The ORIGINAL densevid_eval protocol (ranjaykrishna/densevid_eval evaluate.py), mapped onto our metric set.
+    """DVC-style matching and aggregation (ranjaykrishna/densevid_eval), with the repository's text scorers.
 
     Faithful components, per tIoU threshold (the caller builds `pairs_by_video` for one threshold):
       * MANY-TO-MANY pairing — every (prediction, gt) pair with tIoU >= threshold is ONE single-reference evaluation instance 
@@ -359,10 +359,10 @@ def densevid_text_metrics(
       * the caller averages thresholds for the headline (our threshold_average does this for every text key).
 
     Deviations, both deliberate and documented: the garbage rng is SEEDED, and tokenization is our shared Uni-Sign preprocessing + 
-    sacrebleu 13a instead of the PTB tokenizer, so the column is internally comparable with every other table in this codebase. 
-    BLEU-4 is corpus BLEU over the video's pairs (their COCO Bleu semantics); CIDEr-D is the official COCO scorer over the video's 
-    pairs (pycocoevalcap, IDF from that video's references — their Cider semantics); ROUGE-L/METEOR are per-pair means (COCO 
-    semantics); BLEURT is not in the original toolkit and follows the same per-pair mean, zeros without a checkpoint.
+    sacrebleu 13a instead of COCO BLEU with PTB tokenization. Shared text preprocessing does not make DVC and RQ1 corpus scores 
+    comparable: matching and aggregation differ. BLEU-4 is corpus BLEU over each video's pairs; CIDEr-D is the official COCO scorer 
+    over the video's pairs (pycocoevalcap, IDF from that video's references — their Cider semantics); ROUGE-L/METEOR are per-pair 
+    means (COCO semantics); BLEURT is not in the original toolkit and follows the same per-pair mean, zeros without a checkpoint.
 
     KNOWN PROPERTY, not a bug: the protocol is RECALL-BLIND — a missed gold caption never enters any pair, so it is uncharged. 
     It is the headline (continuity with the previous paper); the SODA fusion is reported beside it because it charges misses.
@@ -406,7 +406,7 @@ def compute_text_metrics(
     The relationship is  soda_X ~= (mean per-pair X) * segmentation.f1, so a fused cell divided by the f1 reported beside 
     it recovers the per-pair quality — no extra metric needed.
 
-    localization_aware=False (default — RQ1 and GT-span controls): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT over the whole set. 
+    localization_aware=False (default — RQ1 and generated dev captions): CORPUS BLEU-4/ROUGE-L/METEOR/BLEURT over the whole set.
     Paper-comparable (Uni-Sign reports corpus BLEU). ROUGE-L/METEOR/BLEURT are per-sentence means; BLEU-4 pools across the 
     set, so it is computed corpus-level.
 

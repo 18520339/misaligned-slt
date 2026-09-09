@@ -5,17 +5,22 @@ stride_s: 1.0
 # train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
 buffer_cap_s:
     ase: 29.08
-    asf: 31.01
+    asf: 31.43
     bfi: 35.72
 # Shared hard/soft duration scores. tune-decode writes each complete per-language model.
 # Untuned languages stay absent; joint training refuses to borrow another language's settings.
 duration_model:
     moryossef:
+        bfi: {"mu_log_s": 1.5802147573680898, "sd_log_s": 0.8158729306212167, "tail_start_s": 33.84935999999997, "completion_bias": 1.0, "boundary_logit_weight": 1.5}
+        asf: {"mu_log_s": 1.7800481900540717, "sd_log_s": 0.7644972669361924, "tail_start_s": 29.679959999999955, "completion_bias": 2.0, "boundary_logit_weight": 1.5}
     s1:
+        bfi: {"mu_log_s": 1.5802147573680898, "sd_log_s": 0.8158729306212167, "tail_start_s": 33.84935999999997, "completion_bias": 3.0, "boundary_logit_weight": 1.0}
         asf: {"mu_log_s": 1.7800481900540717, "sd_log_s": 0.7644972669361924, "tail_start_s": 29.679959999999955, "completion_bias": 5.0, "boundary_logit_weight": 2.0}
 boundary_stability:
     # delta-enc records which duration model was measured; stage 2 refuses a stale tolerance.
     duration_model_signature:
+        bfi: "1abd7dde201bb3a3"
+        asf: "4903adf7a2db07d8"
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
     #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
@@ -27,14 +32,14 @@ boundary_stability:
     #   3. target-identity tolerance: the hysteresis history resets when the selected span's start moves > δ.
     delta_enc_frames:
         ase: 11
-        asf: 8
-        bfi: 21
+        asf: 18
+        bfi: 53
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
     # Fixed lag for B terminators. O terminators need no extra lag. Selected on dev by the lag-only tune-stream stage.
     commit_lag_s:
         ase: 0.0
         asf: 4.0
-        bfi: 0.0
+        bfi: 4.0
 
 span_selection:
     # Λ_min: shortest selectable span, in encoder frames — a pure DURATION NOISE FLOOR (spans shorter than the
@@ -45,8 +50,8 @@ span_selection:
     # deliberately NOT enforced anywhere — on short-sentence corpora 2δ already exceeds real sentence lengths.
     min_span_frames:
         ase: 12
-        asf: 9
-        bfi: 22
+        asf: 19
+        bfi: 54
 # Continuation of a sentence cut by a FORCED (cap) commit: "skip" (default) never translates the left-truncated
 # tail — Mode-2b training gives the decoder no translation supervision on headless fragments, so its decode is
 # undefined behaviour; the sentence's visible head was already emitted flagged PARTIAL.

@@ -404,6 +404,9 @@ class UniSignMBartFrontEnd(UniSignFrontEndBase):
 
 
 class UniSignMT5FrontEnd(UniSignFrontEndBase):
+    # Bound each inference score tile; all keys remain visible. This is a workspace limit, not a context limit.
+    _ATTENTION_TILE_ELEMENTS = 64 * 1024 * 1024
+
     def __init__(
         self, mt5_name: str = "google/mt5-base", prompt_lang: str = "Chinese", tokenizer=None,
         pose_hidden_dim: int = 256, init_mt5_weights: bool = False,
@@ -436,7 +439,52 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         return self.mt5.encoder.embed_tokens(input_ids)
 
     def _run_lm_encoder(self, inputs_embeds, attention_mask):
-        return self.mt5.encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
+        encoder = self.mt5.encoder
+        batch, length, _ = inputs_embeds.shape
+        heads = max(block.layer[0].SelfAttention.n_heads for block in encoder.block)
+        query_rows = max(1, self._ATTENTION_TILE_ELEMENTS // max(1, batch * heads * length))
+        if encoder.training or torch.is_grad_enabled() or query_rows >= length or encoder.model_parallel:
+            return encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
+
+        print(f"[mt5 encoder] full-context attention in query blocks: batch={batch}, tokens={length}, query_rows={query_rows}; "
+              f"dense score tensor={batch * heads * length**2 * 4 / 2**30:.2f} GiB in fp32", flush=True)
+        hidden = encoder.dropout(inputs_embeds)
+        key_mask = (1.0 - attention_mask[:, None, None, :].to(hidden.dtype)) * torch.finfo(hidden.dtype).min
+        relative_bias = encoder.block[0].layer[0].SelfAttention
+
+        def clamp_fp16(x):
+            if x.dtype != torch.float16: return x
+            bound = torch.where(torch.isinf(x).any(), torch.finfo(x.dtype).max - 1000, torch.finfo(x.dtype).max)
+            return torch.clamp(x, min=-bound, max=bound)
+
+        for block in encoder.block:
+            self_layer = block.layer[0]
+            attention = self_layer.SelfAttention
+            normed = self_layer.layer_norm(hidden)
+            q, k, v = (
+                proj(normed).view(batch, length, attention.n_heads, attention.key_value_proj_dim).transpose(1, 2) 
+                for proj in (attention.q, attention.k, attention.v)
+            )
+            attended = torch.empty_like(q)
+            for start in range(0, length, query_rows):
+                stop = min(start + query_rows, length)
+                # mT5 uses unscaled QK scores and the first layer's relative bias in every encoder layer.
+                scores = torch.matmul(q[:, :, start:stop], k.transpose(3, 2))
+                bias = relative_bias.compute_bias(
+                    length, length, device=hidden.device, cache_position=torch.arange(start, stop, device=hidden.device)
+                ) + key_mask
+                if attention.pruned_heads: bias = bias[:, [h for h in range(bias.shape[1]) if h not in attention.pruned_heads]]
+                scores += bias
+                weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+                attended[:, :, start:stop] = torch.matmul(weights, v)
+                del scores, bias, weights
+
+            merged = attended.transpose(1, 2).contiguous().view(batch, length, attention.inner_dim)
+            hidden = clamp_fp16(hidden + self_layer.dropout(attention.o(merged)))
+            hidden = clamp_fp16(block.layer[-1](hidden))
+            del q, k, v, attended, merged, normed
+        return BaseModelOutput(last_hidden_state=encoder.dropout(encoder.final_layer_norm(hidden)))
+
 
     def make_dlm_decoder(self, block_size: int) -> OPUTBlockDiffusionDecoder:
         return MT5BlockDiffusionDecoder(
