@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-import re, csv, json
+import re, csv
 import numpy as np
 from .preprocessing import normalize_keypoints_unisign
 

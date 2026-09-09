@@ -2,31 +2,42 @@ import numpy as np
 from . import *
 
 
-def _unisign_crop_scale_body(body, thr):
-    """Uni-Sign crop_scale on the BODY part: bbox-normalise (x,y) to [-1,1] and return the body scale that
-    every other part is divided by. body: (T, 9, 3) (x,y,conf). Returns (result (T,9,3), scale float)."""
-    result = body.copy()
+def _body_box(body: np.ndarray, thr: float):
     valid = body[body[..., 2] > thr][:, :2]
-    if valid.shape[0] < 4: return np.zeros_like(body), 0.0
-
+    if len(valid) < 4: return None
     xmin, xmax = float(valid[:, 0].min()), float(valid[:, 0].max())
     ymin, ymax = float(valid[:, 1].min()), float(valid[:, 1].max())
-    scale = max(xmax - xmin, ymax - ymin)  # ratio = 1 (Uni-Sign disables the train-time scale jitter here)
-    if scale == 0: return np.zeros_like(body), 0.0
-    
-    xs = (xmin + xmax - scale) / 2.0
-    ys = (ymin + ymax - scale) / 2.0
+    scale = max(xmax - xmin, ymax - ymin)
+    if scale == 0: return None
+    return ((xmin + xmax - scale) / 2, (ymin + ymax - scale) / 2, scale)
+
+
+def unisign_body_box(keypoints: np.ndarray, thr: float = 0.3) -> tuple[float, float, float] | None:
+    # Crop box for these raw frames. An offline training chunk can reuse its video's box.
+    kp = np.asarray(keypoints, dtype=np.float32)
+    if kp.ndim != 3 or kp.shape[1:] != (133, 3):
+        raise ValueError(f"Expected raw (T,133,3) poses, got {kp.shape}")
+    body = np.nan_to_num(kp[:, UNISIGN_BODY_IDX, :], nan=0.0, posinf=0.0, neginf=0.0)
+    return _body_box(body, thr)
+
+
+def _unisign_crop_scale_body(body, thr, box=None):
+    # Normalize body points with a supplied box, or the box of the supplied frames.
+    if box is None: box = _body_box(body, thr)
+    if box is None: return np.zeros_like(body), 0.0
+    xs, ys, scale = (float(v) for v in box)
+    if not np.isfinite([xs, ys, scale]).all() or scale <= 0:
+        raise ValueError("Body crop box must be finite with positive scale.")
+    result = body.copy()
     result[..., 0] = (body[..., 0] - xs) / scale
     result[..., 1] = (body[..., 1] - ys) / scale
     result[..., :2] = (result[..., :2] - 0.5) * 2.0
-    # Uni-Sign crop_scale clips the WHOLE array — including the confidence channel (RTMPose scores exceed
-    # 1.0 on easy joints; upstream the model only ever sees conf <= 1). Clipping xy-only leaves conf > 1.
     np.clip(result, -1.0, 1.0, out=result)
     result[result[..., 2] <= thr] = 0.0
-    return result, float(scale)
+    return result, scale
 
 
-def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.ndarray:
+def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3, box=None) -> np.ndarray:
     """Uni-Sign pose normalisation (ZechengLi19/Uni-Sign datasets.py load_part_kp + crop_scale).
 
     Body is bbox-normalised to [-1,1]; hands are re-centred on the wrist (joint 0) and the face on the nose
@@ -47,7 +58,7 @@ def normalize_keypoints_unisign(keypoints: np.ndarray, thr: float = 0.3) -> np.n
         raise ValueError(f'Invalid pose shape: {keypoints.shape}, expected (frames, 133, 3)')
     kp = np.asarray(keypoints, dtype=np.float32, order='C').copy()
     np.nan_to_num(kp, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    body_norm, scale = _unisign_crop_scale_body(kp[:, UNISIGN_BODY_IDX, :].copy(), thr)
+    body_norm, scale = _unisign_crop_scale_body(kp[:, UNISIGN_BODY_IDX, :].copy(), thr, box=box)
 
     def _recentered_part(idx_list, anchor):
         part = kp[:, idx_list, :].copy()                       # (T, V, 3)

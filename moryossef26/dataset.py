@@ -1,9 +1,8 @@
 """Whole-video-chunk dataset for the faithful Moryossef segmenter (segmenter-error analysis + RQ2 cascade floor).
 
 Random natural-timeline chunks — the Moryossef 2026 segmentation regime, not the SLT window sampler that trains
-the in-system BIO head. This model reads RAW pose keypoints (+ velocity) via a UNet CNN, so the raw-keypoint 
-augmentations Moryossef uses apply here: fps_aug (essential), frame_dropout, body_part_dropout, and appended 
-per-keypoint velocity. The in-system head reads FROZEN Uni-Sign features and drops these.
+the in-system BIO head. This adaptation reads Uni-Sign-normalized keypoints and velocity through a UNet CNN.
+Training chunks use the whole-video crop box, matching offline inference.
 """
 from __future__ import annotations
 import numpy as np
@@ -13,6 +12,7 @@ from torch.utils.data import Dataset
 from data.loader import VideoRecord
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window, apply_fps_aug
+from poses.preprocessing import unisign_body_box
 
 
 class SegmenterChunkDataset(Dataset):
@@ -45,6 +45,7 @@ class SegmenterChunkDataset(Dataset):
         self.body_part_dropout = max(0.0, float(body_part_dropout))
         self.seed = int(seed)
         self.rng = np.random.default_rng(seed)
+        self._boxes: dict[tuple[str, ...], tuple | None] = {}  # per video, never reset: the box is a property of pose file
 
     def __len__(self) -> int:
         return self.steps_per_epoch
@@ -53,6 +54,13 @@ class SegmenterChunkDataset(Dataset):
         if not self.training or self._records_for_epoch is None: return
         records = self._records_for_epoch(int(epoch))
         if records: self.records = records
+
+    def _video_box(self, rec) -> tuple[float, float, float] | None:
+        key = tuple(str(p) for p in rec.pose.paths)
+        if key not in self._boxes: # Cached per video: crop box of WHOLE pose, the coordinates inference normalizes in.
+            raw, _ = load_pose_window(rec.pose, 0.0, rec.pose.duration_s, normalize=False)
+            self._boxes[key] = unisign_body_box(raw) if raw.shape[1:] == (133, 3) else None
+        return self._boxes[key]
 
     def __getitem__(self, index: int) -> dict:
         # Training: fresh random chunks every epoch (persistent rng). Eval: rng derived from (seed, index) so the 
@@ -63,16 +71,17 @@ class SegmenterChunkDataset(Dataset):
 
         start_s = 0.0 if rec.pose.duration_s <= chunk_s else float(rng.uniform(0.0, rec.pose.duration_s - chunk_s))
         end_s = min(rec.pose.duration_s, start_s + chunk_s)
-        poses, abs_timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True)
+        # This offline adaptation uses 1 video box in both training and inference.
+        # The reference code uses different landmark normalization; this is a Uni-Sign input contract.
+        poses, abs_timestamps = load_pose_window(rec.pose, start_s, end_s, normalize=True, box=self._video_box(rec))
         if poses.shape[0] > self.num_frames:
             poses, abs_timestamps = poses[: self.num_frames], abs_timestamps[: self.num_frames]
 
         # All augmentations are train-only (Moryossef gates fps_aug/dropouts on split==TRAIN; eval runs native fps).
         if self.training and self.fps_aug_enabled and poses.shape[0] > 1:
             poses, abs_timestamps, _ = apply_fps_aug(
-                poses, source_fps=rec.pose.fps,
-                min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, rng=rng,
-                source_timestamps_s=abs_timestamps,
+                poses, source_fps=rec.pose.fps, min_fps=self.fps_aug_min, max_fps=self.fps_aug_max, 
+                rng=rng, source_timestamps_s=abs_timestamps,
             )
 
         if self.training and self.body_part_dropout > 0.0:
