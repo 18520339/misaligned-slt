@@ -6,17 +6,18 @@ torch>=2.1
 # Verified on 4.57.3. (models/unisign.py warns loudly at import if a non-4.x transformers is detected.)
 transformers>=4.40,<5
 numpy>=1.24
+scipy>=1.10           # stable log-CDFs for duration and residual-life factors
 pyyaml>=6.0
 einops>=0.7
 
 # Data (Colab)
 huggingface_hub>=0.23
-tqdm>=4.66             # HF-style global training progress bar
+tqdm>=4.66            # HF-style global training progress bar
 
 # Metrics (lazy-loaded; eval degrades gracefully if a backend is missing)
 evaluate>=0.4
 sacrebleu>=2.4
-rouge>=1.0             # pltrdy ROUGE-L — the package Uni-Sign reports with (metrics._rouge_l)
+rouge>=1.0            # pltrdy ROUGE-L — the package Uni-Sign reports with (metrics._rouge_l)
 rouge_score>=0.1      # fallback ROUGE if `rouge` is absent
 nltk>=3.8             # meteor
 pycocoevalcap>=1.2    # CIDEr-D, the official COCO scorer densevid_eval uses (metrics._cider_corpus)

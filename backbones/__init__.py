@@ -1,1 +1,1 @@
-from .unisign import UniSignPoseEncoder
+from .unisign import UniSignPoseEncoder as UniSignPoseEncoder

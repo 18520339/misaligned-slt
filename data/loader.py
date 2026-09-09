@@ -792,7 +792,8 @@ class StreamingWindowDataset(Dataset):
         if self.include_full_evidence and sample.full_evidence_spec is not None:
             rec = self.records_by_id[sample.full_evidence_spec.video_id]
             full = self.sampler.materialize(rec, sample.full_evidence_spec)
-            item["full_evidence"] = self.sampler.to_dict(full)
+            # CB must compare 2 views of the same complete anchor, after actual frame materialization.
+            item["full_evidence"] = self.sampler.to_dict(full) if full.translation_target == sample.anchor_span else None
         else: item["full_evidence"] = None
         return item
 

@@ -225,9 +225,7 @@ class TrainLogger: # Console + Weights & Biases logger for the training loops.
         if postfix: self._progress.set_postfix(postfix, refresh=False)
 
 
-    def epoch_summary(
-        self, epoch: int, train: dict, val: dict | None = None, is_best: bool = False, saved_path: str | None = None
-    ) -> None:
+    def epoch_summary(self, epoch: int, train: dict, val: dict | None = None, saved_path: str | None = None) -> None:
         if not self.enabled: return
         """Record one epoch and append one comma-separated line.
 
@@ -385,6 +383,11 @@ def run_epoch_loop(
         saved_meta = dict(state.get("meta") or {})
         if saved_meta and checkpoint_meta:
             drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))
+            if drift == ["validation_conditioning"]: raise SystemExit(
+                "--resume: generated-dev conditioning changed; the saved best score is not comparable. "
+                "The trained weights remain usable. Re-evaluate saved checkpoints with the corrected dev generation "
+                "and use a separate checkpoint directory for any continuation; do not reuse the old best-score history."
+            )
             if drift: raise SystemExit(
                 f"--resume: this run started under different training-critical config; {', '.join(drift)} changed "
                 + "; ".join(f"{k}: {saved_meta.get(k)!r} -> {checkpoint_meta.get(k)!r}" for k in drift[:4])
@@ -442,8 +445,8 @@ def run_epoch_loop(
             with amp.autocast():  # dev eval in the same precision as training steps; fp32 eval was ~2x slower
                 eval_metrics = evaluate_fn(epoch)
             metrics = dist.reduce_metrics(eval_metrics)
-            improved = control.update(model, metrics, epoch)
-            logger.epoch_summary(epoch, train=train_means, val=metrics, is_best=improved, saved_path=control.last_saved_path)
+            control.update(model, metrics, epoch)
+            logger.epoch_summary(epoch, train=train_means, val=metrics, saved_path=control.last_saved_path)
             logs.append({"epoch": float(epoch), **train_means, **metrics, **control.summary()})
             if control.stopped_early:
                 if dist.is_main(): print(f"{name} | early stop at epoch {epoch} (best {control.monitor}={control.best_value})", flush=True)
@@ -471,8 +474,7 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
     out = {f"{prefix}_{key}": sums[key] / counts[key] for key in sums if counts.get(key, 0) > 0}
     # Two silent-failure alarms the logged numbers already contained but nobody compared:
     #   B-class collapse — signing-vs-not P/R/F1 stay high while B never fires, so only its own rate shows it.
-    #   all-I control — a segmenter that cannot beat "call every frame signing and chop by the duration prior"
-    #   has learned nothing a reviewer will credit; both quantities were being computed already.
+    #   all-I control — compare localization with a constant signing prediction on the same window slice.
     b_rate = next((v for k, v in out.items() if k.endswith("_pred_b_rate")), None)
     gold_rate = next((v for k, v in out.items() if k.endswith("_gold_b_rate")), None)
     if b_rate is not None and gold_rate and b_rate < 0.1 * gold_rate: print(
@@ -480,18 +482,16 @@ def mean_logs(rows: list[dict[str, float]], prefix: str = "train") -> dict[str, 
         f"Check bio_class_weights (train/losses.py documents this failure).", flush=True
     )
     # Compare on the MODE-3 slice when present, not the aggregate: mode-1/2 windows are ~one (fragment of a)
-    # jittered sentence, so the all-I control is near-optimal there by construction and the aggregate control is a
-    # floor no head can beat (README: the aggregate is saturated and gameable; checkpoints select on mode3). Only
+    # jittered sentence, so the all-I control is near-optimal there by construction and the aggregate control
+    # is an easy baseline on that slice. Multi-sentence windows require additional splits;
     # multi-sentence windows measure what the head adds: splitting adjacent sentences.
     tiou = next((v for k, v in out.items() if k.endswith("mode3_tiou_f1") and "alli" not in k),
                 next((v for k, v in out.items() if k.endswith("phrase_tiou_f1")), None))
     alli = next((v for k, v in out.items() if k.endswith("mode3_alli_tiou_f1")),
                 next((v for k, v in out.items() if k.endswith("alli_tiou_f1")), None))
     if tiou is not None and alli is not None and tiou <= alli: print(
-        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} on multi-sentence "
-        f"windows — under THIS monitor's decode the head adds nothing over chopping by the duration prior. "
-        f"(Plain-argmax pooled monitoring understates a head whose value flows through the posterior; confirm "
-        f"with --segmenter-eval under the tuned decode before judging the checkpoint.)", flush=True
+        f"[{prefix}] WARNING: tIoU-F1 {tiou:.4f} does not beat the all-I control {alli:.4f} on multi-sentence windows. "
+        f"This is a diagnostic for this window slice; use whole-video and online evaluation for final claims.", flush=True
     )
     return out
 

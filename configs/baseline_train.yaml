@@ -11,9 +11,8 @@
 # native-rate and deployment never subsamples — introducing it would create a rate mismatch OUR system never sees), 
 # and single-GPU batch sizing below.
 #
-# BEFORE training: run README B1 (MEASURE: tune-decode-s1 -> delta-enc -> buffer-cap) — the sampler clamps this 
-# recipe's windows to inference.yaml buffer_cap_s, and a stale cap silently unsupervises the long-sentence tail of 
-# THIS arm only (see the cap note below).
+# BEFORE training: run README B1 (MEASURE: delta-enc -> buffer-cap -> tune-stream) — the sampler clamps this recipe's 
+# windows to inference.yaml buffer_cap_s, and a stale cap silently unsupervises long-sentence tail of THIS arm only.
 # After training: set data.yaml <lang>.pretrained_slt to checkpoints/baseline_train/<lang>/model.pt (README B2b). 
 # NOT train-bio: pooled S1 is language-agnostic and deliberately warm-starts from RELEASED checkpoint, so re-rooting 
 # it on 1 language's fine-tune would privilege that language inside language-agnostic pretraining (train/bio_pretrain.py). 

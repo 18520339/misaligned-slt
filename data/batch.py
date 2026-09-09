@@ -11,7 +11,6 @@ def frame_mask_for(n_frames: int, visual_padding: str = "none") -> torch.Tensor:
     if visual_padding == "none": return torch.ones(int(n_frames), dtype=torch.bool)
     raise ValueError(f"Unsupported visual_padding={visual_padding!r} (Uni-Sign uses 'none')")
 
-
 def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
     """Right-pad a (T, ...) pose tensor by `pad` frames, REPEATING THE LAST FRAME (Uni-Sign Base_Dataset.collate_fn), 
     not zeros: the pose branch's temporal GCN (kernel 5) has no mask, so zero pads leak into the last real frames' 
@@ -20,7 +19,6 @@ def repeat_last_frame(poses: torch.Tensor, pad: int) -> torch.Tensor:
     if pad <= 0: return poses
     if poses.shape[0]: return torch.cat([poses, poses[-1:].expand(pad, *poses.shape[1:])])
     return torch.nn.functional.pad(poses, (0,) * (2 * (poses.ndim - 1)) + (0, pad))
-
 
 def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str, torch.Tensor | list]:
     prepared = []
@@ -35,7 +33,7 @@ def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str
     pose_shape = prepared[0][1].shape[1:]
     poses, frame_masks, timestamps  = [], [], []
     bio_labels, specs, targets, anchor_spans = [], [], [], []
-    commit_masks = []
+    commit_masks, candidates = [], []
 
     for item, poses_i, ts_i, mask_i, labels_i in prepared:
         n = poses_i.shape[0]
@@ -51,13 +49,13 @@ def collate_windows(batch: list[dict], visual_padding: str = "none") -> dict[str
         specs.append(item["spec"])
         targets.append(item.get("translation_target"))
         anchor_spans.append(item.get("anchor_span"))
+        candidates.append(list(item.get("candidate_sentences") or []))
 
     return {
         "poses": torch.stack(poses).reshape(len(batch), max_len, *pose_shape),
         "frame_mask": torch.stack(frame_masks), "timestamps_s": torch.stack(timestamps),
-        "bio_labels": torch.stack(bio_labels), "specs": specs,
-        "commit_mask": torch.stack(commit_masks),
-        "translation_targets": targets, "anchor_spans": anchor_spans,
+        "bio_labels": torch.stack(bio_labels), "specs": specs, "commit_mask": torch.stack(commit_masks),
+        "translation_targets": targets, "anchor_spans": anchor_spans, "candidate_sentences": candidates,
     }
 
 
@@ -89,15 +87,13 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
             texts, padding="max_length" if self.pad_to_max_length else True,
             truncation=True, max_length=self.max_text_tokens, return_tensors="pt",
         )
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]
+        input_ids, attention_mask = encoded["input_ids"], encoded["attention_mask"]
         if not self.pad_to_max_length:
             need = input_ids.shape[1] + 1 + self.eos_supervision_tokens
             width = min(self.max_text_tokens, math.ceil(need / self.block_size) * self.block_size)
             if width > input_ids.shape[1]:
-                pad_id = int(self.tokenizer.pad_token_id)
                 grow = width - input_ids.shape[1]
-                input_ids = F.pad(input_ids, (0, grow), value=pad_id)
+                input_ids = F.pad(input_ids, (0, grow), value=int(self.tokenizer.pad_token_id))
                 attention_mask = F.pad(attention_mask, (0, grow), value=0)
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
@@ -108,8 +104,7 @@ class WindowCollator:# Collate windows and optionally tokenize complete-anchor r
         out["mode_names"] = [spec["mode"] if isinstance(spec, dict) else spec.mode for spec in out["specs"]]
         out["mode2_subcases"] = [(spec.get("subcase") if isinstance(spec, dict) else spec.subcase) for spec in out["specs"]]
         out["translation_supervised"] = torch.tensor(
-            [target is not None for target in out["translation_targets"]],
-            dtype=torch.bool,
+            [target is not None for target in out["translation_targets"]], dtype=torch.bool
         )
         if self.tokenizer is not None:
             target_texts = [

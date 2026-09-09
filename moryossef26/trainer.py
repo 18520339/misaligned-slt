@@ -123,7 +123,7 @@ def train_segmenter_epochs(model, train_loader, dev_loader, device, epochs, cfg,
     if class_weights is not None: class_weights = class_weights.to(device)
     optimizer = build_optimizer(cfg, model.parameters())  # end-to-end: UNet + RoPE + head all train
 
-    def step_fn(batch, epoch):
+    def step_fn(batch, _epoch):
         logits = model(batch["poses"], timestamps_s=batch["timestamps_s"])["phrase"]
         loss = bio_nll_dice_loss(logits, batch["phrase_bio"], dice_weight=dice_weight, class_weights=class_weights)
         return loss, {"bio_loss": float(loss.detach())}

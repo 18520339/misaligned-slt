@@ -1,16 +1,11 @@
 """Metrics — frame-domain (BIO-head training monitor) and time-domain (final eval).
 
-`segmentation_prf` (greedy one-to-one tIoU-matched P/R/F1) is THE segment metric for both; tIoU is scale-invariant,
-so frame units and seconds score identically. Numbers differ only because inputs do: the stage-2 monitor
-(train/slt.py) = raw (ungated) BIO argmax on sampler dev WINDOWS, macro per window (`val_phrase_tiou_f1`); the S1
-monitor (train/bio_pretrain.py) scores the DEPLOYED duration-decoded tags whenever inference.yaml `duration_decode`
-is on for the language, so the two `val_phrase_tiou_f1` series are NOT comparable; RQ2 `--stream` = commit-GATED FSM
-events on whole VIDEOS vs GT caption spans, per-video macro (F1 built from macro-averaged P/R — still not the same
-number as segmenter-eval's mean of per-video F1s; see README "segmenter-eval and RQ2").
+`segmentation_prf` provides one-to-one tIoU-matched precision, recall and F1.
+S1 and stage-2 monitors score legal BIO paths on sampler windows. Streaming RQ2 scores committed events
+on full videos. Whole-video segmenter evaluation also reports its spans through the RQ2 scoring boundary.
+Frame diagnostics and span diagnostics answer different questions; training monitors are not final results.
 
-FRAME-DOMAIN (BIO logits/labels) — bio_frame_metrics, moryossef_segment_metrics; used by train/slt.py, 
-train/bio_pretrain.py, moryossef26/, eval.py (FSM-internal BIO diagnostic), analyze.py (tune-decode). ONE decode 
-rule for BOTH prediction and gold (default `signing_runs_with_b_splits`; why there); decoders parameterize `_bio_runs`.
+FRAME-DOMAIN: bio_frame_metrics and moryossef_segment_metrics, with a shared span parser for predictions and gold.
 
 TIME-DOMAIN (Segment(start_s, end_s) seconds) — Segment/temporal_iou/match_segments/segmentation_prf; used by eval.py 
 (RQ2 tIoU brackets), analyze.py (segmenter-error analysis pred-vs-GT matching).
@@ -160,8 +155,8 @@ def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_thresho
 
 
 def moryossef_segment_metrics(
-    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase",
-    decode: str = "runs_bsplit", tiou_threshold: float = 0.5,
+    logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", decode: str = "runs_bsplit", 
+    tiou_threshold: float = 0.5, pred_tags: torch.Tensor | None = None
 ) -> dict[str, float]:
     """Per-item BIO-head training monitor: one per-FRAME score, one segment score.
 
@@ -170,6 +165,9 @@ def moryossef_segment_metrics(
     Collapse-proof for early stopping — an all-`I`/all-`O` collapse can't game one-to-one matching (the looser
     overlap `seg_f1` / frame-IoU `seg_iou` flavors could; removed).
     `decode` applies to BOTH sides (`runs_bsplit` = inference, default; `bio` = B-required; `likeliest` = raw run).
+
+    `pred_tags` (B, T) optionally supplies the decoded path instead of logits' argmax.
+    Binary signing-frame overlap belongs to bio_frame_metrics; it does not test sentence boundaries.
     """
     # B-required gold fits Moryossef's full annotations (every onset visible) but breaks on OUR misaligned windows:
     # make_bio_labels tags a left-truncated span as a HEADLESS I-run, so gold emits NO segment where a PERFECT
@@ -189,14 +187,14 @@ def moryossef_segment_metrics(
         # Trim TRAILING padding (collators pad with UNK on the right); keep interior UNK (untrusted gaps).
         last = int(torch.nonzero(valid).max().item()) + 1
         gold_v = gold[:last]
-        pred_tags = logits[i, :last].argmax(dim=-1)
+        tags_i = (pred_tags[i] if pred_tags is not None else logits[i].argmax(dim=-1))[:last]
         interior_unk = gold_v == BIO["UNK"]
         if bool(interior_unk.any()):
             # No reliable label in untrusted gaps: mask BOTH sides so `close_on_unk` splits runs identically.
-            pred_tags = torch.where(interior_unk, torch.full_like(pred_tags, BIO["UNK"]), pred_tags)
-        frame_f1s.append(_macro_frame_f1(pred_tags[~interior_unk], gold_v[~interior_unk]))
+            tags_i = torch.where(interior_unk, torch.full_like(tags_i, BIO["UNK"]), tags_i)
+        frame_f1s.append(_macro_frame_f1(tags_i[~interior_unk], gold_v[~interior_unk]))
 
-        pred_segs = _frame_segments_to_seconds(decode_fn(pred_tags))
+        pred_segs = _frame_segments_to_seconds(decode_fn(tags_i))
         gold_segs = _frame_segments_to_seconds(decode_fn(gold_v))
         prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=tiou_threshold)
         tiou_f1s.append(prf["f1"]); precisions.append(prf["precision"]); recalls.append(prf["recall"])
