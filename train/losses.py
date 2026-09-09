@@ -136,38 +136,6 @@ def bio_nll_dice_loss(
     return ce_weight * ce + dice_weight * dice
 
 
-def anchor_alpha(gt_ratio: float, temperature: float, class_weights=None) -> float:
-    """Convert the configured coefficient ratio to alpha using the B weight and temperature.
-
-    This is a scale heuristic. CE weighting, Dice, probability values and loss reductions
-    determine the actual gradient ratio; this formula does not fix it across datasets.
-    """
-    r, T = max(float(gt_ratio), 0.0), max(float(temperature), 1e-6)
-    if r == 0.0: return 0.0
-    w_b = 1.0
-    if class_weights is not None:
-        w = class_weights.tolist() if hasattr(class_weights, "tolist") else list(class_weights)
-        if len(w) > BIO["B"]: w_b = max(float(w[BIO["B"]]), 1e-6)
-    return float(r * T / (r * T + w_b))
-
-
-def bio_anchor_loss(
-    student_logits: torch.Tensor, reference_logits: torch.Tensor, frame_mask: torch.Tensor, temperature: float = 1.0
-) -> torch.Tensor:
-    """Mean T-squared KL(reference || head) over real frames.
-
-    The reference receives no gradients. This penalty discourages output changes but does not
-    bound parameter drift or guarantee calibration. The separate GT term permits corrections.
-    """
-    valid = frame_mask.to(student_logits.device).bool()
-    if not valid.any(): return student_logits.sum() * 0.0
-    T = max(float(temperature), 1e-6)
-    log_s = F.log_softmax(student_logits.float() / T, dim=-1)
-    p_t = F.softmax(reference_logits.float().detach() / T, dim=-1)
-    kl = (p_t * (torch.log(p_t.clamp_min(1e-12)) - log_s)).sum(dim=-1)
-    return (T * T) * (kl * valid.float()).sum() / valid.float().sum()   # T^2 keeps the gradient scale of the T=1 loss (Hinton et al.)
-
-
 def confidence_bound_gate(
     full_tokens: torch.Tensor, trunc_tokens: torch.Tensor, trunc_confidence: torch.Tensor,
     reference_tokens: torch.Tensor | None = None, valid_mask: torch.Tensor | None = None,

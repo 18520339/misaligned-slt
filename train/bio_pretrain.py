@@ -24,31 +24,18 @@ from data.loader import StreamingWindowDataset, assert_pool_safe, resolve_pretra
 from backbones import UniSignPoseEncoder
 from models.bio_head import RoPEBIOHead
 from models.unisign import released_layout_state
+from infer.duration_decode import DurationDecoder
+from models.checkpointing import _load_state
 
 from train import distributed as dist
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
-from infer.duration_decode import deployed_decode_tags, fit_duration_prior, streaming_decode_params
 from metrics import bio_frame_metrics, moryossef_segment_metrics
-from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference, resolve_pretrained
+from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference
 
 PRETRAIN_CONTEXT_MARGIN_S = 1.0  # a deployed cap adds delta/fps to p99 + stride; one second covers any delta up to fps frames
 
-class BioS1Model(nn.Module):
-    """Uni-Sign pose encoder + trainable RoPE BIO head.
-
-    `bio_head` matches `MisalignedSLTModel.bio_head`, so this checkpoint's keys load directly as the SLT-model init.
-
-    `freeze_encoder=False` (`freeze_backbone: false` — the SHIPPED recipe): the encoder trains too, adapting translation-optimized 
-    features to segmentation. This is what makes multilingual pretraining a REPRESENTATION and not just a ~6.7M-parameter head, 
-    and stage 2 loads this encoder alongside the head, so "S1 features == S2 initial features" still holds. It does NOT recover 
-    back-to-back sentence boundaries on YouTube corpora — that signal is absent from the captions themselves. It also means the 
-    gated arms and the clean floor no longer share a pose encoder — deliberately: the arms load this one so their BIO head meets 
-    the features it trained on, while the floor stays the faithful Uni-Sign transfer it is supposed to anchor.
-
-    `freeze_encoder=True` (the ablation): encoder frozen AND pinned to eval (`train()` override) so ST-GCN BatchNorm running stats 
-    stay the released checkpoint's — no input-distribution jump, and 2 arms then share an encoder by construction.
-    """
+class BioS1Model(nn.Module): # Pose backbone and temporal BIO classifier shared with the joint model's segmentation branch.
     def __init__(
         self, pose_hidden_dim: int = 256, feat_dim: int = 768, bio_hidden_dim: int = 384, bio_depth: int = 4, 
         bio_nhead: int = 8, bio_dropout: float = 0.1, bio_conv_stem_layers: int = 2, freeze_encoder: bool = True,
@@ -68,10 +55,12 @@ class BioS1Model(nn.Module):
         if self.freeze_encoder: self.pose_encoder.eval()  # BN running stats pinned to the released checkpoint
         return self
 
-    def load_unisign_pose(self, ckpt_path: str | Path) -> int:
-        blob = torch.load(str(ckpt_path), map_location="cpu")
-        sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
-        sd = released_layout_state(sd)  # accepts released blobs AND trainer model.pt (baseline_train re-rooting)
+    def load_pretrained(self, ckpt_path: str | Path) -> int:
+        sd = _load_state(ckpt_path)
+        if any(k.startswith("bio_head.") for k in sd):
+            self.load_state_dict(sd, strict=True)
+            return len(sd)
+        sd = released_layout_state(sd)
         pose_sd = {k: v for k, v in sd.items() if not k.startswith("mt5_model.")}
         self.pose_encoder.load_state_dict(pose_sd, strict=True)
         return len(pose_sd)
@@ -84,9 +73,9 @@ class BioS1Model(nn.Module):
 
 
 def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, language: str | None = None) -> dict[str, float] | None:
-    """`pretrain_geometry.buffer_cap_s: auto` -> max over the S1 languages (the pool, or `language` alone) of train p99 +
-    stride_s + margin: the label-only rule the deployed caps follow, so every deployed cap fits the head's trained context by
-    construction. Returns the per-language terms, or None when the cap is numeric (an explicit design override)."""
+    """`pretrain_geometry.buffer_cap_s: auto` -> max over S1 languages (the pool, or `language` alone) of train p99 + stride_s + 
+    margin: the label-only rule the deployed caps follow, covering deployed caps when delta/fps does not exceed the margin. 
+    Return the per-language terms, or None when the cap is numeric (an explicit design override)."""
     geometry = dict(cfg.get("pretrain_geometry") or {})
     langs = cfg.get("pretrain_languages") or ([language] if language else None)
     if not langs or str(geometry.get("buffer_cap_s", "")).lower() != "auto": return None
@@ -99,12 +88,7 @@ def resolve_pretrain_context(cfg: dict, data_cfg: dict, inference_cfg: dict, lan
 
 
 def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Model:
-    """Construct BioS1Model and load the Uni-Sign pose encoder.
-
-    SINGLE source of truth for the head shape: training (build_bio_s1) and inference (analyze.segmenter_infer) both route here, 
-    so the S1 checkpoint always strict-loads and `bio_head_init` shape parity holds by construction. `pretrained_path` overrides 
-    which released checkpoint the frozen encoder loads (per-language warm-start, resolved by the caller).
-    """
+    # Construct S1; optionally initialize from released pose weights or a complete S1 checkpoint.
     # Inherited dlm.yaml `freeze_backbone`. The SHIPPED S1 recipe is false — the encoder trains, so `bio_head_init`
     # can carry an ADAPTED encoder into stage 2. The `True` default here is for a config that omits the key entirely
     # (the frozen-encoder ablation), not for bio_pretrain.yaml, which sets it explicitly.
@@ -115,11 +99,9 @@ def build_bio_s1_model(cfg: dict, pretrained_path: str | None = None) -> BioS1Mo
         bio_nhead=int(cfg.get("bio_nhead", 8)), bio_dropout=float(cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(cfg.get("bio_conv_stem_layers", 2)), freeze_encoder=freeze_encoder,
     )
-    pose_ckpt = pretrained_path or pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth")
-    n = model.load_unisign_pose(pose_ckpt)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-    print(f"bio_s1 | pose encoder from {pose_ckpt} ({n} tensors); encoder {'FROZEN' if freeze_encoder else 'TRAINABLE'}; "
-          f"trainable params: {trainable:.2f}M", flush=True)
+    if pretrained_path:
+        n = model.load_pretrained(pretrained_path)
+        print(f"bio_s1 | initialized from {pretrained_path} ({n} tensors)", flush=True)
     return model
 
 
@@ -135,9 +117,6 @@ def build_bio_s1(
     language = str(language or cfg.get("language") or data_cfg.get("active_languages", ["asf"])[0])
     if language != cfg.get("language"): cfg = load_yaml(config, language=language)
     inference_cfg = resolve_inference(load_yaml(inference_config), language, strict=False)
-    # train_bio_s1_epochs re-reads these for the monitor's duration prior; record the CLI paths so a run with
-    # non-default configs monitors under the same decode/data as the sampler it just built.
-    cfg["inference_config"], cfg["data_config"] = str(inference_config), str(data_config)
 
     # Segmentation is language-agnostic (boundaries are prosodic), so S1 may pretrain on a pool of languages;
     # translation stays monolingual in stage 2. `pretrain_languages: null` = the target language alone.
@@ -194,30 +173,16 @@ def build_bio_s1(
     dev_loader = streaming_loader(
         dev_dataset, dist.per_rank_batch_size(int(cfg.get("batch_size", 8))), collator, num_workers=num_workers
     )
-    if cfg.get("pretrain_mix"): # Multilingual pool: warm-start from Uni-Sign released checkpoint, not a per-language fine-tune.
-        # resolve_pretrained is per-language, and after the re-root, it points at baseline_train/<lang> — an encoder already 
-        # adapted to ONE target language, which would (a) privilege that language inside a language-agnostic pretraining and (b) 
-        # make the pool checkpoint depend on which --language launched it while writing to the same multi_* directory. S1 features 
-        # == S2 initial features is preserved by bio_head_init carrying THIS encoder into stage 2, not by matching warm-starts.
-        pretrained = pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth")
-    else: # Monolingual: the language's configured Uni-Sign checkpoint, matching the SLT model's warm-start.
-        pretrained = resolve_pretrained(cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth")
+    # Every S1 recipe has an explicit initialization, independent of the clean translator's per-language re-root.
+    pretrained = pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth")
     model = build_bio_s1_model(cfg, pretrained_path=pretrained)
     return model, train_loader, dev_loader, cfg
 
 
 @torch.no_grad()
-def evaluate_bio_s1(
+def evaluate_bio_s1( # Evaluate frame losses and the untuned legal-path monitor before duration calibration.
     model: BioS1Model, loader: DataLoader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None, 
-    duration_prior=None, delta: int = 3,
 ) -> dict[str, float]:
-    """`duration_prior` (inference.yaml duration_decode): score the DEPLOYED decoder, not raw argmax.
-
-    Without it the monitor measures argmax's split rate — the very quantity the semi-Markov decode REPLACES with the duration 
-    prior at deployment (infer/duration_decode.py). A checkpoint that argmax-splits more then ranks higher while contributing 
-    nothing downstream, which is how a rising monitor coexists with falling whole-video test numbers. Same rule already 
-    applied to `analyze --stage delta-enc`: measure under the decode you deploy.
-    """
     rows = []
     with eval_mode(model):
         for batch in loader:
@@ -226,16 +191,10 @@ def evaluate_bio_s1(
             ts = batch["timestamps_s"].to(device)
             labels = batch["bio_labels"].to(device)
             out = model(poses, mask, timestamps_s=ts)
-            # Loss + FRAME metrics read raw logits (they score the objective and per-frame quality); SEGMENT metrics read `seg_logits`, 
-            # deployed decode's tags, so the monitor ranks what deployment produces. Segment metrics score DEPLOYED tags (same function 
-            # the FSM and gate use); loss + frame metrics keep raw logits. One-hot so every metric call is unchanged — they all argmax.
-            seg_logits = out.logits
-            if duration_prior is not None:
-                tags = deployed_decode_tags(
-                    out.logits, mask.long().sum(dim=1), duration_prior, ts, batch.get("commit_mask"), delta=int(delta)
-                )
-                seg_logits = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=out.logits.shape[-1]).to(out.logits.dtype)
-
+            # S1 checkpoint selection uses an untuned legal-path monitor; deployment is calibrated afterwards.
+            # Raw frame diagnostics remain independent of the selected duration decoder.
+            tags = DurationDecoder().decode(out.logits, mask.long().sum(1))
+            seg_logits = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=out.logits.shape[-1]).to(out.logits.dtype)
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
             row.update(moryossef_segment_metrics(seg_logits, labels, prefix="phrase"))
@@ -274,44 +233,19 @@ def train_bio_s1_epochs(
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
     # Frozen encoder → head only. Unfrozen → head at learning_rate, the pretrained encoder at backbone_lr.
-    # Pooled pretraining monitors plain argmax. A monolingual ablation can monitor an already-pinned target decode.
-    duration_prior = None
-    # The monolingual monitor decodes exactly as the FSM deploys: the streaming triple, the deployed delta and terminator rule
-    # (strict=False: a fresh language has no rows yet). A pooled run monitors plain argmax, so the rule is inert there.
-    _dd_cfg = resolve_inference(
-        load_yaml(str(cfg.get("inference_config", "configs/inference.yaml"))), str(cfg.get("language") or ""), strict=False
-    )
-    _delta = int((_dd_cfg.get("boundary_stability", {}) or {}).get("delta_enc_frames", 3))
-    # Semi-Markov decoding is language-agnostic, but it can recover segments from an all-I/weak-B head using the
-    # duration prior alone. That makes it a poor checkpoint selector for transferable SEGMENTATION pretraining.
-    # Pooled training therefore ranks the learned BIO head with plain argmax. Target-specific decode calibration
-    # happens after pretraining. A monolingual ablation can monitor an already-pinned target decode.
-    _corpus = None if cfg.get("pretrain_mix") else cfg.get("language")
-    _dd = streaming_decode_params(_dd_cfg, _corpus)[0] if _corpus else None
-    if _dd is not None:
-        _recs, _ = resolve_pretrain_records(
-            cfg, load_yaml(str(cfg.get("data_config", "configs/data.yaml"))), str(cfg.get("language")), "train",
-        )
-        duration_prior = fit_duration_prior(_recs, **_dd)
-        if duration_prior is not None:
-            print(f"bio_s1 | monitor decode: duration (monolingual corpus {_corpus}); prior from {len(_recs)} videos", flush=True)
-        else: print(f"bio_s1 | monitor decode: plain argmax (corpus {_corpus}: <10 usable train captions)", flush=True)
-    else: print(f"bio_s1 | monitor decode: plain argmax "
-                f"({'pooled pretraining' if cfg.get('pretrain_mix') else 'untuned corpus'})", flush=True)
+    print("bio_s1 | monitor: BIO Viterbi without duration scores; deployment: calibrated semi-Markov Viterbi", flush=True)
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
     else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
-    def step_fn(batch, epoch: int):
+    def step_fn(batch, _epoch: int):
         out = model(batch["poses"], batch["frame_mask"], timestamps_s=batch["timestamps_s"])
         loss = bio_nll_dice_loss(out.logits, batch["bio_labels"], dice_weight=dice_weight, class_weights=class_weights)
         return loss, {"bio_loss": float(loss.detach())}
 
-    # The head's RoPE context is set by the windows it trains on, which the sampler clamps to buffer_cap_s. Later stages re-measure 
-    # and rewrite that cap, so eval must read the cap from HERE, not from the live config. monitor_decode: the triple best-epoch 
-    # selection ran under. On a corpus's FIRST pass duration_decode_s1.<lang> is still unpinned (tune-decode needs this checkpoint), 
-    # so selection happens with the decode off and deployed decode differs — recorded here so the gap is visible instead of inferred.
+    # Save the trained context and monitor decode with the S1 weights.
     training_cap_s = float(cfg["training_buffer_cap_s"])
-    meta = {"rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s, "monitor_decode": _dd,
+    meta = {"monitor_decode": "bio_viterbi", "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s,
+            "initialization": pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth"),
             "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
             "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")}
     # The end-of-training save in train.py reuses THIS dict. A second, independently-built meta drops pretrain_pool/pretrain_mix 
@@ -320,7 +254,6 @@ def train_bio_s1_epochs(
     cfg["checkpoint_meta"] = meta
     return run_epoch_loop(
         name="bio_s1", model=model, loader=train_loader, optimizer=optimizer, device=device, epochs=epochs, cfg=cfg, step_fn=step_fn, 
-        evaluate_fn=lambda e: evaluate_bio_s1(
-            model, dev_loader, device, dice_weight, class_weights, duration_prior=duration_prior, delta=_delta), 
+        evaluate_fn=lambda e: evaluate_bio_s1(model, dev_loader, device, dice_weight, class_weights),
         default_monitor="val_mode3_tiou_f1", default_mode="max", dev_loader=dev_loader, resume=resume, checkpoint_meta=meta
     )

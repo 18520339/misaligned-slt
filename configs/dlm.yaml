@@ -37,6 +37,7 @@ wandb:
 visual_padding: none # raw windows; the LM encoder masks padding via attention_mask (no boundary halos)
 freeze_backbone: false # Freeze the Uni-Sign pose encoder during SLT training as an overfitting regularizer.
 freeze_projection: false
+lambda_bio: 1.0
 lambda_trans: 1.0
 oput:
     # DMax dFactory data_transform.sft_noise_transition samples sigma ~ U(0.3, 0.8).
@@ -82,32 +83,9 @@ confidence_bound:
     decode_steps: 32
     cache_type: prefix
     window_type: static
-membership_gate:
-    # Condition the DLM decoder on the BIO head's segmentation belief (docs/membership_gate.md): an additive,
-    # query-independent bias Ω(t) on cross-attention = γ·ln(m∨ε)+ln(1−χ+ε). This is the ONLY channel by which
-    # the segmenter's knowledge reaches the decoder at decode time — without it the two heads are separate models
-    # sharing an encoder (§1.1). Ω is built from DETACHED BIO logits: it conditions the decoder; no translation
-    # gradient reaches the head (trained by alpha*(CE+Dice) + (1-alpha)*KL to frozen S1, see bio loss note below).
-    # Applies to BOTH decoder arms: the DLM injects Ω in its manual decode; the AR de-risk arm injects the
-    # SAME Ω via HF cross-attention forward-hooks (models.membership_gate.CrossAttnOmegaInjector), so §9.3 is a
-    # gated-vs-gated decoder-family contrast. This block is inherited by ar.yaml (extends dlm).
+membership_gate: # Exact first-complete-span membership from legal BIO paths. Live logits carry caption gradients.
     enabled: true
-    # δ (ramp width / boundary tolerance / 2δ trust-band half-width) and Λ_min are NOT set here: they are
-    # DERIVED at load from inference.yaml's per-language measured geometry (utils.resolve_inference →
-    # train/slt._inject_gate_geometry). A per-language value mirrored into this shared file is a stale-constant
-    # hazard — there is deliberately no key to drift.
-    eps: 1.0e-4 # doubt cap: γ·ln ε ≈ −9.2·γ (a bias, not a mask — a strong content score still beats it).
-    # Veto (training only): when the head's own span is a bad anchor, Omega is rebuilt from the GT span instead.
-    # Three cases, by what the span shows of the GT target sentence:
-    #   covers it (within delta)      -> keep the span. This is a merge; the target then lists every complete sentence
-    #                                    inside it, so the mask and the text name the same sentences.
-    #   overlaps it at tIoU >= this   -> keep the span, keep the single full sentence as the target. Omega dims the part
-    #                                    the span misses. The FSM commits exactly this span and is scored against exactly
-    #                                    this sentence, and these rows are the only ones whose training anchor matches the
-    #                                    one at deployment (112 of 112 on asf train, against 0 of 144 for rebuilt rows).
-    #   worse                         -> rebuild from GT. Share logged as gate_veto_rate.
-    iou_veto: 0.5
-    gt_anchored: false # always-GT ablation row (§3). Leave false for the on-policy method.
+    eps: 1.0e-4 # finite floor for the log-membership bias
     # Gate warmup — hold the gate off for the first `warmup_epochs` so it never couples to an untrained head
     # (garbage conditioning, §1.2). Canonical flow: run `train.py --stage train-bio` FIRST → checkpoint.bio_head_init
     # loads a sharp head → set warmup_epochs: 0 (the coupling trains from step one, §1.4). There is no safe
@@ -145,16 +123,6 @@ augmentation:
     affine: { prob: 0.0, scale: [0.9, 1.1], shift: [-0.05, 0.05], degree: null, shear: null }
     spatial_mask: { prob: 0.0, size: [0.1, 0.2] }
     fps: { enabled: true, min_fps: 15.0, max_fps: 30.0 }
-# Stage-2 segmentation objective (train.losses.bio_anchor_loss, models.streaming_slt.forward_loss):
-#     L_BIO = alpha * (CE + Dice on the GT labels) + (1 - alpha) * T^2 * KL(reference head || head)
-bio_anchor:
-    # alpha = r*T / (r*T + w_B) is a coefficient heuristic, not an exact gradient balance.
-    # An explicit alpha overrides gt_ratio. GT labels allow corrections beyond the reference.
-    gt_ratio: 1.0
-    temperature: 2.0
-    # Replace the reference only when the head exceeds its dev F1 by this margin.
-    # Repeated selection can overfit dev; the margin does not guarantee test improvement.
-    anchor_margin: 0.01
 # BIO loss = Dice(1.5) + class-weighted cross-entropy. Dice is BINARY signing-vs-not, so it carries the O/I
 # imbalance but gives NO B-vs-I signal; with B at 0.8% of frames, unweighted CE collapsed the class outright
 # (measured: zero B predictions on dev, max P(B) 0.20, mean P(B) 0.015 AT gold boundaries) — the failure
@@ -180,13 +148,12 @@ jitter:
     # and Mode-2 cut depths uniformly from fallback_cut_range — the same distributions S1 pretrains under. Designed,
     # not measured, deliberately: (a) S1↔S2 parity — swapping the nuisance model between stages injects a shift
     # justified only by fidelity to a segmenter we do not deploy; (b) deployment windows are cut by OUR head under
-    # the tuned semi-Markov decode and the terminator−δ commit — a different error law from the analysis
-    # segmenter's whole-video argmax errors, so a measured Laplace is not "matched to deployment" either;
-    # (c) robustness training wants coverage: the designed scales sit deliberately above measured boundary offsets,
-    # and sensitivity is MEASURED by the RQ1 sweep, not assumed from a proxy. The segmenter-error taxonomy stays in
-    # the paper as evidence that real segmenters produce exactly these event types, inside the designed support.
-    # MEASURED ABLATION: point `source` at the INDEPENDENT segmenter's artifact (never an `_s1_` file —
-    # self-calibration): outputs/a_jitter_moryossef_${language}_dev.json. Laplace is the right family either way:
+    # legal BIO decoding and terminator−δ commit — a different error law from the analysis segmenter's whole-video 
+    # argmax errors, so a measured Laplace is not "matched to deployment" either; (c) robustness training wants 
+    # coverage: the designed scales sit deliberately above measured boundary offsets, and sensitivity is MEASURED by 
+    # RQ1 sweep, not assumed from a proxy. Segmenter-error taxonomy stays in paper as evidence that real segmenters 
+    # produce exactly these event types, inside the designed support. MEASURED ABLATION: point `source` at INDEPENDENT 
+    # segmenter's artifact: outputs/a_jitter_moryossef_${language}_dev.json. Laplace is the right family either way: 
     # measured offsets are leptokurtic (Laplace beats Gaussian in held-out log-lik on both edges).
     source: null
     fallback_laplace:
@@ -194,7 +161,7 @@ jitter:
         head_scale_s: 0.6 # deliberately broader than measured head offsets (coverage, not point-matching)
         tail_loc_s: 0.0
         tail_scale_s: 0.8 # broader still: deployment tails also carry cap-forced commits and survival splits
-    fallback_cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off the edges so mode2 stays distinct from mode1/4
+    fallback_cut_range: [0.15, 0.85] # uniform relative Mode-2 cut, clipped off edges so mode2 stays distinct from mode1/4
 mixed_precision: auto # bf16 on Ampere+ GPUs, fp16+GradScaler otherwise, fp32 on CPU
 batch_size: 16
 num_workers:

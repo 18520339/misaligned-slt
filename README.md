@@ -2,7 +2,7 @@
 
 Pose-only, gloss-free, **streaming** sign-language-to-text translation. The system is robust to sentence-boundary **temporal misalignment** (imperfect segmentation).
 
-**Central rule.** Training windows match the windows the streaming loop produces. A truncated visual input never gets a partial text label (premise **P1**). Every segmenter error becomes a window-shape variation, never a label variation (**P2**). Design spec: [`streaming_slt_prompt.md`](streaming_slt_prompt.md). The segmentation→translation coupling: [`docs/membership_gate.md`](docs/membership_gate.md).
+**Central rule.** Training windows match the windows the streaming loop produces. A truncated visual input never gets a partial text label (premise **P1**). Every segmenter error becomes a window-shape variation, never a label variation (**P2**). Design spec: [`streaming_slt_prompt.md`](streaming_slt_prompt.md). The segmentation→translation coupling: [`docs/membership_gate.md`](docs/membership_gate.md). Decoder model, algorithm and loss: [`docs/segmentation_decoding.md`](docs/segmentation_decoding.md).
 
 **Data.** YouTube-SL-25: ASL (`ase`), Auslan (`asf`), BSL (`bfi`). All targets are English. All poses come from SignVerse-2M at a uniform 24 fps. The full load-time pipeline (caption cleanup, sentence reconstruction, quarantine, de-duplication, pooling) is documented in [`docs/data_pipeline.md`](docs/data_pipeline.md). Read it before you change anything that touches ground truth.
 
@@ -20,23 +20,28 @@ pip install -r requirements.txt
 ## Architecture
 
 ```
-DWPose 133-kp stream
-  └─ pose_io.load_pose_window        raw 133-kp → Uni-Sign 69-kp
-                                     box from the supplied window, buffer, or S1 evaluation chunk
-                                     offline Moryossef: video box reused by training chunks
-       └─ Uni-Sign 4-part pose ST-GCN (69 kp)      per-frame pose tokens (T preserved)
-            ├─ Conv1d stem → RoPE-rel-time BIO head ──► phrase B/I/O ──► streaming FSM (terminator = O-or-B)
-            │        │                                        │
-            │        └──────── membership gate Ω(t) ◄─────────┘  (segmentation belief → decoder cross-attention)
-            └─ task prompt prepended → LM encoder (mT5 | mBART) ─► DLM decoder (OPUT train / SPD+DCD infer, gated by Ω)
+raw pose buffer → normalization → Uni-Sign pose backbone → pose tap F
+                                                │
+                                                └→ Conv stem + RoPE temporal encoder → H
+                                                           ├→ BIO classifier → legal paths
+                                                           │                    ├→ first-span probability → Ω
+                                                           │                    └→ Viterbi span → FSM
+                                                           └→ nonlinear mapper → residual F + mapper(H)
+                                                                                 ↓
+                                                                    task prompt + mT5 encoder
+                                                                                 ↓
+                                                                      AR / DLM decoder ← Ω
 ```
 
 - **Pose encoder** ([`backbones/`](backbones)): Uni-Sign 4-part ST-GCN, loaded from the released `*_pose_only_slt.pth`. [`poses/`](poses) reproduces Uni-Sign normalization byte-exactly.
 - **Front end** ([`models/unisign.py`](models/unisign.py)): one pose encoder, two LMs (mT5 default; mBART ablation). `MisalignedSLTModel` takes either, so the heads, sampler, and FSM are written once.
 - **Decoder** ([`models/block_diffusion.py`](models/block_diffusion.py), [`models/dmax.py`](models/dmax.py)): BD3LM core + DMax (OPUT training, SPD/DCD inference). Verified faithful to the released DMax/DCD code.
-- **BIO head** ([`models/bio_head.py`](models/bio_head.py)): its own RoPE-relative-time transformer with a Conv1d stem, over the pose tap.
-- **Membership gate** ([`models/membership_gate.py`](models/membership_gate.py)): Ω(t) = γ·ln(m∨ε) + ln(1−χ+ε), an additive bias on decoder cross-attention. It is the only decode-time channel between the heads; both decoder arms use the same Ω. Full derivation: [`docs/membership_gate.md`](docs/membership_gate.md).
-- **Streaming FSM** ([`infer/stream.py`](infer/stream.py)): sawtooth WATCH→TRANSLATE→COMMIT. A span's terminator is the first following `O` or `B`. The target is the first complete span ≥ **Λ_min** frames. A commit cuts the buffer at terminator − δ. The buffer's last sentence is right-censored: its tag stream comes from the FSM's own decode triple (`duration_decode_s1_stream`), a split that opens the censored tail survives only if the closed-tail decode agrees within δ, and a duration-decided `B` terminator commits only once the buffer extends `commit_lag_s` past it (fixed-lag decoding; an `O` terminator commits at once).
+- **Shared temporal encoder** ([`models/bio_head.py`](models/bio_head.py)): Conv1d stem, RMSNorm and time-aware RoPE. Its features train from both segmentation and translation.
+- **Membership gate** ([`infer/duration_decode.py`](infer/duration_decode.py), [`models/membership_gate.py`](models/membership_gate.py)): exact probabilities of membership in the first eligible complete span. Caption gradients reach the BIO classifier through the soft mask. The same soft-mask rule runs during training and streaming.
+- **Segmentation decoder** ([design](docs/segmentation_decoding.md)): a restricted semi-Markov CRF with fixed duration scores, legal BIO transitions and exact Viterbi. BIO supervision remains frame CE plus Dice. S1 checkpoint selection uses an untuned legal-only monitor; joint conditioning sums probabilities under the calibrated model.
+- **Streaming FSM** ([`infer/stream.py`](infer/stream.py)): first eligible complete span from duration-aware BIO Viterbi, boundary hysteresis, commit lag for B terminators, translation confidence and explicit forced-partial handling. Committed prefixes cannot be selected again.
+
+**Claim boundary.** S1 is a pretrained segmentation module built from existing components. Duration-aware BIO decoding uses established structured inference and can also process Moryossef logits. It enforces valid transitions but does not establish accurate interior boundaries. S1's CE/Dice objective does not use the caption mask. The proposed joint contribution is first-complete conditioning with incomplete-state handling; its accuracy and latency benefit must be measured. See `docs/membership_gate.md` §4.
 
 ## Multi-GPU (torchrun)
 
@@ -48,7 +53,8 @@ torchrun --standalone --nproc-per-node=4 train.py --stage train-slt --language "
 
 - Config `batch_size` is the GLOBAL batch, split across ranks. A non-divisible batch is a hard error.
 - `mixed_precision: auto` picks bf16 on compute capability ≥ 8. Multi-GPU + fp16 is refused (per-rank scaler drift).
-- `latest.pt` is a full resumable snapshot, written every epoch. Continue with `--resume`. Re-running without `--resume` over an existing `latest.pt` is refused.
+- `latest.pt` is a full resumable snapshot, written every epoch. Continue an interrupted run of the same architecture and settings with `--resume`. Re-running without `--resume` over an existing `latest.pt` is refused.
+- CUDA compiles the membership recurrence on first use. Judge speed after warmup. Before another full run after a slowdown, run `python tests/test_membership_runtime.py` on the training GPU. This data-free check measures gate forward/backward time and checks gradients; it writes `outputs/membership_runtime.json`. It does not estimate total epoch time.
 - Eval and analysis stay single-process; use `--batch-size` there. Gradient averaging is explicit, not DDP ([`train/distributed.py`](train/distributed.py) explains why).
 
 ## The experiment sequence
@@ -62,7 +68,7 @@ Two blocks. **Stage A** (segmentation pretraining) runs once, pooled over all th
 | Produces                          | `checkpoints/{moryossef,bio_s1}/multi_<pool>` | `checkpoints/{baseline_train,ar,dlm}/$LANG`, `outputs/*_$LANG_*`, the `inference.yaml` constants |
 | Reads `data.yaml pretrained_slt`? | no — released warm starts only                | yes (`utils.resolve_pretrained`)                                                                 |
 
-Stage A never reads `pretrained_slt`, so the B2b re-root cannot reach it. The two blocks are independent. `--language "$LANG"` re-points the dataset and every `${language}` path; no config edits.
+Segmentation training reads its explicit warm start, so the B2b clean-translator re-root cannot reach S1. The two blocks are independent. `--language "$LANG"` re-points the dataset and every `${language}` path; no config edits.
 
 ```bash
 # ═══ STAGE A — run ONCE. Both segmenters train on the SAME multilingual pool ([ase, asf, bfi]). ═══
@@ -84,80 +90,41 @@ python train.py --stage train-moryossef        # -> checkpoints/moryossef/multi_
 #   encoder AND head via bio_head_init. The pool is temperature-flattened and balanced by SUB-sampling with
 #   per-epoch rotation — nothing is replicated, nothing is permanently dropped. Dev is a balanced fixed
 #   sub-sample; test is pooled as-is. Every design value (fixed mode mix, designed jitter, uniform cuts,
-#   auto context = pool train p99 + stride + 1 s, plain-argmax monitor) is documented in configs/bio_pretrain.yaml.
+#   auto context = pool train p99 + stride + 1 s, legal-BIO monitor) is documented in configs/bio_pretrain.yaml.
 #   Checkpoints stamp their pool (meta.pretrain_pool); every loader refuses a pool mismatch.
 #   Monitor = val_mode3_tiou_f1. Compare checkpoints with --segmenter-eval, never by monitor value.
 python train.py --stage train-bio              # -> checkpoints/bio_s1/multi_ase-asf-bfi/model.pt
 
 # ═══ STAGE B — per target language. MEASURE (B1) → TRAIN (B2, B3) → EVALUATE (B4, B5, B6). ═══
-# WHAT A CHANGE INVALIDATES (rerun only what is listed; everything else keeps):
-#   change in Stage A (S1 or Moryossef retrained)    -> all of B1, then B3, rows 6/6' (S1 spans) and every evaluation that uses the arms
-#   change in data preprocessing / GT construction   -> everything, Stage A included
-#   change in the FSM decode (terminator rule, streaming triple, commit lag, tune-stream) -> B1a', B1b (delta), B1c if
-#       delta moved, then B3 (the gate trains under that decode) and rows 7/8, RQ1 for the arms; NOT the clean baseline
-#       (no head, no gate), NOT the cascade rows 1-6 (their spans are whole-video; row 6' IS an FSM row and reruns), NOT Stage A
-#   change in a language's buffer_cap_s (B1c re-measured) -> B2 baseline_train, B3 both arms, B1a' tune-stream and B1b
-#       delta-enc for THAT language (every training window is clamped to the cap; the FSM buffer is the cap)
-#   change in the arms' checkpoint monitor -> B3 and the arm rows only
-#   change in RQ2 scoring (uniform Lambda_min floor, DVC columns) -> re-score events JSONs with --predictions; no training
-#   change in pose normalization (the frames a body scale is computed over) -> B1a tune-decode, then rows 6/7 and
-#       segmenter-eval for EVERY language (the whole-video S1 passes normalize per chunk at the trained context). If B1a's
-#       snap or w moved, also B1a' (it inherits them) and then the FSM-decode rule above; otherwise no training
-#   change in the stage-2 recipe (bio_anchor, iou_veto) -> B3 and the arm rows only
-#   change in delta / Lambda_min (a B1b write) -> re-run B1a' once (tune-stream selects under the live delta / Lambda_min)
+# WHAT A CHANGE INVALIDATES:
+#   New joint architecture/loss -> fresh AR and DLM training, followed by their RQ1/RQ2 evaluations.
+#   New S1 checkpoint or legal decode -> S1 evaluation and B1 for every target language.
+#   Changed delta/minimum span -> B1b capacity, B1c lag, and the arms that consume those values.
+#   Changed capacity -> clean baseline and arms if their training windows change.
+#   Changed commit lag only -> streaming evaluation; it is not a training input.
+#   Changed ground truth -> every dependent training/calibration/evaluation stage.
 LANG=ase      # ase (ASL) | asf (Auslan) | bfi (BSL)
-python train.py --stage smoke-data --language "$LANG" --split train --num-samples 64   # loader sanity
+python train.py --stage smoke-data --language "$LANG" --split train --num-samples 64
 
-# ── B1. MEASURE — freeze the constants that parameterize training ──
-#   Three rules order everything. (1) A constant that parameterizes training is frozen before any training that
-#   reads it: the sampler clamps windows to buffer_cap_s, and the gate trains under δ/Λ_min. (2) Nothing in B1
-#   may depend on a trained translator — that would be circular. Every B1 input is Stage A's S1 checkpoint, the
-#   data, or an earlier B1 write (B1a → B1b → B1c). (3) A constant that depends only on labels is measured on the
-#   TRAIN split (buffer_cap_s); a constant that depends on a model is selected on dev (the decode triples, δ).
-#   Stage A's context follows the same rule without a B1 run: `pretrain_geometry.buffer_cap_s: auto` = max over the
-#   pool of train p99 + stride + 1 s (the margin covers any δ up to fps frames), so every deployed cap written in
-#   B1c fits the S1 context by construction, and B1c refuses a cap above the checkpoint's stamped context.
-#   Re-run B1 per language and after any S1 retrain.
-#   Constants are written as PER-LANGUAGE rows in inference.yaml (duration_decode convention), so switching
-#   $LANG never overwrites another language's calibration; a new language's rows are inserted by
-#   --write-config, and a missing row fails loud at load (utils.resolve_inference). The membership gate's
-#   δ/Λ_min are DERIVED from these rows at load (train/slt._inject_gate_geometry) — no dlm.yaml mirror.
-#
-# B1a — deployed semi-Markov decode triple → inference.yaml duration_decode_s1.$LANG.
-#   Two dev folds, joint grid. Quote the HELD-OUT estimate, never the selected cell. One forward per video; the
-#   whole (w, bias, radius) grid is decoded by one batched DP per video (duration_split_grid), so the sweep
-#   costs minutes, not hours, and still equals the deployed scalar decode cell by cell (tests/test_duration_decode_grid.py).
+# ── B1. MEASURE — one duration score model in hard decoding and soft membership ──
+# S1 architecture and CE/Dice loss are compatible with an existing pooled S1 checkpoint. Check standalone multi-sentence localization before using it as a joint-training initialization; compatibility does not establish quality.
+# Retraining S1 is optional if reusing that checkpoint; a new S1 run selects with the updated legal-BIO monitor.
+# B1a — fit train durations and select duration-score weights on dev.
 python analyze.py --stage tune-decode --segmenter-arch s1 --language "$LANG" --split dev --write-config
-#
-# B1a' — the FSM's OWN triple, selected under the STREAMING decode → inference.yaml duration_decode_s1_stream.$LANG.
-#   The buffer's last sentence is right-censored, so the whole-video triple is far too permissive in the FSM (a weak
-#   P(B) bump near the buffer edge opens a new sentence at almost no cost and the FSM commits sentences in pieces).
-#   tune-stream runs the FSM itself, segmentation-only, on the S1 head over two dev folds and sweeps split bias x commit
-#   lag (max min-fold F1@0.5); it writes duration_decode_s1_stream.$LANG and boundary_stability.commit_lag_s.$LANG. The
-#   FSM, the gate's anchor decode (training + eval) and delta-enc read the stream row; offline/cascade rows keep the
-#   whole-video one (two estimators, two triples). The split that opens the buffer's censored tail counts as a terminator
-#   only if the closed-tail decode agrees within δ (streaming_split_tags; no knob). Dry runs of any FSM setting:
-#   eval.py --rq 2 --stream --no-translate (no decoder calls, minutes). Numbers: docs/implementation_notes.md.
-python analyze.py --stage tune-stream --segmenter-arch s1 --language "$LANG" --split dev --write-config
-#   AFTER B3 (optional): re-select ONLY the commit lag on the deployed arm's head (the bias is a training input through
-#   the gate and stays; the lag is a commit policy): the same command with --checkpoint checkpoints/{ar,dlm}/$LANG/model.pt
-#   --grid-bias <pinned bias> --grid-lag 2 3 4 5 (stage-2 layout accepted).
-#
-# B1b — gate geometry: δ (the S1 head's boundary-noise floor, under the B1a' streaming decode) and Λ_min = δ+1.
-#   Indifferent to the data.yaml warm start. If the write changed Λ_min, run once more; it settles in 2 passes.
-#   δ is a p90, so on a large dev split `--num-sentences 3000` (a seeded random subset) estimates it in a
-#   fraction of the time; re-run only when the S1 checkpoint or the B1a triple changes.
-python analyze.py --stage delta-enc --language "$LANG" --write-config
-#
-# B1c — buffer capacity: buffer_cap_s = TRAIN-split p99 sentence duration + stride_s + δ/fps. Model-free by rule 2,
-#   measured on train by rule 3 (a label-only constant; the stage refuses dev and test). A translator-dependent tail
-#   elbow never enters the cap; the B5 context-appetite sweep is diagnostic only. Refuses to write a cap above the
-#   S1 checkpoint's trained context (rope_eval_chunk_s): retrain S1 with `auto` instead of running the head out of range.
+# Then measure boundary tolerance and minimum eligible span under that same score model.
+# If the written minimum span changes which sentences can be measured, rerun until the selection is stable.
+python analyze.py --stage delta-enc --language "$LANG" --split dev --write-config
+# On a large dev set, --num-sentences 3000 uses a fixed random subset.
+# B1b — capacity from reliable TRAIN sentence durations, stride and measured tolerance.
 python analyze.py --stage buffer-cap --language "$LANG" --split train --write-config
+# B1c — commit lag under the resolved capacity/tolerance; duration-score weights stay fixed.
+python analyze.py --stage tune-stream --segmenter-arch s1 --language "$LANG" --split dev --write-config
+# After B3, lag can be selected again on the deployed head using --checkpoint checkpoints/ar/$LANG/model.pt
+# (or the DLM checkpoint). This changes streaming evaluation only. Ties prefer smaller lag.
 
 # ── B2. TRAIN the clean floor — the shared init for every later stage ──
 #   Faithful Uni-Sign SLT transfer on a caption-trimmed training view: mode1-only, ~zero jitter, lambda_bio 0.
-#   Windows clamp to the B1c cap; configs/baseline_train.yaml documents why a stale cap biases this arm.
+#   Windows clamp to the B1b cap; configs/baseline_train.yaml documents why a stale cap biases this arm.
 #   The reported clean number is NOT a separate step: it is the (0,0) cell of the B5 baseline sweep.
 #
 # B2a — train (writes checkpoints/baseline_train/$LANG/model.pt)
@@ -175,33 +142,28 @@ python train.py --stage train-slt --language "$LANG" --slt-config configs/baseli
 #   The S1-pretrained pose encoder and BIO head train at backbone_lr (default 0.3 x learning_rate) — the rule stage 1
 #   applies to the released encoder; the LM trains at learning_rate. baseline_train.yaml pins backbone_lr = learning_rate
 #   (Uni-Sign's one-rate transfer recipe), so the clean floor is unchanged.
-#   Stage-2 segmentation mixes GT CE + Dice with KL to a saved segmentation reference (bio_anchor).
-#   The reference starts at S1 and is fixed between dev-selected replacements. The current head and pose encoder train.
-#   KL regularizes the head's outputs. It does not guarantee calibration or improvement over the reference.
-#   gt_ratio is a coefficient heuristic; alpha can also be set directly. It is not an exact gradient ratio.
-#   The reference state is saved in latest.pt so resume preserves the training objective.
-#   The IoU veto uses GT only during training to keep the mask paired with the first complete sentence's text.
-#   Omega uses detached BIO logits. Translation trains the shared pose encoder, but has no direct gradient to the BIO head.
-#   Watch val_phrase_tiou_f1, val_reference_phrase_tiou_f1 and val_bio_pred_b_rate beside the dev BLEU monitor.
+#   Stage 2 shares the pretrained visual temporal features H across BIO classification and a nonlinear V-L mapper.
+#   The mapper is residual: F + mapper(H), with its last layer initialized to zero to preserve the warm-start input.
+#   Both the shared features and first-span membership carry caption gradients. BIO labels and the first-complete
+#   translation target stay fixed. No segmentation reference model or GT-boundary veto trains with the arms.
+#   Checkpoints without this mapper cannot resume. Interrupted runs of this architecture use --resume.
+#   Watch val_phrase_tiou_f1, boundary precision/recall and val_translation_bleu4 together.
 python train.py --stage train-slt --language "$LANG" --slt-config configs/ar.yaml    # gated AR de-risk (§9.3)
 python train.py --stage train-slt --language "$LANG" --slt-config configs/dlm.yaml   # DLM -> checkpoints/dlm/$LANG
 
 # ── B4. EVALUATE — calibration, acceptance checks, diagnostics. Nothing here parameterizes training ──
-# B4a — baseline segmenter's decode triple + the whole-video segmenter table.
-#   Each arch gets its OWN tuned triple (sharing one would be the unfair-baseline objection).
-#   duration_decode_moryossef feeds only the baseline's eval and RQ2 rows 4/5.
+# B4a — portable decoder control: no additional segmentation training.
 python analyze.py --stage tune-decode --segmenter-arch moryossef --language "$LANG" --split dev --write-config
-python eval.py --segmenter-eval --segmenter-arch moryossef --language "$LANG" --split dev
-python eval.py --segmenter-eval --segmenter-arch moryossef --language "$LANG" --split test --allow-test
-python eval.py --segmenter-eval --segmenter-arch s1 --language "$LANG" --split dev
-python eval.py --segmenter-eval --segmenter-arch s1 --language "$LANG" --split test --allow-test
-#   READ WITH CARE: the same protocol is not neutral. Moryossef trains and evaluates on whole-video crops at a
-#   1024-frame context; S1 trains on truncated, jittered buffer windows and evaluates at its own trained context
-#   (checkpoint-pinned; re-chunking a trained head degrades it, measured), each chunk normalized on its own frames as
-#   every training window was (the Uni-Sign body scale is one number over the frames it is given). Expect the external segmenter to lead
-#   this cell; report both models' training input and context beside the number, plus the segment-count ratio.
-#   No paper claim needs S1 to win here — a higher cascade floor raises the bar rows 7/8 must clear.
-#   Check val_alli_tiou_f1 (the all-I floor) before crediting any duration-decoded F1.
+#   Freeze the settings before test. Four decoder cells; no extra model training.
+for S in moryossef s1; do
+    for D in plain duration; do
+        python eval.py --segmenter-eval --segmenter-arch "$S" --segmenter-decode "$D" \
+            --language "$LANG" --split test --allow-test --output outputs/segmenter_eval_${S}_${D}_${LANG}_test.json
+    done
+done
+#   Declare the training data, initialization, normalization and trained context beside each model.
+#   Different encoders and data views make this a system comparison, not a controlled test of one layer.
+#   Use the three-condition S1 continued-training study below to test the value of pretraining.
 #   TWO PROTOCOLS, ONE DECODE: segmenter-eval also scores its spans through the RQ2 code path itself
 #   (`rq2_protocol` in the JSON: caption-span gold, quarantine-dropped events, F1 of macro P/R) and prints both
 #   numbers per threshold. QUOTE the rq2-protocol number wherever localization is compared across tables — it is
@@ -216,17 +178,17 @@ python eval.py --segmenter-eval --segmenter-arch s1 --language "$LANG" --split t
 #   input and stay DEV-ONLY. Artifacts are split-stamped in name and payload, and the training side
 #   (data/jitter.py, the sampler's mode_ratios loader) REFUSES a split=test artifact outright.
 #   REPORTED taxonomy — TEST, the split the results tables describe (this is pure analysis; nothing trains on it):
-python analyze.py --stage segmenter-infer --language "$LANG" --split test --allow-test --segmenter-decode duration \
+python analyze.py --stage segmenter-infer --segmenter-decode duration --language "$LANG" --split test --allow-test \
     --output outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json
 python analyze.py --stage segmenter-errors --language "$LANG" --split test --allow-test \
     --predictions outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json
 #   ABLATION INPUT — DEV, only when running the measured-jitter ablation (its artifacts feed TRAINING, and the
 #   loader refuses a split=test artifact):
-python analyze.py --stage segmenter-infer --language "$LANG" --split dev --segmenter-decode duration \
+python analyze.py --stage segmenter-infer --segmenter-decode duration --language "$LANG" --split dev \
     --output outputs/segmenter_predictions_moryossef_duration_${LANG}_dev.json
 python analyze.py --stage segmenter-errors --language "$LANG" --split dev \
     --predictions outputs/segmenter_predictions_moryossef_duration_${LANG}_dev.json
-#   Guard: segmenter-errors refuses spans whose stamped decode differs from the pinned triple.
+#   Guard: segmenter-errors refuses spans whose stamped architecture or BIO decoder differs from this run.
 
 # ── B5. RQ1 — controlled boundary sensitivity ──
 #   All three arms run, deliberately. RQ1 is the only CONTROLLED robustness evidence: the baseline row shows the
@@ -256,29 +218,24 @@ for M in baseline ar dlm; do python eval.py --rq 1 --method $M --language "$LANG
 #   Report each vs the full arm at (0,0), the worst evidence-complete cells, and RQ2 rows 7/8. Event/stability
 #   filenames auto-append the method-config stem, so ablation evals never overwrite the main arm's artifacts.
 
-# ── B6. RQ2 — end-to-end DVC (rows 1-8 plus the online S1 cascade row 6'; table below) ──
-python eval.py --emit-gold-segments outputs/gold_${LANG}_test.json --language "$LANG" --split test    # rows 1/2 spans
-python analyze.py --stage segmenter-infer --language "$LANG" --split test --allow-test \
-    --output outputs/segmenter_predictions_moryossef_plain_${LANG}_test.json                # row 3 spans (plain argmax)
-python analyze.py --stage segmenter-infer --language "$LANG" --split test --allow-test --segmenter-decode duration \
-    --output outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json             # rows 4/5 spans
-#   Decode parity: rows 7/8 self-segment under the duration decode, so segmenter/deployment deltas use the
-#   duration-decoded cascade rows 4/5. Row 3 stays as the published-protocol reference.
+# ── B6. RQ2 — end-to-end DVC (rows 1–8 below) ──
+python eval.py --emit-gold-segments outputs/gold_${LANG}_test.json --language "$LANG" --split test
+python analyze.py --stage segmenter-infer --segmenter-decode duration --segmenter-arch moryossef --language "$LANG" --split test --allow-test \
+    --output outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json
 python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 1
-python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 2'
-python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 2
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_plain_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 3
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 4
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 5'
-python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 5
-#   Row 6 — the S1-cascade floor (matched-segmenter control): the deployed head's spans, clean AR translator.
-#   There is deliberately no "S1 spans + our DLM" row; every contrast it could carry is covered by (2−1), (5−4), (8−7).
-python analyze.py --stage segmenter-infer --segmenter-arch s1 --segmenter-decode duration --language "$LANG" --split test --allow-test \
+python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 2 AR
+python eval.py --rq 2 --segments outputs/gold_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 2 DLM
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 3
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method ar       --language "$LANG" --split test --allow-test  # row 4 AR
+python eval.py --rq 2 --segments outputs/segmenter_predictions_moryossef_duration_${LANG}_test.json --method dlm      --language "$LANG" --split test --allow-test  # row 4 DLM
+#   Row 5 — the S1-cascade floor (matched-segmenter control): the deployed head's spans, clean AR translator.
+#   There is deliberately no "S1 spans + our DLM" row; every contrast it could carry is covered by (2−1), (4−3), (8−7).
+python analyze.py --stage segmenter-infer --segmenter-arch s1 --language "$LANG" --split test --allow-test \
     --output outputs/segmenter_predictions_s1_duration_${LANG}_test.json
-python eval.py --rq 2 --segments outputs/segmenter_predictions_s1_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 6
-#   Row 6' — online S1 cascade. S1 proposes spans; the clean translator encodes each candidate crop.
+python eval.py --rq 2 --segments outputs/segmenter_predictions_s1_duration_${LANG}_test.json --method baseline --language "$LANG" --split test --allow-test  # row 5
+#   Row 6 — online S1 cascade. S1 proposes spans; the clean translator encodes each candidate crop.
 #   The shared FSM checks boundary stability, lag and the translator's confidence before it commits.
-#   --match-geometry reads the comparison arm's saved cap, delta, minimum span and streaming triple.
+#   --match-geometry reads the comparison arm's saved cap, delta and minimum span.
 #   Run both rows with the same inference.yaml for stride, lag and confidence threshold.
 #   The S1 checkpoint comes from --bio-config. --checkpoint here names the clean translator.
 python eval.py --rq 2 --stream --segmenter-arch s1 --method baseline \
@@ -339,17 +296,16 @@ python report.py --language "$LANG" --split test --reference stream \
 
 **RQ2 ladder** — conditions over {segmenter source × translator × mode}; each delta varies one axis:
 
-| #   | segmenter (source of spans) | translator        | eval flag (span source)                                              |
-| --- | --------------------------- | ----------------- | -------------------------------------------------------------------- |
-| 1   | GT (oracle)                 | clean AR          | `--segments gold_${LANG}_test.json --method baseline`                |
-| 2   | GT (oracle)                 | misaligned AR/DLM | `--segments gold_${LANG}_test.json --method dlm`                     |
-| 3   | Moryossef (plain argmax)    | clean AR          | `--segments …moryossef_plain_${LANG}_test.json --method baseline`    |
-| 4   | Moryossef + duration decode | clean AR          | `--segments …moryossef_duration_${LANG}_test.json --method baseline` |
-| 5   | Moryossef + duration decode | misaligned AR/DLM | `--segments …moryossef_duration_${LANG}_test.json --method dlm`      |
-| 6   | S1 (deployed head, offline) | clean AR          | `--segments …s1_duration_${LANG}_test.json --method baseline`        |
-| 6'  | S1 (deployed head, online)  | clean AR          | `--stream --segmenter-arch s1`, then `--segments …events_s1_…_segonly.json --method baseline` |
-| 7   | final model's own head      | misaligned AR/DLM | `--offline --method dlm`                                             |
-| 8   | final model's own head      | misaligned AR/DLM | `--stream --method dlm`                                              |
+| # | Span source | Translator | Evaluation |
+| --- | --- | --- | --- |
+| 1 | GT | Clean AR | `--segments gold_… --method baseline` |
+| 2 | GT | Joint AR/DLM | `--segments gold_… --method ar/dlm` |
+| 3 | Moryossef26, enhanced BIO | Clean AR | `--segments …moryossef_duration_… --method baseline` |
+| 4 | Moryossef26, enhanced BIO | Joint AR/DLM | `--segments …moryossef_duration_… --method ar/dlm` |
+| 5 | S1, offline duration BIO | Clean AR | `--segments …s1_duration_… --method baseline` |
+| 6 | S1, online FSM | Clean AR | `--stream --segmenter-arch s1 --method baseline --match-geometry <arm>` |
+| 7 | Joint head, offline | Joint AR/DLM | `--offline --method ar/dlm` |
+| 8 | Joint head, online FSM | Joint AR/DLM | `--stream --method ar/dlm` |
 
 **Required same-span control** — re-translate row 7's saved spans with the clean translator ("clean translator + S2 spans"):
 
@@ -358,28 +314,93 @@ python eval.py --rq 2 --segments outputs/rq2_offline_events_dlm_${LANG}_test.jso
   --method baseline --language "$LANG" --split test --allow-test
 ```
 
-**How to read the ladder.** `(a−b)` = score(row a) − score(row b); positive = the minuend wins.
+**How to read the ladder.** Compare the same target language and decoder family.
 
-- **(2−1)** / **(5−4)** — translator at oracle / realistic spans: the robustness tax on clean data, and the robust-translation gain under real segmenter error.
-- **(7−5)** — segmenter (Moryossef → our own head), same translator, same mode, same decode.
-- **(8−7)** — streaming vs offline deployment of the same model. Offline segments bidirectionally, streaming causally, so (8−7) folds the causal cost into the streaming gain: row 7 is a conservative baseline.
-- **(8−4)** — the application headline: full deployed system vs the standard offline cascade.
+- **2 vs 1; 4 vs 3:** translation at fixed oracle or Moryossef spans.
+- **5 vs 3:** segmentation pipelines with the same clean translator; report the input/context differences.
+- **8 vs 6:** full joint system against the online S1 cascade under matched streaming geometry and policy. Compare localization separately from text scores.
+- **8 vs 7:** the same joint model under online and offline access. This includes the effect of future context.
 
 Notes that prevent misreading, in brief:
 
-- Every row is scored under ONE boundary policy (`eval.scoreable_predictions`): events majority-inside a quarantined region are ignored and events shorter than Λ_min are dropped — cascade spans included, since the deployed FSM can never commit a sub-Λ_min span. Without the shared floor rows 1–6 carry flicker spans rows 7/8 drop by policy, and (7−6) no longer isolates joint training.
-- Rows 1–6 are cascades: only the span _boundaries_ are external. `run_cascade` still runs the full model (BIO head and gate included) on `--method dlm/ar` rows. Rows with `--method baseline` use the ungated clean floor — deliberately a different model.
+- Every row is scored under ONE boundary policy (`eval.scoreable_predictions`): events majority-inside a quarantined region are ignored and events shorter than Λ_min are dropped — cascade spans included, since the ordinary FSM selection requires Λ_min. Without the shared floor, short-span filtering differs between the rows. A localization claim must also report precision and recall.
+- Rows 1–5 use supplied spans; row 6 discovers spans online. For rows 1–5, only the span _boundaries_ are external. `run_cascade` still runs the full model (BIO head and gate included) on `--method dlm/ar` rows. Rows with `--method baseline` use the ungated clean floor — deliberately a different model.
 - Row 7 chunks the head at its TRAINED cap (checkpoint meta), overlap-stitched, each chunk pose-normalized on its own frames (the head's training frame), and translates each span in a buffer-shaped window. No whole-video pass, no random sampling at eval; rows 7–8 are deterministic.
 - The misaligned AR twin runs the identical commands with `--method ar` (rows 2′,5′,7′,8′) to isolate the decoder family. The headline table stays DLM.
 
-**Metric.** The RQ2 headline is the original densevid_eval protocol (the metric set of our previous paper: temporal F1 at tIoU {0.3, 0.5, 0.7, 0.9}; BLEU-4, METEOR, ROUGE-L, CIDEr, BLEURT within the localized segments; every text number quoted as the threshold average), implemented FAITHFULLY (metrics.densevid_text_metrics): one evaluation instance per overlapping (prediction, gold) pair — many-to-many, single reference; an unmatched prediction scores against a random lowercase GARBAGE string (length 10–20, seeded for reproducible tables); scoring is per gold video (BLEU-4 corpus-style and CIDEr-D via the official COCO scorer over the video's pairs; ROUGE-L/METEOR/BLEURT per-pair means) then averaged over videos. It is RECALL-BLIND (a missed gold never enters any pair) and precision-heavy (every extra span is a garbage pair inside the video's corpus score), so the SODA fusion (Fujita et al. 2020: one-to-one tIoU matching plus a localization-aware text score) is printed beside it in every table (`--no-densevid` drops the headline rows). Selection stages (tune-decode, tune-stream) select on segmentation F1, never on a text metric: a recall-blind criterion would reward emitting fewer spans. Neither is comparable to RQ1's corpus BLEU: SODA builds on smoothed sentence scores, which run ~1.6x corpus BLEU on identical pairs at this sentence length — the RQ2 runner prints this warning with every table. SODA per video and threshold _t_: n_p predicted spans, n_g gold sentences, M the matched set, s_ij per-pair sentence scores:
+**Metric.** The RQ2 headline is the original densevid_eval protocol (the metric set of our previous paper: temporal F1 at tIoU {0.3, 0.5, 0.7, 0.9}; BLEU-4, METEOR, ROUGE-L, CIDEr, BLEURT within the localized segments; every text number quoted as the threshold average), implemented FAITHFULLY (metrics.densevid_text_metrics): one evaluation instance per overlapping (prediction, gold) pair — many-to-many, single reference; an unmatched prediction scores against a random lowercase GARBAGE string (length 10–20, seeded for reproducible tables); scoring is per gold video (BLEU-4 corpus-style and CIDEr-D via the official COCO scorer over the video's pairs; ROUGE-L/METEOR/BLEURT per-pair means) then averaged over videos. It is RECALL-BLIND (a missed gold never enters any pair) and precision-heavy (every extra span is a garbage pair inside the video's corpus score), so the SODA fusion (Fujita et al. 2020: one-to-one tIoU matching plus a localization-aware text score) is printed beside it in every table (`--no-densevid` drops the headline rows). The tune-stream stage selects on segmentation F1, never on a text metric: a recall-blind criterion would reward emitting fewer spans. Neither is comparable to RQ1's corpus BLEU: SODA builds on smoothed sentence scores, which run ~1.6x corpus BLEU on identical pairs at this sentence length — the RQ2 runner prints this warning with every table. SODA per video and threshold _t_: n_p predicted spans, n_g gold sentences, M the matched set, s_ij per-pair sentence scores:
 
 &nbsp;&nbsp;&nbsp;&nbsp;`segmentation.f1 = 2|M|/(n_p+n_g)` · `S = Σ_(i,j)∈M s_ij`, `p = S/n_p`, `r = S/n_g`, `text = 2pr/(p+r)`
 
 - The fusion charges spurious predictions (n_p) and missed gold (n_g) in one number, which is why it accompanies the recall-blind headline. Matched-pairs-only means are rejected outright. BLEU here is smoothed sentence-BLEU; CIDEr has no per-pair form, so it appears in the densevid rows only.
-- **Translation isolated from localization** lives in the GT-span rows (1–2) and the RQ1 (0,0) cell — the same condition in two metric spaces. Both anchors stay: (0,0) is the corpus-BLEU curve anchor (comparable to trimmed-clip SLT numbers); rows 1–2 are the ladder's oracle ceiling in SODA space, where (2−1) and the row deltas live.
+- **Provided-boundary translation** is measured by the GT-span rows (1–2), which are explicit oracle controls. RQ1 (0,0) supplies a clean GT-trimmed clip but gives the joint gate no known-start flag or internal boundary. It is a clean-input anchor, not an identical conditioning path to the supplied-proposal controls.
 - **segmenter-eval and RQ2** report the same decode under two protocols, both in the segmenter-eval JSON: the Moryossef-comparable block (per-video mean of F1s over UNK-masked BIO gold — cross-paper comparability only) and `rq2_protocol` (caption-span gold, quarantine-dropped events, F1 of macro P/R — computed by the RQ2 code path itself, so it matches the cascade rows' segmentation block by construction). Quote `rq2_protocol` wherever localization is compared across tables; the residual delta between the two blocks is gold construction plus aggregation, and it is now a printed pair, not an open question.
-- Quote `segmentation.recall` beside any RQ2 text column, and quote tune-decode's held-out F1, never its selected cell.
+- Quote `segmentation.recall` beside any RQ2 text column, and quote tune-stream's held-out F1, never its selected cell.
+
+## S1 continued-training study (`asf` and `bfi`)
+
+Keep `[ase, asf, bfi]` in the multilingual phase. The target language is included throughout that phase.
+Call its direct evaluation **pooled evaluation without target fine-tuning**, not zero-shot.
+All three conditions use the same S1 architecture and released pose initialization; the target-only control must remain S1.
+
+| Condition | Training schedule | Purpose |
+| --- | --- | --- |
+| 1. Target-only | Target-language S1 training | Reference for the value of multilingual training |
+| 2. Pooled, no target fine-tune | Train on `[ase, asf, bfi]`; evaluate that checkpoint on each target | Multilingual model before specialization |
+| 3. Pooled → target fine-tune | Start from the exact checkpoint in case 2; continue on each target separately | Effect of target specialization after multilingual training |
+
+An example schedule is 50 pooled epochs followed by 20 target epochs. Set the target-only training budget before the comparison; adding phase epoch counts does not produce an equal-compute baseline.
+These are not equal-compute conditions: pooled and target epochs contain different numbers of batches and target windows.
+Record optimizer updates, target-language exposure and training time. If claiming equal-budget gains, match optimizer updates and batch size for cases 1 and 3 before running them.
+Case 2 is the shared intermediate checkpoint for case 3, not another model selected to improve the comparison.
+A lower case-2 result can reflect a compromise between languages or less target-specific training; it does not by itself establish a code defect.
+
+Set a common numeric `pretrain_geometry.buffer_cap_s` from training data before the study. Freeze one per-language duration decoder across the three pretraining conditions; do not attribute separate decoder retuning to pretraining. Keep window construction, augmentation, BIO loss, initialization family and evaluation fixed.
+Use dev for checkpoint selection, freeze the selection rules before test, and use a distinct output directory per run.
+The default early-stopping and best-checkpoint settings make the phase lengths upper limits. Report the actual selected epochs.
+
+1. Run the pooled phase with `pretrain_languages: [ase, asf, bfi]`, the released `checkpoint.from_pretrained`, and a distinct `checkpoint.dir`: `python train.py --stage train-bio --epochs 50`. Do not pass `--language` for this phase.
+2. Save the selected pooled `model.pt` as the shared case-2 checkpoint. Evaluate it on both targets using the pooled config: `python eval.py --segmenter-eval --segmenter-arch s1 --language <target> --checkpoint <pooled-model.pt> --split test --allow-test --output <case2-output.json>`.
+3. For case 1, set `pretrain_languages: null`, retain the released initialization, and choose a distinct target-only directory. Run `python train.py --stage train-bio --language <target> --epochs <target-only-budget>` using the predeclared budget.
+4. For case 3, keep `pretrain_languages: null`, set `checkpoint.from_pretrained: <pooled-model.pt>` and a separate target-adaptation directory. Run `python train.py --stage train-bio --language <target> --epochs 20`, without `--resume`.
+5. Evaluate cases 1 and 3 with the same target test data and monolingual config. Use distinct `--output` paths. Restore the pooled configuration before main experiments that expect that checkpoint.
+
+Case 3 continues both pose-encoder and BIO-head weights. The current fine-tuning interface starts a fresh optimizer and schedule; it does not carry Adam moments across the phase boundary.
+`--resume` is for interruption within the same recipe and schedule, not for switching the language pool.
+The main AR/DLM stages need only the selected S1 initialization; this segmentation study does not require separate translators for each case.
+
+Interpret **3 vs 1** as the test of the pooled-then-target recipe, and **3 vs 2** as the effect of further target training. For the separate claim that text improves localization, compare joint training with the case-3 segmentation-only continuation under the same pooled start, target windows, BIO update budget and checkpoint-selection policy. Comparing only against the unadapted pooled checkpoint does not separate text support from extra target BIO training.
+If case 3 remains worse than case 1 under the declared protocol, do not claim that multilingual pretraining improved that result.
+The external Moryossef baseline tests a different visual encoder and cannot replace this same-architecture control. Choose its release by a stated comparison protocol, not by which version scores lower. Credit the 2026 public code even when no separate paper is cited; only our specific additions can be claimed as ours.
+
+### Segmentation evaluation and metric meaning
+
+The main streaming evidence must come from chronological online evaluation with equal observed frames, capacity, stride and latency policy.
+An offline whole-video result remains a useful reference. The four-mode window test is a controlled diagnostic, not an online event evaluation.
+Use identical test-video windows for all models, fixed independently of their predictions; do not reuse training examples or choose mode weights after seeing results.
+For modes 1/3, evaluate eligible complete-sentence localization. In mode 2, distinguish visible-fragment labeling from the decision to wait for a complete sentence. In mode 4, report false spans/false commits.
+Report modes separately: their training mixture is a sampling design and need not match how often they occur in a real stream. A one-sentence crop can make an all-signing prediction score well by cutting it at the supplied window edges; it does not establish boundary detection or correct commit timing.
+The current CLI supplies whole-video segmentation and online S1/joint evaluation.
+Streaming capacity is enforced before encoding. EOF clock advances do not count as new boundary evidence; forced overrides are flagged. A common four-mode benchmark and online Moryossef adaptation are proposed comparisons, not implemented entry points.
+
+| Output | What it measures |
+| --- | --- |
+| `bio_iou` | Raw-head signing-frame overlap, with B and I combined; averaged per video over reliable labels |
+| `phrase_tiou_f1@t` | One-to-one sentence matches at interval tIoU threshold `t`; averaged per video |
+| `phrase_frame_f1` | Macro F1 across the separate O/B/I frame classes |
+| `phrase_segment_count_ratio` | Predicted/gold span count, averaged per video; not boundary accuracy |
+
+Three consecutive gold sentences can be merged into one predicted span with identical signing-frame coverage.
+Then `bio_iou` is perfect, while no sentence meets tIoU 0.5 if the three gold sentences have equal length.
+High `bio_iou` therefore does not imply accurate sentence boundaries. Use sentence precision/recall/F1 for that claim.
+Do not compute IoU from the already averaged precision/recall: the evaluator computes it within each video and then averages.
+Use `rq2_protocol` when comparing with final RQ2 rows; it applies the common quarantine and minimum-span policy.
+
+**Before a new joint run:** duration conditioning and the CB eligibility fixes change the training recipe. Start fresh AR/DLM runs; old joint weights are not evidence for this recipe. S1 weights remain usable because its BIO architecture/loss is unchanged. Recalibrate each target language, then reevaluate its cascades and joint models. Keep a clean translator only when its normalization and training capacity remain the same.
+
+The `asf` duration row may be reused only with the S1 checkpoint and data used to select it. Untuned languages are refused. A small diagnostic subset must not write final settings. Decoder fit/selection, boundary tolerance, capacity and lag are separate steps; tuning duration scores alone does not complete streaming calibration.
+
+The implemented mask is not Masked Transformer’s hard/learned confidence mixture. See `docs/membership_gate.md` §1.5 for the equations and the distinction. No self-box mask BCE is used.
 
 ## Key design decisions
 
@@ -388,10 +409,10 @@ One line each; the full argument lives at the pointer.
 - **Sentence reconstruction merges caption cues, never splits them**; unresolvable units are quarantined (`reliable=False`, frames UNK). Changing it changes ground truth. → `docs/data_pipeline.md`
 - **Cross-split de-duplication is train-side** (decontamination convention); the split CSV is mandatory. → `configs/data.yaml`
 - **Wrong-language videos are dropped per video by non-Latin script share** (`max_non_latin_ratio`). → `docs/data_pipeline.md` §5b
-- **Segmentation reference loss**: stage 2 mixes GT CE + Dice with KL to a saved reference of the same architecture. The reference is fixed between dev-selected updates. This is output regularization, not a hard limit on model quality. → `configs/dlm.yaml`
+- **BIO loss**: class-weighted CE plus binary signing Dice in S1 and joint training. Caption loss also updates shared temporal features and the BIO classifier through first-span membership.
 - **Terminator = first O-or-B, never "closing O"** — back-to-back sentences have no gap; same rule at training and inference. → spec §5.3
-- **Semi-Markov duration decode is inference-time**: split reward = `split_bias + w·logit P(B)` (discriminative emission; `w=0` is the ablation). Two switches, two estimators: `duration_decode_s1` for whole-video decodes (cascade row 6, offline row 7, segmenter-eval) and `duration_decode_s1_stream` for the right-censored FSM buffer (row 8, the gate's anchor decode, delta-enc), each selected on dev by its own stage (tune-decode / tune-stream). → `docs/implementation_notes.md`
-- **The membership gate is the coupling** — the only decode-time channel between the heads; query-independent bias, not a mask; the anchor is the head's own span, teacher-forced to the GT span in training when it neither covers nor overlaps the target (tIoU < 0.5, rate logged); a span that covers the target keeps it and its target text becomes every sentence inside it; Ω reads detached logits; γ stop-gradiented. → `docs/membership_gate.md`
+- **Decoder controls**: compare plain and enhanced decoding on both heads from the same logits. Use the enhanced Moryossef cascade as the external comparison and the online S1 cascade for the joint-training control.
+- **First-span coupling**: training sums valid-path probabilities before forming Ω. It does not select a hard training boundary or replace the predicted mask with a GT interval. GT determines whether the training view has a complete or open target, not its predicted boundaries.
 - **S1 pretrains competence before coupling**, pooled, under the designed corruption; both stages share one window distribution. Measured (`segmenter-errors`) calibration is an ablation, not the recipe. → `configs/bio_pretrain.yaml`
 - **The confidence-bound term is Mode-2a only** — the FSM never decodes the other truncation states. → spec §5
 - **Best-checkpoint monitor**: clean floor = dev BLEU (not the composite `val_loss`, which rises while BLEU still climbs); gated arms = dev BLEU as well (`val_translation_bleu4`), with `val_phrase_tiou_f1` logged beside it so a decaying head is visible.
@@ -405,11 +426,11 @@ One line each; the full argument lives at the pointer.
 backbones/   Uni-Sign 69-kp 4-part ST-GCN (UniSignPoseEncoder)
 poses/       normalize_keypoints_unisign (133→69) · pose_io (load_pose_window, per-video fps) · augmentation
 data/        loader (YouTube-SL-25 + pooling + dedup) · windowing (BIO, first-complete-span, χ) · jitter · batch
-models/      block_diffusion · dmax (OPUT + SPD/DCD) · membership_gate (Ω) · front_end · unisign ·
+models/      block_diffusion · dmax (OPUT + SPD/DCD) · membership_gate (soft first-span Ω) · front_end · unisign ·
              streaming_slt (MisalignedSLTModel) · bio_head
-train/       slt (AR/DLM trainer) · bio_pretrain (S1) · sampler (window modes) · losses (Dice+CE, KL-to-S1, CB) · helpers
+train/       slt (AR/DLM trainer) · bio_pretrain (S1) · sampler (window modes) · losses (Dice+CE, CB) · helpers
 moryossef26/ faithful external segmenter (raw-kp UNet): model · dataset · trainer · infer. NOT the FSM head.
-infer/       commit_gate · duration_decode (semi-Markov re-split) · decode (SPD+DCD) · stream (FSM) · stability
+infer/       duration_decode (semi-Markov BIO Viterbi) · commit_gate · decode (SPD+DCD) · stream (FSM) · stability
 metrics.py   BIO monitor · tIoU segments · text metrics (declared scoring level)
 utils.py     load_yaml (extends, ${language}, ${corpus}) · checkpoint_dir · pick_device
 train.py     --stage {smoke-data, train-bio, train-moryossef, train-slt}
@@ -432,22 +453,20 @@ docs/        membership_gate.md · data_pipeline.md · run_real_data.md · imple
 | `baseline_train.yaml`     | trains the clean floor: mode1-only, ~0 jitter, `lambda_bio: 0`                          | `extends: baseline_eval.yaml`                    |
 | `bio_pretrain.yaml`       | S1 pooled segmentation pretraining (`train-bio`)                                        | `extends: dlm.yaml` (shared window distribution) |
 | `moryossef26.yaml`        | external Moryossef segmenter (`train-moryossef`)                                        | standalone                                       |
-| `inference.yaml`          | FSM constants (frozen, measured), `duration_decode_<arch>` + `duration_decode_s1_stream` triples, commit lag | —                                                |
 | `data.yaml` / `eval.yaml` | corpora, splits, `target_lang`, `pretrained_slt`, subtitle pipeline / RQ grids          | —                                                |
 
 Per-language constants, in the order B1 derives them (`--write-config` writes each):
 
 | constant                          | source                                                                                                                               | writes                               |
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------ |
-| `duration_decode_s1` triple       | B1a `tune-decode --segmenter-arch s1` (two dev folds; quote held-out)                                                                | `inference.yaml`                     |
-| `duration_decode_s1_stream` triple, `commit_lag_s` | B1a' `tune-stream --segmenter-arch s1` (the FSM itself, segmentation-only, two dev folds; snap and w inherited from B1a) | `inference.yaml` per-language rows |
-| `delta_enc_frames` (δ), Λ_min=δ+1 | B1b `delta-enc` (S1 head, deployed decode; re-run once if Λ_min changed)                                                             | `inference.yaml` per-language row    |
-| `buffer_cap_s`                    | B1c `buffer-cap --split train` = train-split p99 + stride + δ/fps (label-only, model-free; runs after delta-enc)                     | `inference.yaml`                     |
-| `duration_decode_moryossef`       | B4a `tune-decode --segmenter-arch moryossef` (baseline eval + RQ2 rows 4/5 only)                                                     | `inference.yaml`                     |
+| `duration_model` | B1a `tune-decode`: train duration fit and dev decoder selection | `inference.yaml`, per head/language |
+| `delta_enc_frames` (δ), Λ_min=δ+1 | B1a `delta-enc` (S1 head, deployed decode; re-run once if Λ_min changed)                                                             | `inference.yaml` per-language row    |
+| `commit_lag_s` | B1c `tune-stream --segmenter-arch s1` on dev, lag only | `inference.yaml` per-language row |
+| `buffer_cap_s`                    | B1b `buffer-cap --split train` = train-split p99 + stride + δ/fps (label-only, model-free; runs after delta-enc)                     | `inference.yaml`                     |
 | `bio_class_weights`               | `balanced` — resolved from measured label counts at train start, logged                                                              | automatic                            |
-| pooled S1 context                 | `bio_pretrain.yaml pretrain_geometry.buffer_cap_s: auto` = max over the pool of train p99 + stride + 1 s (>= every deployed cap by construction; a number is an explicit override); the trained value is pinned in checkpoint meta and B1c refuses a cap above it | train-bio, automatic |
+| pooled S1 context                 | `bio_pretrain.yaml pretrain_geometry.buffer_cap_s: auto` = max over the pool of train p99 + stride + 1 s (covers deployed caps when δ/fps ≤ 1 s; a number is an explicit override); the trained value is pinned in checkpoint meta and B1b refuses a cap above it | train-bio, automatic |
 
-Rules that are not optional: run delta-enc before buffer-cap (the cap reads δ); buffer-cap runs on the train split (label-only constants are measured on train, model-dependent constants are selected on dev; the stage refuses any other split). One shared `inference.yaml` serves every language — the measured constants live in PER-LANGUAGE rows (like `duration_decode_<arch>`), resolved for the active language at load and refused loudly when the row is missing; the gate's δ/Λ_min are derived from the resolved rows, so there is no per-language config pair to maintain and no mirror to drift. A `buffer_cap_s` change never re-chunks an already-trained head — the checkpoint's `rope_eval_chunk_s` wins for that head's evaluation.
+Rules that are not optional: run tune-decode before delta-enc, then delta-enc before buffer-cap (the cap reads δ); buffer-cap runs on the train split (label-only constants are measured on train, model-dependent constants are selected on dev; the stage refuses any other split). One shared `inference.yaml` serves every language — the measured constants live in PER-LANGUAGE rows (delta, minimum span, capacity and commit lag), resolved for the active language at load and refused loudly when the row is missing; the gate's δ/Λ_min are derived from the resolved rows, so there is no per-language config pair to maintain and no mirror to drift. A `buffer_cap_s` change never re-chunks an already-trained head — the checkpoint's `rope_eval_chunk_s` wins for that head's evaluation.
 
 Watch `gate_anchor_hit_rate` during stage-2 training (the head's own closed span at tIoU ≥ 0.5 with the GT target, over windows that have one): at S1's level and steady = S1 delivered a usable policy and joint training keeps it. Falling = the head is decaying; find the cause before spending more GPU.
 
@@ -463,6 +482,35 @@ Watch `gate_anchor_hit_rate` during stage-2 training (the head's own closed span
 
 The reference Moryossef code uses different landmarks and shoulder/mean-std normalization. Our model uses the Uni-Sign input transform.
 A Moryossef checkpoint trained with boxes computed from individual chunks needs retraining for the whole-video-box training contract.
-Re-tune affected whole-video decode settings on dev after a normalization change. Regenerate segmenter spans and dependent cascade results.
+Regenerate affected segmenter spans after a normalization change. For S1 or joint-model changes, recheck the B1 calibration before training dependent arms.
 Streaming calibration must use buffer normalization. No comparison requires equal crop boxes across models with different training inputs.
 See [implementation notes](docs/implementation_notes.md) for the current contracts and [membership gate](docs/membership_gate.md) for the loss and gradient paths.
+
+## Reruns for the shared temporal / first-span architecture
+
+| Stage | Required action |
+| --- | --- |
+| Pooled S1 | Existing weights are compatible. Rerun its evaluation and per-language B1 calibration. Retrain only if selecting a new S1 checkpoint. |
+| Moryossef | No architecture change in this update. If its training normalization is unchanged, keep the checkpoint and its own calibration. |
+| Clean translator | Keep it if its input normalization and training capacity are unchanged. A changed B1b capacity can require retraining. |
+| AR and DLM | Train both from S1 plus the clean translation warm start in fresh directories. Do not resume a checkpoint from another architecture. |
+| Evaluation | Regenerate S1 spans, online S1 cascade, joint offline/online events and the joint RQ1 curves. Use one clean translator for the cascade rows. |
+
+B1 runs per language for ase, asf and bfi. Archive result files before reusing their output paths.
+S1 tuning no longer writes duration parameters. `tune-stream` writes only `commit_lag_s`.
+The same first-span probabilities condition captioning during training and streaming. Externally supplied spans are explicit fixed-boundary controls.
+
+Names and runtime-only changes preserve checkpoint weights, duration scores and the loss. A run that already uses the current mapper, duration model and CB recipe can resume from `latest.pt` with the same settings. No recalibration is needed for these changes; the runbook order is unchanged.
+
+The duration calibration fingerprint hashes the numerical parameters only. If an existing saved fingerprint is rejected after a fingerprint-format change, rerun B1 `delta-enc --split dev --write-config` with the same checkpoint and settings. The hash change alone requires no decoder tuning or retraining. If the measured tolerance changes, follow the usual dependent capacity/lag steps.
+
+
+## Ground truth during evaluation
+
+The inference gate accepts no GT labels or spans. Its separate `for_supervision` method uses annotations only for train/dev loss and diagnostics.
+RQ1 uses GT to construct crops and score predictions, but passes no reference-derived frontier or known-start flag. Generated dev captions also receive no sampler commit mask.
+Streaming uses the FSM's own commit history. The GT-span cascade rows are declared oracle controls; model-generated offline spans remain predictions.
+See [membership gate §3.0](docs/membership_gate.md#30-ground-truth-access) for the access rules.
+
+After this evaluation-state correction, rerun joint RQ1 and generated-dev caption scores before reporting them. Existing fixed-checkpoint streaming events and segmentation scores do not change because of this correction. The training loss, S1, clean translator and decoder calibration are unchanged.
+The corrected dev monitor can select a different checkpoint. Re-evaluate saved candidates under the same corrected protocol; do not compare its scores with a cached best score from reference-assisted conditioning. Resume checks record `validation_conditioning` and refuse that incompatible selection history. Keep trained weights; use a separate checkpoint directory for any continuation under the corrected selection protocol.
