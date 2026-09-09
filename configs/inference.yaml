@@ -1,33 +1,5 @@
 stride_s: 1.0
-# Semi-Markov duration decode (infer/duration_decode.py). One block per (segmenter, regime), named for the
-# `--segmenter-arch` value, so the block a run reads is derivable from its command line:
-#   duration_decode_s1        -> the in-system head decoding a WHOLE video (offline row 7, the S1 cascade row 6,
-#                                S1's segmenter-eval, tune-stream's snap/w anchor). Selected by tune-decode.
-#   duration_decode_s1_stream -> the same head inside the FSM, where the buffer's last sentence is right-censored:
-#                                the streaming FSM, the membership gate's anchor decode (training + inference), RQ1
-#                                gated windows, delta-enc. Selected by tune-stream. Different estimator, own triple.
-#   duration_decode_moryossef -> the external baseline segmenter. Error calibration, segmenter-eval, and the RQ2
-#                                cascade's upstream segmenter. Nothing deployed reads it.
-duration_decode_s1:
-    default: false
-    ase: {split_bias: 7.25, snap_radius_s: 0.0, boundary_logit_weight: 0.75}  # outputs/tune_decode_s1_ase_dev.json
-    asf: {split_bias: 10.0, snap_radius_s: 0.5, boundary_logit_weight: 2.0}   # outputs/tune_decode_s1_asf_dev.json
-    bfi: {split_bias: 7.0, snap_radius_s: 1.0, boundary_logit_weight: 0.75}   # outputs/tune_decode_s1_bfi_dev.json
-    # Valid at the checkpoint's pinned rope_eval_chunk_s AND under per-chunk pose normalization of the whole-video pass
-    # (models.bio_head.chunk_normalized_logits) — re-tune if S1 is retrained or that normalization changes.
-# The FSM's OWN triple, selected UNDER THE STREAMING DECODE (analyze.py --stage tune-stream): the buffer's last sentence
-# is right-censored, so the same split_bias is far more permissive than in the whole-video decode above. Read by the
-# FSM, the gate's anchor decode (training and eval) and delta-enc; missing row -> the whole-video triple, with a note.
-duration_decode_s1_stream:
-    default: false
-    ase: {split_bias: 0.0, snap_radius_s: 0.0, boundary_logit_weight: 0.0}    # outputs/tune_stream_s1_ase_dev.json
-    asf: {split_bias: 9.0, snap_radius_s: 0.5, boundary_logit_weight: 2.0}    # outputs/tune_stream_s1_asf_dev.json
-    bfi: {split_bias: 0.0, snap_radius_s: 0.0, boundary_logit_weight: 0.0}    # outputs/tune_stream_s1_bfi_dev.json
-duration_decode_moryossef:
-    default: false
-    ase: {split_bias: 8.25, snap_radius_s: 1.0, boundary_logit_weight: 2.0}   # outputs/tune_decode_moryossef_ase_dev.json
-    asf: {split_bias: 8.0, snap_radius_s: 1.5, boundary_logit_weight: 2.0}    # outputs/tune_decode_moryossef_asf_dev.json
-    bfi: {split_bias: 7.25, snap_radius_s: 1.5, boundary_logit_weight: 2.0}   # outputs/tune_decode_moryossef_bfi_dev.json
+# The in-system S1/joint head uses one duration-aware BIO model for Viterbi and first-span marginals.
 # Measured on the TRAIN split by `analyze.py --stage buffer-cap --split train --write-config` (p99 train sentence
 # duration + stride_s + δ/fps, reliable sentences only; run after delta-enc). Label-only constants are measured on
 # train, model-dependent constants are selected on dev. That stage is the only writer of these rows.
@@ -35,7 +7,15 @@ buffer_cap_s:
     ase: 29.08
     asf: 31.01
     bfi: 35.72
+# Shared hard/soft duration scores. tune-decode writes each complete per-language model.
+# Untuned languages stay absent; joint training refuses to borrow another language's settings.
+duration_model:
+    moryossef:
+    s1:
+        asf: {"mu_log_s": 1.7800481900540717, "sd_log_s": 0.7644972669361924, "tail_start_s": 29.679959999999955, "completion_bias": 5.0, "boundary_logit_weight": 2.0}
 boundary_stability:
+    # delta-enc records which duration model was measured; stage 2 refuses a stale tolerance.
+    duration_model_signature:
     # delta_enc_frames (δ) plays 3 coupled roles, all tied to the BIO head's boundary-noise floor (analyze.py
     # delta-enc writes the measured value here):
     #   1. terminator-stability tolerance: commit condition 1 = the target span's terminator (first O-or-B —
@@ -50,10 +30,7 @@ boundary_stability:
         asf: 8
         bfi: 21
     hysteresis_strides: 3 # K: strides the terminator must hold still (spec §7.3, k ≈ 2–3); a DESIGN constant, shared
-    # Fixed commit lag (seconds) for a terminator DECIDED BY DURATION (a B placed by the re-split): the causal split decision
-    # depends on frames not yet seen, so it commits only once the buffer extends this far past it — fixed-lag decoding, as in
-    # streaming ASR. An O terminator (a real pause) commits without lag. Selected on dev by tune-stream together with the
-    # streaming split bias; 0 = commit as soon as hysteresis passes.
+    # Fixed lag for B terminators. O terminators need no extra lag. Selected on dev by the lag-only tune-stream stage.
     commit_lag_s:
         ase: 0.0
         asf: 4.0

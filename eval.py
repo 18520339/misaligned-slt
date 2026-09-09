@@ -23,13 +23,13 @@ from data.batch import frame_mask_for, repeat_last_frame
 
 from transformers import T5Tokenizer, AutoTokenizer
 from models.bio_head import chunk_normalized_logits
+from infer.duration_decode import DurationModel, DurationDecoder
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, load_unisign_pretrained, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel
 from models.checkpointing import load_checkpoint_meta, load_model_checkpoint
 
-from moryossef26.infer import duration_decode_tags, evaluate_segmenter_whole_video
+from moryossef26.infer import evaluate_segmenter_whole_video
 from infer.stream import S1RunnerAdapter, StreamingSLTRunner
-from infer.duration_decode import STREAM_DECODE_KEY, duration_decode_params, fit_duration_prior, streaming_decode_params
 from infer.stability import TAU_GRID, group_tracks, build_policies, score_policy
 from metrics import (
     Segment, densevid_text_metrics, match_segments, temporal_iou, 
@@ -382,40 +382,9 @@ def _method_config_path(args: argparse.Namespace) -> str:
     return str(args.method_config) if args.method_config else METHOD_CONFIGS[args.method]
 
 
-def _attach_duration_prior(model, language: str, data_cfg: dict, inference_cfg: dict | None) -> None:
-    """Attach the deployed semi-Markov duration prior (inference.yaml `duration_decode`, per language).
-
-    `build_gate_omega` re-splits tags with `model.duration_prior` before picking the Ω anchor, so None here while
-    segmentation duration-decodes makes the GATE off-policy: Ω anchored on raw-argmax merged runs, emitted spans
-    duration-split. Every gated RQ2 row routes through here; no-op if the switch is off or the attr is absent."""
-    if not hasattr(model, "duration_prior"): return
-    # The gate's anchor decode is the streaming (censored-tail) decode, so it deploys the FSM's triple.
-    dd, _ = streaming_decode_params(inference_cfg or {}, language)
-    if dd is None:
-        model.duration_prior = None
-        return
-    train_records, _ = load_language_records(data_cfg, language, split="train")
-    model.duration_prior = fit_duration_prior(train_records, **dd)
-
-
-def _streaming_geometry(args, inference_cfg: dict, method_cfg: dict) -> dict:
-    # Resolve 1 geometry for the emitting arm and its online S1 comparator.
-    s1 = str(getattr(args, "segmenter_arch", "moryossef")) == "s1"
-    checkpoint = getattr(args, "match_geometry", None) if s1 else args.checkpoint or checkpoint_dir(method_cfg, default="")
-    if s1 and not getattr(args, "no_translate", False) and not checkpoint:
-        raise SystemExit("Online S1 cascade needs --match-geometry <arm checkpoint> for the comparison.")
-    if s1 and checkpoint:
-        if not Path(checkpoint).exists(): raise FileNotFoundError(f"Missing comparison checkpoint: {checkpoint}")
-        meta = load_checkpoint_meta(checkpoint)
-        gate = meta.get("gate") or {}
-        if meta.get("buffer_cap_s") is None or gate.get("delta") is None or gate.get("min_span_frames") is None or "stream_decode" not in meta:
-            raise ValueError("Comparison checkpoint must record cap, delta, minimum span and streaming decode.")
-    return _apply_stamped_geometry(inference_cfg, checkpoint, args.language)
-
-
-def _apply_stamped_geometry(inference_cfg: dict, checkpoint: str | Path | None, language: str) -> dict:
-    """Deploy a trained arm under the gate geometry it TRAINED with (train/slt._training_meta: delta, Lambda_min, the streaming
-    triple). A later delta-enc / tune-stream rewrite of inference.yaml must not silently change how a finished arm is gated."""
+def _apply_stamped_geometry(inference_cfg: dict, checkpoint: str | Path | None) -> dict:
+    """Deploy a trained arm under the gate geometry it TRAINED with (train/slt._training_meta: delta, Lambda_min, buffer capacity). 
+    A later delta-enc / tune-stream rewrite of inference.yaml must not silently change how a finished arm is gated."""
     meta = load_checkpoint_meta(checkpoint) if checkpoint and Path(str(checkpoint)).exists() else {}
     gate = (meta or {}).get("gate") or {}
     out, notes = dict(inference_cfg), []
@@ -430,22 +399,38 @@ def _apply_stamped_geometry(inference_cfg: dict, checkpoint: str | Path | None, 
         block[name] = int(value)
 
     out["boundary_stability"], out["span_selection"] = bs, ss
-    if "stream_decode" in meta:
-        stamped, live = meta["stream_decode"], streaming_decode_params(out, language)[0]
-        if live != stamped: notes.append(f"{STREAM_DECODE_KEY} {live} -> {stamped}")
-        out[STREAM_DECODE_KEY] = {"default": False, str(language): dict(stamped) if isinstance(stamped, dict) else False}
     if notes: print(f"[eval] gate geometry from the checkpoint's training meta ({'; '.join(notes)}); "
                     f"the live inference.yaml differs — retrain to deploy new constants.", flush=True)
     return out
 
 
-def _build_eval_model(
-    method: str, checkpoint: str | None, language: str, data_cfg: dict, method_cfg: dict, 
-    device: torch.device, inference_cfg: dict | None = None,
-):
-    """Uni-Sign pose-only model. LM (`language_model.name`) and checkpoint (`checkpoint.from_pretrained` /
-    `checkpoint.dir`) both come from the METHOD config — no separate stage-1 config. Plain scalars so
-    analyze/visualize need no fake Namespace. `inference_cfg` gives the gate the deployed duration prior."""
+def _streaming_geometry(args, inference_cfg: dict, method_cfg: dict) -> dict:
+    # Resolve 1 geometry for the emitting arm and its online S1 comparator.
+    s1 = str(getattr(args, "segmenter_arch", "moryossef")) == "s1"
+    checkpoint = getattr(args, "match_geometry", None) if s1 else args.checkpoint or checkpoint_dir(method_cfg, default="")
+    if s1 and not getattr(args, "no_translate", False) and not checkpoint:
+        raise SystemExit("Online S1 cascade needs --match-geometry <arm checkpoint> for the comparison.")
+    if s1 and checkpoint:
+        if not Path(checkpoint).exists(): raise FileNotFoundError(f"Missing comparison checkpoint: {checkpoint}")
+        meta = load_checkpoint_meta(checkpoint)
+        gate = meta.get("gate") or {}
+        if meta.get("buffer_cap_s") is None or gate.get("delta") is None or gate.get("min_span_frames") is None:
+            raise ValueError("Comparison checkpoint must record cap, delta and minimum span.")
+    return _apply_stamped_geometry(inference_cfg, checkpoint)
+
+
+def _build_eval_model(method: str, checkpoint: str | None, language: str, data_cfg: dict, method_cfg: dict, device: torch.device):
+    """Uni-Sign pose-only model. LM (`language_model.name`) and checkpoint (`checkpoint.from_pretrained` / `checkpoint.dir`) both 
+    come from the METHOD config — no separate stage-1 config. Plain scalars so analyze/visualize need no fake Namespace."""
+    if method != "baseline":
+        ckpt = Path(checkpoint or checkpoint_dir(method_cfg, default="") or "")
+        if not ckpt.exists(): raise FileNotFoundError(f"Missing checkpoint for {method}: {ckpt}")
+        meta = load_checkpoint_meta(ckpt)
+        expected = {"architecture": "shared_temporal_slt", "decoder": method,
+                    "language": language, "segmentation_decode": "semi_markov_viterbi"}
+        for key, value in expected.items():
+            if meta.get(key) != value: raise ValueError(f"{ckpt}: expected {key}={value!r}, found {meta.get(key)!r}")
+        duration = DurationModel(**meta["duration_model"])
     target_lang = data_cfg["languages"][language].get("target_lang")
     prompt_lang = prompt_lang_for_target(target_lang)
     lm_name = language_model_name(method_cfg)
@@ -457,8 +442,7 @@ def _build_eval_model(
         tokenizer = T5Tokenizer.from_pretrained(mt5_name, legacy=False)
         front_end = UniSignMT5FrontEnd(mt5_name=mt5_name, prompt_lang=prompt_lang, tokenizer=tokenizer, init_mt5_weights=False)
         model = MisalignedSLTModel(
-            front_end=front_end, tokenizer=tokenizer, decoder="ar", 
-            bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384))
+            front_end=front_end, decoder="ar", bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)), shared_temporal=False
         )
         # Released ckpt ONLY — no `checkpoint.dir` fallback, so a concurrent train-slt run can't slip trained
         # weights in. Retained languages use OpenASL or their in-domain clean baseline.
@@ -470,8 +454,8 @@ def _build_eval_model(
         rep = load_unisign_pretrained(model, ckpt, strict=True)
         print(f"[unisign] loaded {ckpt.name}: {rep['pose_tensors']} pose + {rep['mt5_tensors']} LM tensors (missing "
               f"{rep['pose_missing'] + rep['mt5_missing']}, unexpected {rep['pose_unexpected'] + rep['mt5_unexpected']})", flush=True)
+        model.bio_branch_off = True
         model.to(device); model.eval()
-        _attach_duration_prior(model, language, data_cfg, inference_cfg)
         return model, tokenizer
 
     # Trained ar / dlm: same pose encoder + prompt, only the LM differs (clean mT5-vs-mBART ablation).
@@ -485,8 +469,7 @@ def _build_eval_model(
     # four at code defaults, so any config change silently gives eval a different architecture than training —
     # and the strict=False load below would absorb the mismatch as "missing keys" without a word.
     model = MisalignedSLTModel(
-        front_end=front_end, tokenizer=tokenizer,
-        decoder="ar" if method == "ar" else "dlm",
+        front_end=front_end, decoder="ar" if method == "ar" else "dlm",
         bio_hidden_dim=int(method_cfg.get("bio_hidden_dim", 384)),
         bio_depth=int(method_cfg.get("bio_depth", 4)),
         bio_nhead=int(method_cfg.get("bio_nhead", 8)),
@@ -494,23 +477,9 @@ def _build_eval_model(
         bio_conv_stem_layers=int(method_cfg.get("bio_conv_stem_layers", 2)),
         block_size=int(method_cfg.get("block_size", 8)),
     )
-    ckpt = Path(checkpoint or checkpoint_dir(method_cfg, default="") or "")
-    if not ckpt.exists(): raise FileNotFoundError(f"Missing checkpoint for {method}: {ckpt}. Train the method first or pass --checkpoint.")
-
-    # strict=False is deliberate (an ar checkpoint has no dlm decoder and vice versa), but the report must be READ:
-    # a silently half-loaded model evaluates a partly-random network and reports it as a result.
-    missing, unexpected = load_model_checkpoint(model, ckpt, strict=False)
-    core_missing = [k for k in missing if k.startswith(("bio_head.", "front_end.pose_encoder."))]
-    if core_missing: raise RuntimeError(
-        f"{ckpt} did not supply {len(core_missing)} core tensor(s) (e.g. {core_missing[:3]}). The eval model's "
-        f"shape disagrees with the checkpoint — check the bio_* / block_size keys in the method config."
-    )
-    if missing or unexpected: print(
-        f"[eval] {ckpt.name}: {len(missing)} missing, {len(unexpected)} unexpected tensor(s) "
-        f"(expected across decoder arms; core pose/BIO tensors verified present).", flush=True
-    )
+    load_model_checkpoint(model, ckpt, strict=True)
+    model.duration_model = duration
     model.to(device); model.eval()
-    _attach_duration_prior(model, language, data_cfg, inference_cfg)
     return model, tokenizer
 
 
@@ -556,8 +525,6 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
         "gate_enabled": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
         # Fallbacks mirror the RQ2 runner: delta from the measured noise floor, Lambda_min from it (delta+1),
         # never 0 — a 0 floor re-admits 1-frame flicker spans in exactly 1 of 2 eval paths.
-        "gate_delta": int(method_cfg.get("membership_gate", {}).get("delta",
-                          inference_cfg.get("boundary_stability", {}).get("delta_enc_frames", 3))),
         "gate_eps": float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
         "gate_min_span_frames": int(method_cfg.get("membership_gate", {}).get("min_span_frames", lambda_min_frames(inference_cfg))),
     }
@@ -567,8 +534,7 @@ def _generation_kwargs(method: str, inference_cfg: dict, method_cfg: dict, max_t
 def _translate_windows(
     model, tokenizer, method: str, items: list[tuple[np.ndarray, np.ndarray, float]], device: torch.device,
     inference_cfg: dict, method_cfg: dict, batch_size: int | None = None, stream_start: bool = False,
-    commit_frontier_s: list[float] | None = None, use_duration_prior: bool | None = None,
-    anchor_frames: list[tuple[int, int] | None] | None = None,
+    commit_frontier_s: list[float] | None = None, anchor_frames: list[tuple[int, int] | None] | None = None,
 ) -> list[tuple[str, float, bool]]:
     """Pre-trimmed pose windows -> [(text, mean_token_confidence, gate_would_skip)]. The loop-decode entry point:
     ONE `generate_from_poses` path for every method.
@@ -580,8 +546,7 @@ def _translate_windows(
     if batch_size is not None and int(batch_size) < len(items):
         out: list[tuple[str, float, bool]] = []
         for i in range(0, len(items), max(1, int(batch_size))): out.extend(_translate_windows(
-            model, tokenizer, method, items[i:i + max(1, int(batch_size))], device, 
-            inference_cfg, method_cfg, stream_start=stream_start, use_duration_prior=use_duration_prior,
+            model, tokenizer, method, items[i:i + max(1, int(batch_size))], device, inference_cfg, method_cfg, stream_start=stream_start,
             commit_frontier_s=commit_frontier_s[i:i + max(1, int(batch_size))] if commit_frontier_s else None,
             anchor_frames=anchor_frames[i:i + max(1, int(batch_size))] if anchor_frames else None,
         ))
@@ -589,6 +554,7 @@ def _translate_windows(
     visual_padding = str(method_cfg.get("visual_padding", "none"))
     prepped = [_prep_window(p, ts, start_s, visual_padding) for (p, ts, start_s) in items]
     max_t = max(int(p.shape[0]) for p, _, _ in prepped)
+    
     # Same repeat-last-frame pad + frame-mask contract as the training collator (data.batch).
     poses = torch.stack([repeat_last_frame(p, max_t - int(p.shape[0])) for p, _, _ in prepped]).to(device)
     timestamps = torch.stack([torch.nn.functional.pad(ts, (0, max_t - int(ts.shape[0]))) for _, ts, _ in prepped]).to(device)
@@ -603,7 +569,6 @@ def _translate_windows(
     if gen_kwargs.get("gate_enabled"):
         gen_kwargs["gate_stream_start"] = bool(stream_start)
         # Parity: training and the FSM re-split every window with the streaming prior before anchoring Ω, so every reported row does.
-        gen_kwargs["gate_use_duration_prior"] = True if use_duration_prior is None else bool(use_duration_prior)
         if anchor_frames is not None:   # window-relative (start, terminator) frames the caller emits; -1 = decode the anchor
             if visual_padding != "none": raise NotImplementedError("anchor_frames assume visual_padding: none")
             gen_kwargs["gate_anchor"] = torch.tensor([list(a) if a else [-1, -1] for a in anchor_frames], dtype=torch.long, device=device)
@@ -666,8 +631,8 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     records_by_id = {record.video_id: record for record in records}
     device = pick_device(args.device)
     inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
-    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""), args.language)
-    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
+    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     
     # Length-sorted batches keep padding minimal.
     materialized: list[tuple[ControlledWindow, np.ndarray, np.ndarray]] = []
@@ -681,28 +646,14 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     grouped: dict[tuple[float, float], dict[str, list]] = {}
     rows = []
 
-    # Mint the stream-start onset only when frame 0 is the realized sentence onset. A positive head offset has removed that onset; 
-    # a negative offset starts in leading context. Partition before batching so this flag is row-invariant.
-    _rq1_stream_start = lambda delta_head_s: abs(float(delta_head_s)) <= 1e-6
-    partitions = [
-        ([m for m in materialized if  _rq1_stream_start(m[0].delta_head_s)], True),
-        ([m for m in materialized if not _rq1_stream_start(m[0].delta_head_s)], False),
-    ]
-    chunks = []
-    for part, is_stream_start in partitions:
-        part.sort(key=lambda wp: int(wp[1].shape[0]))
-        chunks += [(part[s : s + batch_size], is_stream_start) for s in range(0, len(part), batch_size)]
-
-    for chunk, is_stream_start in tqdm(chunks, desc="Translating windows"):
+    # GT constructs and scores the controlled windows; the decoder receives no reference-derived frontier or onset flag.
+    materialized.sort(key=lambda wp: int(wp[1].shape[0]))
+    chunks = [materialized[s:s + batch_size] for s in range(0, len(materialized), batch_size)]
+    for chunk in tqdm(chunks, desc="Translating windows"):
         results = _translate_windows(
             model=model, tokenizer=tokenizer, method=args.method,
             items=[(poses, timestamps, w.window_start_s) for (w, poses, timestamps) in chunk], device=device,
-            inference_cfg=inference_cfg, method_cfg=method_cfg, stream_start=is_stream_start,
-            # chi for a lead-in window: frames before the sentence onset are the predecessor's tail, already handled — the same commit 
-            # frontier run_offline supplies. Without it a lead-in window on back-to-back pair has an unopenable leading I-run (buffer-start 
-            # I never opens, no chi mint), so Omega anchors on merged predecessor+target run and gated arms are scored on a mis-anchored 
-            # decode while ungated baseline is untouched. delta_head_s < 0 means the window opens that far before the onset.
-            commit_frontier_s=[max(0.0, -float(w.delta_head_s)) for (w, _p, _t) in chunk],
+            inference_cfg=inference_cfg, method_cfg=method_cfg,
         )
         for (window, _poses, _ts), (prediction, confidence, gate_skip) in zip(chunk, results):
             key = (window.grid_head, window.grid_tail)  # group by grid coordinate (fraction in relative mode)
@@ -766,9 +717,8 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
                              if args.method == "baseline" else 1,
                 "gate": bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
                 "checkpoint": getattr(args, "checkpoint", None),
-                # The gate re-splits every controlled window with the streaming triple (parity with training and the FSM);
-                # held constant across the sweep, recorded because a grid swept under a varying gate is not a degradation curve.
-                "duration_decode": streaming_decode_params(inference_cfg, args.language)[0], "gate_use_duration_prior": True,
+                "segmentation_decode": "none" if args.method == "baseline" else "semi_markov_viterbi",
+                "conditioning_state": "predicted_from_window",
             },
             "windows": len(rows), "severity": severity, "rows": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -776,15 +726,14 @@ def run_rq1(args: argparse.Namespace) -> "pd.DataFrame":
     return pd.json_normalize(severity, sep=".").T # one row per (grid_head, grid_tail) severity point
 
 
-def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, duration_prior=None, translate: bool = True, cascade_model=None):
+def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, translate: bool = True, cascade_model=None):
     trans = inference_cfg.get("translation", {})
     dcd = {**method_cfg.get("dcd", {}), **trans.get("dcd", {})}  # same per-key merge as _generation_kwargs
     spd = method_cfg.get("spd", {})
     boundary = inference_cfg.get("boundary_stability", {})
 
     return StreamingSLTRunner(
-        model,
-        stride_s=float(inference_cfg.get("stride_s", 1.0)),
+        model, stride_s=float(inference_cfg.get("stride_s", 1.0)),
         buffer_cap_s=float(inference_cfg.get("buffer_cap_s", 18.0)),
         delta_enc_frames=int(boundary.get("delta_enc_frames", 3)),
         hysteresis_strides=int(boundary.get("hysteresis_strides", 3)),
@@ -795,7 +744,6 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         forced_tail_policy=str(inference_cfg.get("forced_tail_policy", "skip")),
         # Ω from the method config's membership_gate; χ from the runner's commit log.
         gate_enabled=bool(method_cfg.get("membership_gate", {}).get("enabled", False)),
-        gate_delta=int(method_cfg.get("membership_gate", {}).get("delta", boundary.get("delta_enc_frames", 3))),
         gate_eps=float(method_cfg.get("membership_gate", {}).get("eps", 1e-4)),
         max_text_tokens=int(trans.get("max_text_tokens", method_cfg.get("max_text_tokens", 128))),
         diffusion_steps=int(trans.get("diffusion_steps", method_cfg.get("diffusion_steps", 64))),
@@ -817,8 +765,7 @@ def _build_streaming_runner(model, inference_cfg: dict, method_cfg: dict, durati
         dcd_sample_top_k=None if dcd.get("top_k") is None else int(dcd.get("top_k")),
         dcd_top_p=None if dcd.get("top_p") is None else float(dcd.get("top_p")),
         decode_conditioning=str(trans.get("decode_conditioning", "window")),
-        duration_prior=duration_prior, translate=bool(translate), cascade_model=cascade_model,
-        commit_lag_s=float(boundary.get("commit_lag_s", 0.0) or 0.0),
+        translate=bool(translate), cascade_model=cascade_model, commit_lag_s=float(boundary.get("commit_lag_s", 0.0) or 0.0)
     )
 
 
@@ -853,35 +800,21 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             if int(getattr(args, "num_beams", None) or method_cfg.get("validation", {}).get("num_beams", 1)) != 1:
                 raise ValueError("The online cascade and streaming arms use greedy decoding (num_beams=1).")
             method_cfg = {**method_cfg, "membership_gate": {"enabled": False}}
-            cascade_model, tokenizer = _build_eval_model("baseline", args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
+            cascade_model, tokenizer = _build_eval_model("baseline", args.checkpoint, args.language, data_cfg, method_cfg, device)
             run_streaming.last_translation_checkpoint = args.checkpoint or resolve_pretrained(method_cfg, data_cfg, args.language)
         model = S1RunnerAdapter(model).to(device)
+        model.duration_model = DurationModel.from_config(inference_cfg, args.language)
+        model.duration_model.require_calibration(inference_cfg, args.language)
     else:
         method_cfg = load_yaml(_method_config_path(args), language=args.language)
         if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
         if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
         device = pick_device(args.device)
         inference_cfg = _streaming_geometry(args, inference_cfg, method_cfg)
-        model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
-
-    # Opt-in buffer-level semi-Markov duration decode (inference.yaml duration_decode: true, or per-language tuned
-    # {split_bias, snap_radius_s} from `analyze --stage tune-decode`).
-    duration_prior = None
-    dd, dd_block = streaming_decode_params(inference_cfg, args.language)
-    if dd is not None:
-        train_records, _ = load_language_records(data_cfg, args.language, split="train")
-        duration_prior = fit_duration_prior(train_records, **dd)
-        if duration_prior is not None: 
-            print(f"[streaming] buffer duration decode ON (prior from {len(train_records)} train videos" + 
-                  (f"; {dd_block}: {dd}" if dd else "") + ")", flush=True)
-        else: print(f"[streaming] duration_decode requested but <10 usable train captions — decoding plain argmax", flush=True)
-        if dd_block != STREAM_DECODE_KEY: print(f"[streaming] NOTE: no {STREAM_DECODE_KEY} row for this language — "
-                                                f"FSM deploys WHOLE-VIDEO triple; run analyze --stage tune-stream", flush=True)
+        model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
 
     if no_translate: print("[streaming] Segmentation only: translation confidence is not evaluated.", flush=True)
-    runner = _build_streaming_runner(
-        model, inference_cfg, method_cfg, duration_prior=duration_prior, translate=not no_translate, cascade_model=cascade_model
-    )
+    runner = _build_streaming_runner(model, inference_cfg, method_cfg, translate=not no_translate, cascade_model=cascade_model)
     print(f"[streaming] commit lag {runner.commit_lag_s:g} s", flush=True)
     if getattr(args, "stability", False): runner.trace = []
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
@@ -897,15 +830,17 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
 
         if runner.trace is not None: runner.trace.clear()
         events = runner.run(torch.as_tensor(poses, dtype=torch.float32), fps=float(record.pose.fps))
-        if runner.trace: stability_tracks.extend(group_tracks(runner.trace, delta_s=runner.gate_delta / max(1.0, float(record.pose.fps))))
+        if runner.trace: stability_tracks.extend(
+            group_tracks(runner.trace, delta_s=runner.commit_gate.history.delta_enc_frames / max(1.0, float(record.pose.fps)))
+        )
         predicted[record.video_id] = [PredictionEvent(
             video_id=record.video_id, start_s=float(ev.start_s), end_s=float(ev.end_s),
             text=None if no_translate else tokenizer.decode(ev.token_ids.tolist(), skip_special_tokens=True).strip(),
             flagged_partial=bool(ev.flagged_partial), commit_time_s=float(ev.commit_time_s),
         ) for ev in events]
 
-        # Moryossef-style BIO P/R/F1 on the runner's stitched DECODED tags (duration re-split + onset restoration, as the
-        # FSM read them; not raw argmax) vs GT captions: latest estimate per frame.
+        # BIO P/R/F1 on the runner's stitched legal tags (including committed frontier, 
+        # as FSM read them; not raw argmax) vs GT captions: latest estimate per frame.
         if runner._bio_timeline is not None:
             gold = make_bio_labels(timestamps, record.sentences, 0.0, float(record.pose.duration_s), video_duration_s=record.pose.duration_s)
             tags = runner._bio_timeline.clone()
@@ -965,10 +900,10 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
     if getattr(args, "gate", None): method_cfg.setdefault("membership_gate", {})["enabled"] = (args.gate == "on")
     inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
+    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
     device = pick_device(args.device)
-    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""), args.language)
-    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
 
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     records_by_id = {record.video_id: record for record in records}
     segments = load_prediction_file(args.segments)
@@ -982,11 +917,9 @@ def run_cascade(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     )
     if len(matched) < len(segments): print(
         f"[cascade] WARNING: {len(segments) - len(matched)}/{len(segments)} segment video_ids "
-        f"are absent from --split {args.split}; scoring only the {len(matched)} that match.", flush=True)
-
-    # Same single-sentence-unit rule as run_rq1: a cascade window IS the span to translate — the upstream segmenter already did the splitting,
-    # so re-splitting inside it would anchor Ω on a fragment of the very span being scored. Gate-off methods (baseline) never read the prior.
-    model.duration_prior = None
+        f"are absent from --split {args.split}; scoring only the {len(matched)} that match.", flush=True
+    )
+    # The supplied proposal fixes the crop and reported interval; a joint translator still predicts membership inside it.
     src_rows = load_prediction_rows(args.segments)   # an events file (online spans) carries commit time and the forced flag
     predicted: dict[str, list[PredictionEvent]] = {}
 
@@ -1013,8 +946,8 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     span under the FSM's DECODE CONDITIONING — the buffer-shaped window (δ-frame lead + trailing context to buffer_cap) 
     with Ω anchoring the span — never a tight span crop. No FSM, no commit/hysteresis, no cross-stride refinement.
 
-    Held against `--stream` at the SAME model to measure what streaming buys; it folds in the cost of causal (vs
-    offline-bidirectional) segmentation, so it is a conservative baseline, not a pure-refinement control.
+    Held against `--stream` at the SAME model to measure what streaming buys; it folds in the cost of causal 
+    (vs offline-bidirectional) segmentation, so it is a conservative baseline, not a pure-refinement control.
     """
     if args.method == "baseline": raise SystemExit(
         "Offline RQ2 uses the trained model's own BIO head (ar/dlm); the baseline has no "
@@ -1028,8 +961,8 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
     inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     device = pick_device(args.device)
 
-    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""), args.language)
-    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device, inference_cfg)
+    inference_cfg = _apply_stamped_geometry(inference_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
+    model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     buffer_cap_s = float(inference_cfg.get("buffer_cap_s", 18.0))
     # SEGMENTATION context comes from the cap the head TRAINED under (checkpoint meta), same rule _load_segmenter applies to S1: `tail-benefit 
@@ -1043,17 +976,6 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         f"{buffer_cap_s:.2f}s); translation windows keep the live cap.", flush=True
     )
     min_span_frames = lambda_min_frames(inference_cfg)
-    # Same deployed decode as every other inference.yaml consumer — else offline argmaxes while streaming duration-decodes and the
-    # rows compare decodes, not deployments. Whole-video input has ended, so nothing is right-censored (unlike FSM's "survival" buffers).
-    dd = duration_decode_params(inference_cfg, args.language)
-    duration_prior = None
-    if dd is not None:
-        train_records, _ = load_language_records(data_cfg, args.language, split="train")
-        duration_prior = fit_duration_prior(train_records, **dd)
-        if duration_prior is not None: 
-            print(f"[offline] whole-video duration decode ON (prior from {len(train_records)} train videos)", flush=True)
-        else: print("[offline] duration_decode requested but <10 usable train captions — decoding plain argmax", flush=True)
-
     predicted: dict[str, list[PredictionEvent]] = {}
     n_sub_lambda = 0
     for record in tqdm(records, desc="Offline (self-segment + translate)"):
@@ -1071,8 +993,10 @@ def run_offline(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             return model.bio_head(tap, timestamps_s=ts, frame_mask=mask).logits
         
         bio_logits = chunk_normalized_logits(_head_forward, raw, timestamps, chunk, device)
-        if duration_prior is not None: tags = duration_decode_tags(bio_logits, float(record.pose.fps), duration_prior).cpu()
-        else: tags = bio_logits.argmax(dim=-1)[0].cpu()
+        tags = DurationDecoder(model.duration_model).decode(
+            bio_logits, torch.tensor([bio_logits.shape[1]], device=bio_logits.device), 
+            timestamps_s=torch.as_tensor(timestamps, device=device)[None]
+        )[0].cpu()
         segments = bio_tags_to_segments(tags, timestamps.tolist())
 
         # Deployed span floor, offline too: Λ_min is POLICY (span_selection — a sub-floor span is unresolvable from boundary evidence and FSM 
@@ -1163,7 +1087,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         score_cfg = _streaming_geometry(args, score_cfg, method_cfg)
         provenance["min_span_frames"] = lambda_min_frames(score_cfg)
     elif not args.predictions:
-        score_cfg = _apply_stamped_geometry(score_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""), args.language)
+        score_cfg = _apply_stamped_geometry(score_cfg, args.checkpoint or checkpoint_dir(method_cfg, default=""))
         provenance["min_span_frames"] = lambda_min_frames(score_cfg)
     # A deliberate beam override changes the search budget and cannot enter a main row delta.
     if args.method == "baseline" and int(provenance["num_beams"]) != 1: print(
@@ -1183,10 +1107,11 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
         provenance["commit_conditions"] = ["boundary_stability"] if not provenance["translate"] \
                                                                  else ["boundary_stability", "translation_confidence"]
         provenance["stream_geometry"] = {
-            "buffer_cap_s": score_cfg.get("buffer_cap_s"), "stride_s": score_cfg.get("stride_s", 1.0),
+            "buffer_cap_s": score_cfg.get("buffer_cap_s"), 
+            "stride_s": score_cfg.get("stride_s", 1.0),
             "boundary_stability": score_cfg.get("boundary_stability", {}),
             "min_span_frames": lambda_min_frames(score_cfg),
-            "stream_decode": streaming_decode_params(score_cfg, args.language)[0],
+            "segmentation_decode": "semi_markov_viterbi",
             "commit_confidence_tau": score_cfg.get("translation", {}).get("commit_confidence_tau", 0.3),
             "forced_tail_policy": score_cfg.get("forced_tail_policy", "skip"),
         }
@@ -1257,14 +1182,13 @@ def _load_segmenter(args):
     if args.segmenter_arch == "s1":
         from train.bio_pretrain import build_bio_s1_model
         cfg = load_yaml(args.bio_config, language=args.language)
-        pretrained = resolve_pretrained(cfg, load_yaml(args.data_config), args.language, default="checkpoints/openasl_pose_only_slt.pth")
-        model = build_bio_s1_model(cfg, pretrained_path=pretrained)
+        model = build_bio_s1_model(cfg)
         # A pooled (multilingual) S1 is ONE language-agnostic checkpoint; per-language analysis on any --language
-        # reads the same pool directory (that IS the zero-shot protocol). checkpoint_dir does the substitution.
+        # reads the same pool directory. This is zero-shot only for a language excluded from all S1 training.
         ckpt_default = f"checkpoints/bio_s1/{args.language}"
         # Chunked RoPE at the head's TRAINED context, in SECONDS: training windows clamp to buffer_cap_s (sampler.py), so eval chunks there 
         # too (wrapper converts to frames per stream fps). Larger chunks would attend over untrained context.
-        buffer_cap_s = float(resolve_inference(load_yaml(args.inference_config), args.language, strict=False).get("buffer_cap_s", 30.06))
+        buffer_cap_s = float(resolve_inference(load_yaml(args.inference_config), args.language, strict=False).get("buffer_cap_s", 30.0))
         velocity, rope_chunk_s = False, float(cfg.get("rope_eval_chunk_s") or buffer_cap_s)
     else:
         from moryossef26.trainer import build_segmenter
@@ -1316,25 +1240,16 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     data_cfg = load_yaml(args.data_config)
     records, _ = load_language_records(data_cfg, args.language, split=args.split)
     model, device, velocity, rope_chunk_s, checkpoint = _load_segmenter(args)
-    
-    # Per-arch default, same rule as analyze.py segmenter-infer: moryossef stays on its published argmax decode unless
-    # --segmenter-decode duration is explicit — the config switch alone must not silently re-split the external baseline.
-    dd = duration_decode_params(load_yaml(args.inference_config), args.language, arch=args.segmenter_arch)
-    decode = args.segmenter_decode or ("duration" if (args.segmenter_arch == "s1" and dd is not None) else "plain")
-    duration_prior = None
-    if decode == "duration":
-        train_records, _ = load_language_records(data_cfg, args.language, split="train")
-        duration_prior = fit_duration_prior(train_records, **(dd or {}))
-        if duration_prior is None: print("[segmenter-eval] WARNING: too few train captions to fit duration prior; plain decode", flush=True)
-        elif dd is None: print(f"[segmenter-eval] NOTE: --segmenter-decode duration on a language with duration OFF/untuned in "
-                               f"inference.yaml; using module-default params", flush=True)
-    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={'duration' if duration_prior else 'plain'})", flush=True)
-    decode = "duration" if duration_prior else "plain"
+    decode = args.segmenter_decode or ("duration" if args.segmenter_arch == "s1" else "plain")
+    duration = DurationModel.from_config(
+        load_yaml(args.inference_config), args.language, args.segmenter_arch
+    ) if decode == "duration" else None
+    print(f"[segmenter-eval] {args.segmenter_arch} segmenter from {checkpoint} (decode={decode})", flush=True)
 
     thresholds = tuple(float(t) for t in (load_yaml(args.eval_config).get("rq2", {}) or {}).get("tiou_thresholds", [0.5]))
     metrics, segments_by_video = evaluate_segmenter_whole_video(
-        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, tiou_thresholds=thresholds,
-        duration_prior=duration_prior, return_segments=True,
+        model, records, device=device, velocity=velocity, rope_chunk_s=rope_chunk_s, 
+        tiou_thresholds=thresholds, return_segments=True, duration=duration
     )
     # 2 protocols over 1 decode, both reported so the delta between the standalone table and the RQ2 tables is a printed pair. `metrics` = the 
     # Moryossef-comparable protocol (per-video mean of F1s; gold = the UNK-masked BIO label stream). `rq2_protocol` = the SAME spans scored by 
@@ -1354,9 +1269,8 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
     )
     payload = {
         "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
-        "decode": decode, "tiou_thresholds": list(thresholds), "metrics": metrics, "rq2_protocol": rq2_protocol,
-        # Pinned pair is dev-SELECTED, so dev numbers with it are in-selection — quote held-out or test.
-        "decode_hparams": ((dd or "module-defaults") if decode == "duration" else None),
+        "frame_metrics_decode": "raw_argmax", "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax", "decode": decode, 
+        "duration_model": duration.to_dict() if duration else None, "tiou_thresholds": list(thresholds), "metrics": metrics, "rq2_protocol": rq2_protocol
     }
     output = Path(args.output or f"outputs/segmenter_eval_{args.segmenter_arch}_{args.language}_{args.split}.json")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1393,8 +1307,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate", default=None, choices=["on", "off"],
                         help="membership-gate override for THIS run (default: method config). RQ1 measures translation under controlled boundary "
                              "severity, so gate-on vs gate-off is the ablation separating translation quality from gate's conditioning effect")
-    parser.add_argument("--segmenter-decode", default=None, choices=["duration", "plain"],
-                        help="whole-video decode; default: s1 -> duration (semi-Markov re-split), moryossef -> plain (Moryossef argmax)")
+    parser.add_argument("--segmenter-decode", choices=["plain", "duration"], default=None,
+                        help="BIO decoder: default S1=duration, Moryossef=plain; duration uses dev-pinned shared scores")
     parser.add_argument("--segmenter-arch", default="moryossef", choices=["moryossef", "s1"],
                         help="segmenter-eval backend: moryossef = external Moryossef segmenter, s1 = in-system head")
     parser.add_argument("--moryossef-config", default="configs/moryossef26.yaml", help="Moryossef segmenter config")
@@ -1416,8 +1330,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tiou-thresholds", default=None, help="Comma-separated RQ2 tIoU thresholds")
     parser.add_argument("--no-densevid", action="store_true", help="RQ2: skip the densevid_eval headline columns (SODA rows only)")
     parser.add_argument("--match-geometry", default=None,
-                        help="Online S1 comparator: use this arm checkpoint's saved cap, delta, minimum span and streaming decode. "
-                             "Both rows share the live stride, lag and translation-confidence policy")
+                        help="Online S1 comparator: use this arm checkpoint's saved cap, delta and minimum span. The decoder uses the " \
+                             "shared duration-aware BIO model. Both rows share the live stride, lag and translation-confidence policy")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--allow-test", action="store_true")

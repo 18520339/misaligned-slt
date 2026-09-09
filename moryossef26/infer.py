@@ -12,10 +12,8 @@ from data.loader import VideoRecord
 from data.windowing import BIO, TRUSTED_GAP_S, make_bio_labels
 from poses import load_pose_window
 from models.bio_head import chunk_normalized_logits
+from infer.duration_decode import DurationDecoder
 from moryossef26.dataset import append_velocity
-# Semi-Markov duration decode is OURS, not the Moryossef protocol; enters only via `duration_prior`
-# (None = faithful argmax, the default for `--segmenter-arch moryossef`).
-from infer.duration_decode import DurationPrior, duration_decode_tags
 from metrics import Segment, bio_frame_metrics, moryossef_segment_metrics, signing_runs_with_b_splits
 
 
@@ -72,11 +70,8 @@ def whole_video_logits(model, record: VideoRecord, device: torch.device, velocit
 
 @torch.no_grad()
 def predict_phrase_segments(
-    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, 
-    rope_chunk_s: float | None = None, duration_prior: DurationPrior | None = None,
+    model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None, duration=None
 ) -> dict[str, list[Segment]]:
-    # Phrase segments per video for calibration and the RQ2 cascade. `duration_prior` from
-    # fit_duration_prior(train records); semi-Markov is the validated default for whole-video use.
     model.eval().to(device)
     predictions: dict[str, list[Segment]] = {}
 
@@ -85,14 +80,17 @@ def predict_phrase_segments(
         if logits is None:
             predictions[record.video_id] = []
             continue
-        if duration_prior is not None: tags = duration_decode_tags(logits, float(record.pose.fps), duration_prior)
+        if duration is not None: tags = DurationDecoder(duration).decode(
+            logits, torch.tensor([logits.shape[1]], device=logits.device), 
+            timestamps_s=torch.as_tensor(timestamps, device=logits.device)[None]
+        )[0]
         else: tags = logits.argmax(dim=-1)[0].detach().cpu()
         predictions[record.video_id] = bio_tags_to_segments(tags, timestamps.tolist())
     return predictions
 
 
 def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: tuple[float, ...]) -> dict[str, float]:
-    # One video's segment metrics, under the shared key convention.
+    # 1 video's segment metrics, under the shared key convention.
     seg_keys = ("phrase_tiou_f1", "phrase_seg_precision", "phrase_seg_recall")
     row: dict[str, float] = {}
     per_key: dict[str, list[float]] = {k: [] for k in seg_keys}
@@ -114,8 +112,8 @@ def _segment_rows(logits: torch.Tensor, labels: torch.Tensor, tiou_thresholds: t
 @torch.no_grad()
 def evaluate_segmenter_whole_video(
     model, records: list[VideoRecord], device: torch.device, velocity: bool = True, rope_chunk_s: float | None = None,
-    trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,),
-    duration_prior: DurationPrior | None = None, return_segments: bool = False,
+    trusted_gap_s: float | None = TRUSTED_GAP_S, tiou_thresholds: tuple[float, ...] = (0.5,), 
+    return_segments: bool = False, duration=None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, list[Segment]]]:
     """Moryossef evaluate.py-style STANDALONE eval: whole videos, GT phrase BIO from caption spans, frame-F1 and
     1-to-1 tIoU segment P/R/F1 averaged. Phrase only, no sign head; for `--segmenter-arch s1` it scores the
@@ -145,13 +143,14 @@ def evaluate_segmenter_whole_video(
             trusted_gap_s=trusted_gap_s, video_duration_s=record.pose.duration_s,
         )
         logits = logits.detach().cpu()
-        if duration_prior is not None:
-            # Score the ACTUAL decode: one-hot the re-split tags into the same metric path. Binary frame metrics
-            # are unchanged by construction (splits only relabel I<->B).
-            tags = duration_decode_tags(logits, float(record.pose.fps), duration_prior)
+        raw_logits = logits
+        if duration is not None:
+            tags = DurationDecoder(duration).decode(
+                logits, torch.tensor([logits.shape[1]]), timestamps_s=torch.as_tensor(timestamps)[None]
+            )[0]
             logits = torch.nn.functional.one_hot(tags.long(), num_classes=logits.shape[-1]).float().unsqueeze(0)
         if return_segments:
-            raw_tags = tags if duration_prior is not None else logits[0].argmax(dim=-1)
+            raw_tags = logits[0].argmax(dim=-1)
             segments_by_video[record.video_id] = bio_tags_to_segments(raw_tags, timestamps.tolist())
         labels = torch.as_tensor(np.asarray(gold)).long().unsqueeze(0)
         # Ignore-region: where gold is UNK (quarantined chains / untrusted gaps) a prediction is neither right nor
@@ -163,7 +162,7 @@ def evaluate_segmenter_whole_video(
             logits[0, unk_mask, BIO["UNK"]] = 10.0
         # prefix "bio" (trainer convention): bio_f1 is BINARY signing-vs-not F1; under "phrase" it would sit next
         # to phrase_frame_f1 (macro O/B/I, the §4.6 acceptance number) and read as the same thing.
-        row = dict(bio_frame_metrics(logits, labels, prefix="bio"))
+        row = dict(bio_frame_metrics(raw_logits, labels, prefix="bio"))
         # Moryossef 2023's IoU (binary signing-vs-not, per video then averaged) = PR/(P+R−PR), algebraically F1/(2−F1). 
         # Reported for the cross-paper (F1, IoU, %) triple; weak alone — on dense corpora 1 all-signing span scores 
         # high IoU while resolving no boundaries, so the 1-to-1 tIoU F1 stays the headline.

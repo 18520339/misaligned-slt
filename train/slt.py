@@ -11,13 +11,11 @@ from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, load_language_records, streaming_loader
 from models.unisign import UniSignMT5FrontEnd, UniSignMBartFrontEnd, prompt_lang_for_target
 from models.streaming_slt import MisalignedSLTModel, SLTLossOutput
+from infer.duration_decode import DurationModel, DurationDecoder
 
 from train import distributed as dist
-from train.losses import bio_class_weight_tensor, anchor_alpha, resolve_bio_class_weights
+from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import build_optimizer, mean_logs, move_to_device, resolve_lrs, run_epoch_loop
-
-from infer.duration_decode import (STREAM_DECODE_KEY, deployed_decode_tags, duration_decode_params, fit_duration_prior,
-                                   streaming_decode_params)
 from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
 from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
 
@@ -26,35 +24,7 @@ from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_n
 # `pretrain_languages`. `train.py --bio-config` overrides it, so stage 1 and 2 read SAME S1 recipe when a run uses a non-default one.
 BIO_S1_CONFIG = "configs/bio_pretrain.yaml"
 # The membership_gate keys stage 2 reads; delta / min_span_frames are injected from inference.yaml, never configured.
-GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "iou_veto", "gt_anchored", "warmup_epochs"})
-
-
-def refresh_bio_anchor(model, metrics: dict, margin: float = 0.01) -> bool:
-    """Replace the reference when the current head's dev F1 exceeds it by the configured margin.
-
-    This is adaptive model selection on dev, not a guarantee of improvement on unseen data.
-    The reference is fixed between updates and saved in the resumable training checkpoint.
-    """
-    reference = getattr(model, "bio_reference", None)
-    now, was = metrics.get("val_phrase_tiou_f1"), metrics.get("val_reference_phrase_tiou_f1")
-    if reference is None or now is None or was is None or float(now) <= float(was) + float(margin): return False
-    src = {**{f"pose_encoder.{k}": v for k, v in model.front_end.pose_encoder.state_dict().items()},
-           **{f"bio_head.{k}": v for k, v in model.bio_head.state_dict().items()}}
-    reference.load_state_dict({k: v.detach().clone() for k, v in src.items()}, strict=True)
-    reference.eval(); reference.requires_grad_(False)
-    print(f"[anchor] segmentation reference updated to current head: dev phrase tIoU-F1 {float(was):.3f} -> {float(now):.3f}", flush=True)
-    return True
-
-
-def resolve_anchor_mix(slt_cfg: dict) -> tuple[float, float]:
-    # Coefficient heuristic for the GT/KL mix; it does not equalize the actual gradients. An explicit alpha overrides the heuristic.
-    d = slt_cfg.get("bio_anchor", {}) or {}
-    T = float(d.get("temperature", 2.0))
-    if d.get("alpha") is not None: return float(d["alpha"]), T
-    if str(slt_cfg.get("bio_class_weights") or "").lower() == "balanced": 
-        raise ValueError("bio_anchor.gt_ratio needs the measured class weights: call "
-                         "resolve_bio_class_weights(cfg, train_records) first, or pin bio_anchor.alpha explicitly")
-    return anchor_alpha(float(d.get("gt_ratio", 1.0)), T, bio_class_weight_tensor(slt_cfg.get("bio_class_weights"))), T
+GATE_CONFIG_KEYS = frozenset({"enabled", "eps", "warmup_epochs"})
 
 
 @dataclass
@@ -78,32 +48,27 @@ def _inject_gate_geometry(slt_cfg: dict, inference_cfg: dict) -> None:
     gate["min_span_frames"] = lambda_min_frames(inference_cfg)
 
 
-def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str, kd: bool | None = None) -> dict:
+def _training_meta(slt_cfg: dict, inference_cfg: dict, language: str) -> dict:
     """The config this stage-2 run is parameterized by, travelling with the weights.
 
-    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by buffer-cap, the decode triple by tune-decode, and jitter 
-    by segmenter-error analysis. Resuming across such a change trains 2 halves under different objectives, and without this record 
-    nothing in the artifacts shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
+    δ/Λ_min are re-measured by `analyze --stage delta-enc`, buffer_cap_s by buffer-cap, and jitter by segmenter-error analysis. 
+    Resuming across such a change trains 2 halves under different objectives, and without this record nothing in the artifacts 
+    shows it (models/checkpointing.save_model_checkpoint makes the same argument for S1's chunk size).
     """
     gate_cfg = slt_cfg.get("membership_gate", {}) or {}
-    _a, _T = resolve_anchor_mix(slt_cfg)   # the mix that actually trains, not the raw config keys
     learning_rate, backbone_lr = resolve_lrs(slt_cfg)  # effective rates, whichever key spelling the config used
     return {
+        # A changed generated-dev protocol invalidates cached best scores, not the learned weights.
+        **({"validation_conditioning": "predicted_from_window"} if gate_cfg.get("enabled") else {}),
         "language": str(language), "decoder": str(slt_cfg.get("decoder", "dlm")),
-        # KD to the S1 init when one is configured and the head trains; CE + Dice otherwise (no S1 init, or lambda_bio 0).
-        "bio_objective": ("anchored" if 0.0 < _a < 1.0 else "ce_dice" if _a >= 1.0 else "anchor_only") 
-                            if (kd if kd is not None else bool((slt_cfg.get("checkpoint", {}) or {}).get("bio_head_init")) 
-                                and float(slt_cfg.get("lambda_bio", 1.0)) != 0.0) else "ce_dice",
-        "bio_anchor": {"alpha": round(_a, 6), "temperature": _T,
-                       "anchor_margin": float((slt_cfg.get("bio_anchor", {}) or {}).get("anchor_margin", 0.01))},
-        "gate": {
-            **{k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps")},
-            "iou_veto": float(gate_cfg.get("iou_veto", 0.5)),
-            # Effective value, as forward_loss reads it: an absent key and an explicit false are the same objective.
-            "gt_anchored": bool(gate_cfg.get("gt_anchored", False)),
-        },
-        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), "duration_decode": duration_decode_params(inference_cfg, language),
-        "stream_decode": streaming_decode_params(inference_cfg, language)[0],
+        "architecture": "shared_temporal_slt" if float(slt_cfg.get("lambda_bio", 1.0)) else "clean_translation",
+        "bio_objective": "ce_dice", "dice_loss_weight": float(slt_cfg.get("dice_loss_weight", 1.5)),
+        "gate": {**{k: gate_cfg.get(k) for k in ("enabled", "delta", "min_span_frames", "eps")}},
+        "buffer_cap_s": inference_cfg.get("buffer_cap_s"), 
+        "segmentation_decode": "semi_markov_viterbi" if slt_cfg.get("duration_model") else "none",
+        "duration_model": slt_cfg.get("duration_model"), "confidence_bound": slt_cfg.get("confidence_bound", {}), 
+        "oput": slt_cfg.get("oput", {}), "spd": slt_cfg.get("spd", {}), "dcd": slt_cfg.get("dcd", {}), 
+        "gate_warmup_epochs": int(gate_cfg.get("warmup_epochs", 0)),
         "mode_ratios": slt_cfg.get("mode_ratios"), "jitter": slt_cfg.get("jitter"),
         "bio_class_weights": slt_cfg.get("bio_class_weights"),  # resolved list, not the "balanced" string
         "lambda_bio": float(slt_cfg.get("lambda_bio", 1.0)), "lambda_trans": float(slt_cfg.get("lambda_trans", 1.0)),
@@ -148,6 +113,11 @@ def build_slt_components(
     if language != slt_cfg.get("language"): slt_cfg = load_yaml(slt_config, language=language)
     inference_cfg = resolve_inference(load_yaml(inference_config), language)
     _inject_gate_geometry(slt_cfg, inference_cfg)
+    
+    slt_cfg["decoder"] = decoder or str(slt_cfg.get("decoder", "dlm"))
+    duration = DurationModel.from_config(inference_cfg, language) if float(slt_cfg.get("lambda_bio", 1.)) else None
+    slt_cfg["duration_model"] = duration.to_dict() if duration else None
+    if duration: duration.require_calibration(inference_cfg, language)
 
     target_lang = data_cfg["languages"][language].get("target_lang", "en_XX")
     slt_cfg["target_lang"] = target_lang  # metric scoring level is declared, not sniffed (metrics.char_level_for_target)
@@ -203,7 +173,7 @@ def build_slt_components(
     # `pretrained_path` is loaded inside MisalignedSLTModel BEFORE the DLM [MASK]-token extension, so the
     # block-diffusion decoder inherits the released Uni-Sign pose + LM weights (pose always; mT5 also loads the LM).
     model = MisalignedSLTModel(
-        front_end=front_end, tokenizer=tokenizer,
+        front_end=front_end,
         decoder=decoder or str(slt_cfg.get("decoder", "dlm")),
         block_size=int(slt_cfg.get("block_size", 8)),
         # Shape MUST match S1 (train/bio_pretrain.py) or `bio_head_init` fails to strict-load — 
@@ -214,7 +184,9 @@ def build_slt_components(
         bio_dropout=float(slt_cfg.get("bio_dropout", 0.1)),
         bio_conv_stem_layers=int(slt_cfg.get("bio_conv_stem_layers", 2)),
         pretrained_path=resolve_pretrained(slt_cfg, data_cfg, language, default="checkpoints/openasl_pose_only_slt.pth"),
+        shared_temporal=float(slt_cfg.get("lambda_bio", 1.0)) != 0.,
     )
+    model.duration_model = duration
     # S1 BIO init (docs/membership_gate.md §1.4 "competence before coupling"): load the pre-trained head from
     # train-bio so S2 trains exactly one new thing — the coupling — and membership_gate.warmup_epochs can be 0.
     bio_init = slt_cfg.get("checkpoint", {}).get("bio_head_init")
@@ -282,19 +254,6 @@ def build_slt_components(
                     "features it trained on (S1 features == S2 initial features); the LM encoder starts on these adapted "
                     "features, not the ones it was fine-tuned on") if pose_sd else "S1 checkpoint carries no pose encoder"
         print(f"slt | loaded S1 BIO head init from {bio_init} ({len(head_sd)} tensors); {enc_note}", flush=True)
-        # Frozen S1 copy = the stage-2 segmentation target (models.streaming_slt.forward_loss -> train.losses.bio_anchor_loss).
-        # Non-registered attribute: absent from model.pt, the optimizer and model.train(); moved to the batch device on first use.
-        from train.bio_pretrain import BioS1Model
-        teacher = BioS1Model(   # same shape keys build_bio_s1_model reads; no released-checkpoint read, S1 state fills every tensor
-            pose_hidden_dim=int(bio_cfg.get("pose_hidden_dim", 256)), feat_dim=int(bio_cfg.get("feat_dim", 768)),
-            bio_hidden_dim=int(bio_cfg.get("bio_hidden_dim", 384)), bio_depth=int(bio_cfg.get("bio_depth", 4)),
-            bio_nhead=int(bio_cfg.get("bio_nhead", 8)), bio_dropout=float(bio_cfg.get("bio_dropout", 0.1)),
-            bio_conv_stem_layers=int(bio_cfg.get("bio_conv_stem_layers", 2)), freeze_encoder=True,
-        )
-        teacher.load_state_dict(sd, strict=True); teacher.eval(); teacher.requires_grad_(False)
-        object.__setattr__(model, "bio_reference", teacher)
-        print(f"slt | stage-2 BIO objective: KL to the frozen S1 posteriors "
-              f"({sum(q.numel() for q in teacher.parameters()) / 1e6:.2f}M teacher params, no grad)", flush=True)
     elif bio_init:
         # Fail loud, mirroring the mode_ratios.source guard: bio_head_init is cwd-relative, so a wrong-cwd launch
         # (Colab default dir) would otherwise silently train the gate against a random-init head.
@@ -312,23 +271,9 @@ def build_slt_components(
     print(f"slt | model: {total_params / 1e6:.2f}M parameters ({trainable_params / 1e6:.2f}M trainable, "
           f"{(total_params - trainable_params) / 1e6:.2f}M frozen)", flush=True)
           
-    # Gate-side duration decode (inference.yaml duration_decode — the switch the streaming FSM reads): build_gate_omega re-splits 
-    # merged back-to-back runs, so stage-2 trains on the tag stream deployment gates on (§1.3 on-policy symmetry). Prior fit on TRAIN 
-    # captions only. The deployed streaming decode (the FSM's triple) rides on the model for every arm that trains a head: the gate's 
-    # anchor decode reads it (on-policy symmetry, spec §1.3), gate on or off.
-    if float(slt_cfg.get("lambda_bio", 1.0)) != 0.0:
-        params, params_block = streaming_decode_params(inference_cfg, language)
-        if params is not None and params_block != STREAM_DECODE_KEY: 
-            print(f"slt | NOTE: no {STREAM_DECODE_KEY} row — the head decodes under whole-video triple; run tune-stream first", flush=True)
-        if params is not None:
-            model.duration_prior = fit_duration_prior(train_records, **params)
-            if model.duration_prior is not None:
-                p = model.duration_prior
-                print(f"slt | gate duration decode ON: lognormal({p.mu_log_s:.2f},{p.sd_log_s:.2f}) cap={p.cap_s:.0f}s split_bias="
-                      f"{p.split_bias:g} snap_radius_s={p.snap_radius_s:g} boundary_logit_weight={p.boundary_logit_weight:g}", flush=True)
     return SLTComponents(
         model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, slt_cfg=slt_cfg,
-        checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language, kd=getattr(model, "bio_reference", None) is not None),
+        checkpoint_meta=_training_meta(slt_cfg, inference_cfg, language),
     )
 
 
@@ -346,20 +291,15 @@ def evaluate_slt(
     oput_cfg = slt_cfg.get("oput", {})
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
-    _eval_alpha, _eval_T = resolve_anchor_mix(slt_cfg)
 
     # Score dev under SAME gate/CB state the epoch trained under: during warmup decoder has never seen Ω or the CB self-target, so either 
     # one on reports an untrained objective & burns a CB decode on untrustworthy targets. cb_active=None (standalone eval) = full objective.
     gate_on = bool(gate_cfg.get("enabled", False)) if gate_active is None else bool(gate_active)
     cb_on = True if cb_active is None else bool(cb_active)
     gate_kwargs = dict(
-        gate_enabled=gate_on, gate_delta=int(gate_cfg.get("delta", 3)), gate_eps=float(gate_cfg.get("eps", 1e-4)),
-        gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
+        gate_enabled=gate_on, gate_eps=float(gate_cfg.get("eps", 1e-4)), gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0))
     )
-    gate_loss_kwargs = dict(
-        gate_kwargs, gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)), gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
-        bio_anchor_alpha=_eval_alpha, bio_anchor_temperature=_eval_T,
-    )
+    gate_loss_kwargs = gate_kwargs
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     validation_cfg = slt_cfg.get("validation", {})
     max_translation_samples = int(validation_cfg.get("max_translation_samples", 0) or 0) # <= 0: translate ALL supervised dev windows.
@@ -397,22 +337,10 @@ def evaluate_slt(
             # was pure recompute. forward_loss already passes frame_mask, so padded frames never enter conv stem / RoPE as real frames.
             bio_logits = output.bio_logits
             row.update(bio_frame_metrics(bio_logits, batch["bio_labels"], prefix="bio"))
-            # Span metrics under the DEPLOYED decode, not the logits' argmax. The FSM folds every argmax B to I and re-places
-            # splits with the duration DP, and the head's B is a multi-frame smear, so an argmax-scored span metric counts
-            # splits that never deploy — it reads far below the deployed head and falls faster than it. `val_phrase_*` is the
-            # signal the reference update reads, so it has to measure the decode that runs.
+            # Score the visible window with calibrated duration scores; the gate separately excludes committed context.
             _lengths = batch["frame_mask"].long().sum(dim=1)
-            _tags = lambda z: deployed_decode_tags(
-                z, _lengths, getattr(model, "duration_prior", None), batch.get("timestamps_s"),
-                batch.get("commit_mask"), delta=int(gate_cfg.get("delta", 3)),
-            )
-            row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase", pred_tags=_tags(bio_logits)))
-            # Same metrics for the frozen reference head on the same windows and the same decode: val_phrase_* minus
-            # val_reference_phrase_* is the measured departure of the trained head from its reference.
-            if output.reference_logits is not None:
-                row.update(moryossef_segment_metrics(output.reference_logits, batch["bio_labels"], prefix="reference_phrase",
-                                                     pred_tags=_tags(output.reference_logits)))
-                row.update(bio_frame_metrics(output.reference_logits, batch["bio_labels"], prefix="reference_bio"))
+            tags = DurationDecoder(model.duration_model).decode(bio_logits, _lengths, timestamps_s=batch["timestamps_s"])
+            row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase", pred_tags=tags))
         rows.append(row)
 
         cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples
@@ -423,11 +351,9 @@ def evaluate_slt(
             if isinstance(supervised, torch.Tensor) and supervised.any():
                 idx = supervised.nonzero(as_tuple=False).flatten()
                 if max_translation_samples > 0: idx = idx[: max_translation_samples - len(pred_texts)]
-                if idx.numel() > 0:
-                    _commit_mask = batch.get("commit_mask")
+                if idx.numel() > 0: # A dev window has no observed commit history; sampler labels are supervision only.
                     _, tokens, _, _ = model.generate_from_poses(
                         poses=batch["poses"][idx], frame_mask=batch["frame_mask"][idx],
-                        commit_mask=_commit_mask[idx] if _commit_mask is not None else None,
                         timestamps_s=batch.get("timestamps_s", None)[idx] if batch.get("timestamps_s") is not None else None,
                         max_text_tokens=int(slt_cfg.get("max_text_tokens", 128)),
                         diffusion_steps=int(validation_cfg.get("diffusion_steps", slt_cfg.get("diffusion_steps", 64))),
@@ -475,7 +401,6 @@ def train_slt_epochs(
     spd_cfg = slt_cfg.get("spd", {})
     gate_cfg = slt_cfg.get("membership_gate", {})
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
-    _train_alpha, _train_T = resolve_anchor_mix(slt_cfg)
     decoder_name = getattr(model, "decoder_type", "dlm")
 
     # OPUT warmup holds the confidence-bound term off until full-evidence decode is trustworthy; gate warmup holds Ω off while a fresh 
@@ -523,22 +448,13 @@ def train_slt_epochs(
             cb_temperature=float(dcd_cfg.get("temperature", 0.0)),
             gate_enabled=_gate_active(epoch),
             # Same δ as the inference commit gate's delta_enc_frames (configs/inference.yaml).
-            gate_delta=int(gate_cfg.get("delta", 3)),
             gate_eps=float(gate_cfg.get("eps", 1e-4)),
             gate_min_span_frames=int(gate_cfg.get("min_span_frames", 0)),
-            gate_gt_anchored=bool(gate_cfg.get("gt_anchored", False)), 
-            gate_iou_veto=float(gate_cfg.get("iou_veto", 0.5)),
-            bio_anchor_alpha=_train_alpha, 
-            bio_anchor_temperature=_train_T,
         )
         return output.loss, {k: float(v.detach().cpu().item()) for k, v in output.logs.items() if v.numel() == 1}
 
-    anchor_margin = float((slt_cfg.get("bio_anchor", {}) or {}).get("anchor_margin", 0.01))
-
     def evaluate_fn(epoch: int): # Same gate/CB warmup state the epoch trained under (see evaluate_slt).
-        metrics = evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg, gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
-        if refresh_bio_anchor(model, metrics, margin=anchor_margin): metrics["anchor_refreshed"] = 1.0
-        return metrics
+        return evaluate_slt(model, dev_loader, device, slt_cfg=slt_cfg, gate_active=_gate_active(epoch), cb_active=epoch > cb_warmup_epochs)
 
     return run_epoch_loop(
         name=f"slt-{decoder_name}", model=model, loader=loader, optimizer=optimizer, device=device, epochs=epochs,

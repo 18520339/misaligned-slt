@@ -392,55 +392,49 @@ class WindowSampler:
         anchor_span = rec.sentences[spec.anchor_index] if spec.anchor_index is not None else None
         target, full_evidence_spec = None, None
 
-        # The mode names must describe what the window CONTAINS after jitter + buffer-cap clip, because supervision follows content: 
-        # inference's first-complete-span rule selects whatever complete span is present, regardless of which mode drew the window. 
-        # Relabelling keeps the logged per-mode losses / drift check honest AND closes 2 train/inference expectation gaps; 
-        # rejection-resampling instead would distort the measured jitter CDF.
-        eps = 1.0 / rec.pose.fps
-        n_complete = count_complete_spans(rec.sentences, spec.start_s, spec.end_s, eps, min_span_s=self.min_span_frames / rec.pose.fps)
-        if spec.mode == "mode1" and n_complete >= 2:
-            spec = replace(spec, mode="mode3")  # jitter captured a complete neighbour → ≥2 complete spans
-        elif spec.mode == "mode2" and n_complete >= 1:
-            # The jittered edge swallowed a COMPLETE sentence (e.g. 'left' whose tail jitter pulled the successor fully inside). FSM 
-            # would select & translate it — training must supervise it identically, not leave the window target-less as a nominal mode2.
-            spec = replace(spec, mode="mode3" if n_complete >= 2 else "mode1", subcase=None)
-        elif spec.mode in {"mode1", "mode3"} and n_complete == 0 and spec.anchor_index is not None:
-            # The buffer-cap clip (anchor longer than buffer_cap_s) cut the anchor's terminator: no complete span was realized, so this 
-            # IS a right-truncated window — mode2a semantics (BIO-only + the CB machinery), not a silently-unsupervised "mode1".
-            spec = replace(spec, mode="mode2", subcase="right")
-        elif spec.mode == "mode2" and spec.anchor_index is not None:
-            # Subcase honesty after clipping: e.g. a 'left' window whose kept tail exceeded buffer_cap_s lost the anchor's terminator too 
-            # → realized geometry is 'both'. Supervision is unchanged (2b/2c are both BIO-only).
-            realized = classify_anchor_visibility(rec.sentences[spec.anchor_index], spec.start_s, spec.end_s)
-            if realized in {"right", "left", "both"} and realized != spec.subcase: spec = replace(spec, subcase=realized)
-
-        if spec.mode in {"mode1", "mode3"}: target = first_complete_span(
-            rec.sentences, spec.start_s, spec.end_s, 1.0 / rec.pose.fps, min_span_s=self.min_span_frames / rec.pose.fps
-        )
-        elif spec.mode == "mode2" and spec.subcase == "right" and spec.anchor_index is not None:
-            target = None
-            # Attach the CB full-evidence view ONLY if the WHOLE anchor fits in a ≤buffer_cap_s window. An over-cap anchor (buffer-cap-clip 
-            # relabel above) can't be seen complete even by the "full-evidence" view, so its y_full self-target would itself be truncated — 
-            # keep it BIO-only rather than supervise CB against a truncated target.
-            anchor = rec.sentences[spec.anchor_index]
-            if anchor.end_s - anchor.start_s <= self.buffer_cap_s:
+        # Eligibility uses the actual sampled frame grid, also used by the gate's GT frame conversion.
+        relative_times = (timestamps - spec.start_s).astype(np.float32)
+        complete = []
+        for span in sorted(rec.sentences, key=lambda x: (x.start_s, x.end_s)):
+            if not span.reliable or span.start_s < spec.start_s: continue
+            begin, end = np.searchsorted(relative_times, np.asarray([span.start_s - spec.start_s, span.end_s - spec.start_s], dtype=np.float32))
+            if begin < end < len(relative_times): complete.append((span, int(end - begin)))
+        candidates = tuple(span for span, frames in complete if frames >= self.min_span_frames)
+        if candidates:
+            spec = replace(spec, mode="mode3" if len(candidates) >= 2 else "mode1", subcase=None)
+            target = candidates[0]
+        elif anchor_span is not None:
+            represented = any(span is anchor_span for span, _ in complete)
+            if represented: # A complete but too-short unit stays BIO-supervised; it is not a truncation target.
+                spec = replace(spec, mode="mode3" if len(complete) >= 2 else "mode1", subcase=None)
+            else:
+                has_start = anchor_span.start_s >= spec.start_s and anchor_span.start_s < spec.end_s
+                end_idx = int(np.searchsorted(relative_times, np.float32(anchor_span.end_s - spec.start_s)))
+                has_end = anchor_span.end_s > spec.start_s and end_idx < len(relative_times)
+                if has_start and not has_end: subcase = "right"
+                elif not has_start and has_end: subcase = "left"
+                else: subcase = "both"
+                spec = replace(spec, mode="mode2", subcase=subcase)
+        if spec.mode == "mode2" and spec.subcase == "right" and anchor_span is not None:
+            # A full view needs the anchor and a represented terminator, within the same capacity.
+            if anchor_span.duration_s + 1.0 / rec.pose.fps <= self.buffer_cap_s:
                 full_evidence_spec = self._full_evidence_spec(rec, spec.anchor_index)
 
-        # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. 
-        # In the streaming interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content 
-        # the FSM already emitted — the gate floors it unconditionally (no cross-seam duplication). The ANCHOR itself straddling 
-        # the edge (Mode 2b) is the MISSED-HEAD case, NOT a commit: the FSM's commit log would show nothing there (χ=0 at inference), 
-        # so training mirrors it with χ=0 and leaves those frames to the trust-scaled wall/ramp — which is what lets translation vote
-        # to relocate a start (§2.6). Inference-parity of χ is the invariant; the anchor test enforces it.
+        # χ from sampler bookkeeping (membership gate §2.7): frames of a PREDECESSOR sentence straddling the window's left edge. In the streaming 
+        # interpretation the window edge mimics the terminator−δ cut, so a predecessor's leftover tail is content FSM already emitted — the gate 
+        # floors it unconditionally (no cross-seam duplication). The ANCHOR itself straddling the edge (Mode 2b) is MISSED-HEAD case, NOT a commit: 
+        # FSM's commit log would show nothing there (χ=0 at inference), so training mirrors it with χ=0 and leaves those frames to the trust-scaled 
+        # wall/ramp — which is what lets translation vote to relocate a start. Inference-parity of χ is invariant; the anchor test enforces it.
         commit_mask = np.zeros((poses.shape[0],), dtype=bool)
         for span in rec.sentences:
             straddles = span.start_s < spec.start_s < span.end_s
             is_predecessor = anchor_span is None or span.start_s < anchor_span.start_s
-            if straddles and is_predecessor: commit_mask |= (timestamps >= span.start_s) & (timestamps < span.end_s)
+            # Commit state is a time frontier, including any earlier context loaded by frame rounding.
+            if straddles and is_predecessor: commit_mask |= timestamps < span.end_s
         return WindowSample(
             spec=spec, poses=poses, timestamps_s=timestamps - spec.start_s, bio_labels=labels, 
             frame_mask=frame_mask, spans=rec.sentences, translation_target=target, anchor_span=anchor_span, 
-            full_evidence_spec=full_evidence_spec, commit_mask=commit_mask,
+            full_evidence_spec=full_evidence_spec, commit_mask=commit_mask, candidate_sentences=candidates
         )
 
     @staticmethod
@@ -451,4 +445,8 @@ class WindowSampler:
             "translation_target": asdict(sample.translation_target) if sample.translation_target else None,
             "anchor_span": asdict(sample.anchor_span) if sample.anchor_span else None,
             "full_evidence_spec": asdict(sample.full_evidence_spec) if sample.full_evidence_spec else None,
+            "candidate_sentences": [
+                {"start_s": float(sp.start_s - sample.spec.start_s), "end_s": float(sp.end_s - sample.spec.start_s), "text": sp.text} 
+                for sp in sample.candidate_sentences
+            ]
         }
