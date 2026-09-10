@@ -124,9 +124,9 @@ def evaluate_segmenter_whole_video(
     else the segmenter is penalized for firing on possibly-uncaptioned signing.
     `tiou_thresholds`: eval.yaml rq2.tiou_thresholds → comparable to the RQ2 segmentation block.
 
-    Never compare to the monitor's `val_phrase_tiou_f1`: it macro-averages short sampler windows whose EDGES
-    truncate merged runs, while here one undersplit run spans dozens of captions and matches at most one. 
-    Protocol, not a train/infer bug (docs/implementation_notes.md, "Monitor vs whole-video").
+    The current window monitor pools complete-span counts at 1 threshold. Whole-video scoring uses different context, 
+    units and aggregation. Compare checkpoints under both protocols before attributing a gap to training; a protocol 
+    difference does not rule out a model or implementation failure.
     """
     model.eval().to(device)
     rows: list[dict[str, float]] = []

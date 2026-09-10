@@ -15,4 +15,4 @@ rq1:
     # Run 1 full two-axis product per arm. Pass negative-leading lists with `=`. Every severity row also reports clamped_fraction + 
     # realized delta_*_s_mean, so a corpus/grid mismatch is self-reporting (high clamp = the corpus lacked the requested context).
 rq2:
-    tiou_thresholds: [0.3, 0.5, 0.7, 0.9]
+    tiou_thresholds: [0.5, 0.7, 0.9]

@@ -383,8 +383,8 @@ def run_epoch_loop(
         saved_meta = dict(state.get("meta") or {})
         if saved_meta and checkpoint_meta:
             drift = sorted(k for k in set(saved_meta) | set(checkpoint_meta) if saved_meta.get(k) != checkpoint_meta.get(k))
-            if drift == ["validation_conditioning"]: raise SystemExit(
-                "--resume: generated-dev conditioning changed; the saved best score is not comparable. "
+            if drift and set(drift) <= {"validation_conditioning", "monitor_protocol"}: raise SystemExit(
+                "--resume: the validation protocol changed; the saved best score is not comparable. "
                 "The trained weights remain usable. Re-evaluate saved checkpoints with the corrected dev generation "
                 "and use a separate checkpoint directory for any continuation; do not reuse the old best-score history."
             )

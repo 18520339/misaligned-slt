@@ -16,7 +16,7 @@ from infer.duration_decode import DurationModel, DurationDecoder
 from train import distributed as dist
 from train.losses import bio_class_weight_tensor, resolve_bio_class_weights
 from train.helpers import build_optimizer, mean_logs, move_to_device, resolve_lrs, run_epoch_loop
-from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, moryossef_segment_metrics
+from metrics import char_level_for_target, bio_frame_metrics, compute_text_metrics, CompleteSpanMetrics
 from utils import checkpoint_dir, lambda_min_frames, load_yaml, language_model_name, pool_key, resolve_inference, resolve_pretrained
 
 
@@ -285,6 +285,7 @@ def evaluate_slt(
     was_training = model.training
     model.eval()
     rows: list[dict[str, float]] = []
+    spans = CompleteSpanMetrics()
 
     confidence_cfg = slt_cfg.get("confidence_bound", {})
     dcd_cfg = slt_cfg.get("dcd", {})
@@ -340,7 +341,7 @@ def evaluate_slt(
             # Score the visible window with calibrated duration scores; the gate separately excludes committed context.
             _lengths = batch["frame_mask"].long().sum(dim=1)
             tags = DurationDecoder(model.duration_model).decode(bio_logits, _lengths, timestamps_s=batch["timestamps_s"])
-            row.update(moryossef_segment_metrics(bio_logits, batch["bio_labels"], prefix="phrase", pred_tags=tags))
+            spans.update(tags, batch["bio_labels"], _lengths, min_span_frames=max(1, int(gate_cfg.get("min_span_frames", 1))))
         rows.append(row)
 
         cap_reached = max_translation_samples > 0 and len(pred_texts) >= max_translation_samples
@@ -379,6 +380,7 @@ def evaluate_slt(
 
     if was_training: model.train()
     metrics = mean_logs(rows, prefix="val")
+    if float(slt_cfg.get("lambda_bio", 1.)) != 0.: metrics.update(spans.compute(prefix="val_phrase"))
     if pred_texts:
         metrics.update(compute_text_metrics(
             pred_texts, ref_texts, prefix="val_translation", char_level=char_level_for_target(slt_cfg.get("target_lang"))
@@ -402,6 +404,8 @@ def train_slt_epochs(
     gate_cfg = slt_cfg.get("membership_gate", {})
     dice_weight = float(slt_cfg.get("dice_loss_weight", 1.5))
     decoder_name = getattr(model, "decoder_type", "dlm")
+    if float(slt_cfg.get("lambda_bio", 1.)) != 0. and dist.is_main():
+        print("slt | localization monitor: complete-span F1@0.5, pooled dev-window counts; RQ2 scores whole videos separately", flush=True)
 
     # OPUT warmup holds the confidence-bound term off until full-evidence decode is trustworthy; gate warmup holds Ω off while a fresh 
     # BIO head sharpens on Dice (0 when bio_head_init is present — prefer a real S1 pretrain). Per-epoch flags, feeding step AND eval.

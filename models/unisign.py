@@ -446,8 +446,8 @@ class UniSignMT5FrontEnd(UniSignFrontEndBase):
         if encoder.training or torch.is_grad_enabled() or query_rows >= length or encoder.model_parallel:
             return encoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask, return_dict=True)
 
-        print(f"[mt5 encoder] full-context attention in query blocks: batch={batch}, tokens={length}, query_rows={query_rows}; "
-              f"dense score tensor={batch * heads * length**2 * 4 / 2**30:.2f} GiB in fp32", flush=True)
+        # print(f"[mt5 encoder] full-context attention in query blocks: batch={batch}, tokens={length}, query_rows={query_rows}; "
+        #       f"dense score tensor={batch * heads * length**2 * 4 / 2**30:.2f} GiB in fp32", flush=True)
         hidden = encoder.dropout(inputs_embeds)
         key_mask = (1.0 - attention_mask[:, None, None, :].to(hidden.dtype)) * torch.finfo(hidden.dtype).min
         relative_bias = encoder.block[0].layer[0].SelfAttention

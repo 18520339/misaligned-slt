@@ -453,11 +453,10 @@ def _split_caption_sets(root: Path, video_ids, subtitle_cfg: dict, drop_noise: b
 def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, str, float]]:
     """Near-duplicate video pairs — the same talk re-uploaded under a different id.
 
-    A caption identifies content only if it is RARE (document frequency <= df_cap; above that it is series
-    boilerplate such as a scripted contact-info outro, which otherwise chains unrelated videos into one cluster)
-    and LONG enough (>= min_words; single-sign vocabulary clips share a word with everything). A pair is flagged
-    when its shared identifying captions cover more than `cover` of the smaller video's identifying set.
-    Videos below min_captions are skipped: the cover statistic is quantised to 1/n and is meaningless there.
+    A caption identifies content only if it is RARE (document frequency <= df_cap; above that it is series boilerplate such as a scripted 
+    contact-info outro, which otherwise chains unrelated videos into one cluster) and LONG enough (>= min_words; single-sign vocabulary 
+    clips share a word with everything). A pair is flagged when its shared identifying captions cover more than `cover` of the smaller 
+    video's identifying set. Near-match coverage needs min_captions. Exact caption-set copies can instead meet same evidence budget in words.
     """
     df_cap, min_words = int(cfg.get("df_cap", 20)), int(cfg.get("min_words", 4))
     min_caps, cover = int(cfg.get("min_captions", 10)), float(cfg.get("cover", 0.5))
@@ -471,8 +470,14 @@ def _duplicate_pairs(caps: dict[str, set[str]], cfg: dict) -> list[tuple[str, st
         if 2 <= len(vs) <= df_cap:
             for a, b in combinations(sorted(vs), 2): shared[(a, b)] += 1
 
-    pairs = [(a, b, n / min(len(ident[a]), len(ident[b]))) for (a, b), n in shared.items()]
-    return sorted([p for p in pairs if p[2] > cover], key=lambda p: -p[2])
+    scores = {(a, b): n / min(len(ident[a]), len(ident[b])) for (a, b), n in shared.items()}
+    exact: dict[frozenset[str], list[str]] = defaultdict(list)
+    for vid, cs in caps.items():
+        if sum(len(c.split()) for c in cs) >= min_caps * min_words: exact[frozenset(cs)].append(vid)
+    for vids in exact.values():
+        if 2 <= len(vids) <= df_cap:
+            for pair in combinations(sorted(vids), 2): scores[pair] = 1.0
+    return sorted([(a, b, score) for (a, b), score in scores.items() if score > cover], key=lambda p: -p[2])
 
 
 def assert_pool_safe(cfg: dict) -> None:

@@ -263,6 +263,17 @@ def controlled_windows(
     return windows
 
 
+def densevid_pairs(pred_events, gold_events, threshold: float) -> list[tuple[str, str | None]]:
+    """DVC pairs of 1 video at 1 threshold: every (prediction, gold) pair with tIoU >= threshold, and (prediction, None)
+    for a prediction that overlaps no gold (None = garbage reference, drawn by the scorer)."""
+    out = []
+    for ev in pred_events:
+        if ev.text is None: continue
+        over = [gt.text for gt in gold_events if temporal_iou(ev.segment, gt.segment) >= float(threshold) and gt.text is not None]
+        out.extend((ev.text, r) for r in over) if over else out.append((ev.text, None))
+    return out
+
+
 def evaluate_predicted_events(
     predicted: dict[str, list[PredictionEvent]], gold: dict[str, list[PredictionEvent]], 
     thresholds: list[float], char_level: bool = False, densevid: bool = False,
@@ -293,13 +304,8 @@ def evaluate_predicted_events(
             # and the BIO monitor. densevid's own proposal P/R is coverage-based (many-to-many), which lets duplicate spans all "match" 
             # 1 gold and keeps precision at 1.0; 1-to-1 charges the duplicate, so it is the defensible number for a segmentation claim.
             pred_segs, gold_segs = [ev.segment for ev in pred_events], [gt.segment for gt in gold_events]
-            if densevid and gold_events: # DVC pairs (metrics.densevid_text_metrics documents faithful protocol & its known recall-blindness) 
-                dv_pairs.setdefault(video_id, [])
-                for ev in pred_events:
-                    over = [gt.text for gt in gold_events if temporal_iou(ev.segment, gt.segment) >= float(threshold) and gt.text is not None]
-                    if ev.text is None: continue
-                    if over: dv_pairs[video_id].extend((ev.text, r) for r in over)
-                    else: dv_pairs[video_id].append((ev.text, None))
+            if densevid and gold_events: # DVC pairs (metrics.densevid_text_metrics documents the protocol and its recall-blindness)
+                dv_pairs[video_id] = densevid_pairs(pred_events, gold_events, threshold)
 
             prf = segmentation_prf(pred_segs, gold_segs, tiou_threshold=float(threshold))
             if pred_events: vid_prec.append(prf["precision"])
@@ -785,8 +791,10 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         raise SystemExit("Online segmenter cascades use --method baseline; use --no-translate for segmentation only.")
     if segmenter_arch is not None and getattr(args, "gate", None) == "on":
         raise ValueError("Online cascades use the ungated clean translator.")
-    if getattr(args, "segmenter_decode", None) == "plain":
-        raise ValueError("The streaming FSM uses duration-aware BIO; --segmenter-decode plain is an offline decoder control.")
+    plain = getattr(args, "segmenter_decode", None) == "plain"
+    if plain and segmenter_arch is None:
+        raise ValueError("--segmenter-decode plain is a segmenter control: the joint arm's head trained under its duration "
+                         "model and its gate reads the same scores, so an arm row cannot drop them. Use it with --segmenter-arch.")
     data_cfg = load_yaml(args.data_config)
     inference_cfg = resolve_inference(load_yaml(args.inference_config), args.language)
     cascade_model = None
@@ -809,8 +817,9 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
             cascade_model, tokenizer = _build_eval_model("baseline", args.checkpoint, args.language, data_cfg, method_cfg, device)
             run_streaming.last_translation_checkpoint = args.checkpoint or resolve_pretrained(method_cfg, data_cfg, args.language)
         model = (S1RunnerAdapter(model) if segmenter_arch == "s1" else MoryossefRunnerAdapter(model, velocity)).eval().to(device)
-        model.duration_model = DurationModel.from_config(inference_cfg, args.language, segmenter_arch)
-        if segmenter_arch == "s1": model.duration_model.require_calibration(inference_cfg, args.language)
+        model.duration_model = None if plain else DurationModel.from_config(inference_cfg, args.language, segmenter_arch)
+        if model.duration_model is not None and segmenter_arch == "s1": model.duration_model.require_calibration(inference_cfg, args.language)
+        if plain: print("[streaming] plain decode: legal BIO paths only, no duration scores (a decoder control).", flush=True)
     else:
         method_cfg = load_yaml(_method_config_path(args), language=args.language)
         if getattr(args, "num_beams", None): method_cfg.setdefault("validation", {})["num_beams"] = int(args.num_beams)
@@ -820,6 +829,7 @@ def run_streaming(args: argparse.Namespace) -> dict[str, list[PredictionEvent]]:
         model, tokenizer = _build_eval_model(args.method, args.checkpoint, args.language, data_cfg, method_cfg, device)
 
     run_streaming.last_duration_model = model.duration_model.to_dict() if model.duration_model is not None else None
+    run_streaming.last_segmentation_decode = "semi_markov_viterbi" if model.duration_model is not None else "legal_viterbi"
     run_streaming.last_velocity = bool(velocity) if segmenter_arch == "moryossef" else False
     if no_translate: print("[streaming] Segmentation only: translation confidence is not evaluated.", flush=True)
     runner = _build_streaming_runner(model, inference_cfg, method_cfg, translate=not no_translate, cascade_model=cascade_model)
@@ -1113,10 +1123,11 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
     if args.stream:
         predicted = run_streaming(args)
         tag = online_arch or args.method
-        suffix = "_segonly" if getattr(args, "no_translate", False) else ""
+        suffix = ("_segonly" if getattr(args, "no_translate", False) else "") + ("_plain" if getattr(args, "segmenter_decode", None) == "plain" else "")
         provenance["translate"] = not bool(getattr(args, "no_translate", False))
         provenance["pose_normalization"] = "buffer"
         provenance["duration_model"] = run_streaming.last_duration_model
+        provenance["segmentation_decode"] = run_streaming.last_segmentation_decode
         provenance["velocity"] = run_streaming.last_velocity
         # The FSM's commit geometry as run: the lag is a live commit policy (not stamped in any checkpoint) and delta is the
         # stamped or live tolerance, so a later re-selection cannot change what this file was made under.
@@ -1129,7 +1140,7 @@ def run_rq2(args: argparse.Namespace) -> "pd.DataFrame":
             "stride_s": score_cfg.get("stride_s", 1.0),
             "boundary_stability": score_cfg.get("boundary_stability", {}),
             "min_span_frames": lambda_min_frames(score_cfg),
-            "segmentation_decode": "semi_markov_viterbi",
+            "segmentation_decode": run_streaming.last_segmentation_decode,
             "commit_confidence_tau": score_cfg.get("translation", {}).get("commit_confidence_tau", 0.3),
             "forced_tail_policy": score_cfg.get("forced_tail_policy", "skip"),
         }
@@ -1288,6 +1299,9 @@ def run_segmenter_eval(args: argparse.Namespace) -> dict[str, Any]:
         f"[segmenter-eval] tIoU {t:g}: moryossef-protocol F1 {metrics.get(f'phrase_tiou_f1@{t:g}', float('nan')):.3f} | "
         f"rq2-protocol F1 {rq2_protocol[f'{t:g}']['f1']:.3f} (quote the rq2-protocol number across tables)", flush=True
     )
+    # Average each reported statistic across thresholds; mean F1 is not F1 recomputed from mean P/R.
+    rq2_protocol["avg"] = {k: float(np.mean([r["segmentation"][k] for r in rq2_rows])) for k in ("precision", "recall", "f1")}
+    print("[segmenter-eval] rq2-protocol avg: " + " ".join(f"{k}={v:.4f}" for k, v in rq2_protocol["avg"].items()), flush=True)
     payload = {
         "language": args.language, "split": args.split, "videos": len(records), "segmenter_arch": args.segmenter_arch, "checkpoint": checkpoint,
         "frame_metrics_decode": "raw_argmax", "segmentation_decode": "semi_markov_viterbi" if duration else "bio_argmax", "decode": decode, 
@@ -1329,7 +1343,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="membership-gate override for THIS run (default: method config). RQ1 measures translation under controlled boundary "
                              "severity, so gate-on vs gate-off is the ablation separating translation quality from gate's conditioning effect")
     parser.add_argument("--segmenter-decode", choices=["plain", "duration"], default=None,
-                        help="Offline BIO decoder: default S1=duration, Moryossef=plain. Streaming uses duration for every head")
+                        help="BIO decoder: default S1=duration, Moryossef=plain. With --stream it selects the online cascade's "
+                             "decoder (plain = legal paths only, no duration scores); a joint arm always uses its trained duration model")
     parser.add_argument("--segmenter-arch", default=None, choices=["moryossef", "s1"],
                         help="Standalone segmenter (default moryossef). With --stream, select an online cascade using --method baseline; "
                              "omit for a joint AR/DLM head")

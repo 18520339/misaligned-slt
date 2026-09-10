@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from data.windowing import BIO
 from sacrebleu import sentence_bleu
+from sacrebleu.metrics import BLEU
 import numpy as np
 import random
 import torch
@@ -154,16 +155,40 @@ def segmentation_prf(predicted: list[Segment], gold: list[Segment], tiou_thresho
     return {"precision": precision, "recall": recall, "f1": f1, "matches": float(tp)}
 
 
+@dataclass
+class CompleteSpanMetrics:
+    # Pool complete-span counts across windows; fragments and empty true negatives earn no F1 credit.
+    n_matches: int = 0
+    n_pred: int = 0
+    n_gold: int = 0
+
+    def update(self, pred_tags, labels, lengths, min_span_frames=1, tiou_threshold=.5):
+        from infer.commit_gate import bio_complete_spans
+        for pred, gold, n in zip(pred_tags.detach().cpu(), labels.detach().cpu(), lengths.detach().cpu().tolist()):
+            pred, gold = pred[:n], gold[:n]
+            ignored = gold == BIO['UNK']
+            # Parse predictions before using ignore labels: a GT ignore boundary must not create a predicted terminator.
+            ps = [Segment(a, b) for a, b in bio_complete_spans(pred) if b-a >= min_span_frames and int(ignored[a:b].sum()) <= (b-a)/2]
+            gs = [Segment(a, b) for a, b in bio_complete_spans(gold)]
+            self.n_matches += len(match_segments(ps, gs, threshold=tiou_threshold))
+            self.n_pred += len(ps); self.n_gold += len(gs)
+
+    def compute(self, prefix='phrase'):
+        p = self.n_matches / self.n_pred if self.n_pred else 0.
+        r = self.n_matches / self.n_gold if self.n_gold else 0.
+        return {f'{prefix}_tiou_f1': 2*p*r/(p+r) if p+r else 0., f'{prefix}_seg_precision': p, f'{prefix}_seg_recall': r, 
+                f'{prefix}_n_matches': self.n_matches, f'{prefix}_n_pred': self.n_pred, f'{prefix}_n_gold': self.n_gold}
+
+
 def moryossef_segment_metrics(
     logits: torch.Tensor, labels: torch.Tensor, prefix: str = "phrase", decode: str = "runs_bsplit", 
     tiou_threshold: float = 0.5, pred_tags: torch.Tensor | None = None
 ) -> dict[str, float]:
-    """Per-item BIO-head training monitor: one per-FRAME score, one segment score.
+    """External-protocol run overlap: 1 frame score and 1 segment score per item.
 
     `{prefix}_frame_f1`: macro F1 over O/B/I frame classes.
     `{prefix}_tiou_f1`/`_seg_precision`/`_seg_recall`: `segmentation_prf` (the RQ2 metric) on frame-unit segments.
-    Collapse-proof for early stopping — an all-`I`/all-`O` collapse can't game one-to-one matching (the looser
-    overlap `seg_f1` / frame-IoU `seg_iou` flavors could; removed).
+    Clipped fragments can score well on short windows. Training monitors use CompleteSpanMetrics instead.
     `decode` applies to BOTH sides (`runs_bsplit` = inference, default; `bio` = B-required; `likeliest` = raw run).
 
     `pred_tags` (B, T) optionally supplies the decoded path instead of logits' argmax.
@@ -310,6 +335,31 @@ def _bleurt_scores(hyps: list[str], refs: list[str], checkpoint: str | None) -> 
     except Exception: return [0.0] * len(hyps)
 
 
+def bleu_pair_counts(hyps: list[str], refs: list[str], char_level: bool | None = None) -> list[dict]:
+    """Per-pair BLEU-4 ingredients under the shared preprocessing and tokenizer: hypothesis length, reference length,
+    matched and total n-grams for n = 1..4. Corpus BLEU-4 of ANY set of pairs is `bleu_from_counts` of their rows,
+    so a report can show exactly which counts a video or a corpus adds up."""
+    scorer = BLEU(tokenize="13a")
+    h, r, _ = _uni_sign_preprocess(list(hyps), list(refs), char_level)
+    rows = []
+    for hh, rr in zip(h, r):
+        st = scorer.corpus_score([hh], [[rr]])
+        rows.append({
+            "sys_len": int(st.sys_len), "ref_len": int(st.ref_len), 
+            "counts": [int(c) for c in st.counts], "totals": [int(t) for t in st.totals]
+        })
+    return rows
+
+
+def bleu_from_counts(rows: list[dict]) -> float:
+    # Corpus BLEU-4 from summed `bleu_pair_counts` rows (the scorer's own formula and smoothing).
+    if not rows: return 0.0
+    return float(BLEU.compute_bleu(
+        correct=[sum(r["counts"][n] for r in rows) for n in range(4)], total=[sum(r["totals"][n] for r in rows) for n in range(4)],
+        sys_len=sum(r["sys_len"] for r in rows), ref_len=sum(r["ref_len"] for r in rows), smooth_method="exp",
+    ).score)
+
+
 def sentence_bleu_scores(hyps: list[str], refs: list[str], char_level: bool | None = None) -> list[float]:
     """Smoothed sentence BLEU per pair under the shared preprocessing — the BLEU column of `_sentence_text_scores` alone.
     The per-gold deployment score (report.py / analyze.py localized_bleu4) needs only this column."""
@@ -344,10 +394,15 @@ def _sentence_text_scores(
     return [dict(zip(_TEXT_KEYS, vals)) for vals in zip(bleu, bleurt, rouge, met)]
 
 
+def garbage_reference(rng: random.Random) -> str:
+    # densevid_eval's reference for a prediction that overlaps no gold: a random lowercase string of 10..20 letters.
+    return "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(10, 20)))
+
+
 def densevid_text_metrics(
-    pairs_by_video: dict[str, list[tuple[str, str | None]]], *, char_level: bool | None = None,
-    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "densevid",
-) -> dict[str, float]:
+    pairs_by_video: dict[str, list[tuple[str, str | None]]], *, char_level: bool | None = None, sacrebleu_tokenize: str = "13a",
+    bleurt_checkpoint: str | None = "/tmp/BLEURT-20", prefix: str = "densevid", per_video: bool = False
+) -> dict[str, float] | dict[str, dict[str, float]]:
     """DVC-style matching and aggregation (ranjaykrishna/densevid_eval), with the repository's text scorers.
 
     Faithful components, per tIoU threshold (the caller builds `pairs_by_video` for one threshold):
@@ -368,18 +423,17 @@ def densevid_text_metrics(
     It is the headline (continuity with the previous paper); the SODA fusion is reported beside it because it charges misses.
     """
     rng = random.Random(_DENSEVID_GARBAGE_SEED)
-    _garbage = lambda: "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(10, 20)))
-    per_video: list[dict[str, float]] = []
+    out: dict[str, dict[str, float]] = {}
     for vid in sorted(pairs_by_video):
         pairs = pairs_by_video[vid]
         if not pairs:  # gold video with no predictions: original assigns 0 across scorers
-            per_video.append({k: 0.0 for k in _DVC_KEYS})
+            out[vid] = {k: 0.0 for k in _DVC_KEYS}
             continue
         hyps = [h for h, _ in pairs]
-        refs = [r if r is not None else _garbage() for _, r in pairs]
+        refs = [r if r is not None else garbage_reference(rng) for _, r in pairs]
         hyp_p, ref_p, _ = _uni_sign_preprocess(hyps, refs, char_level)
         row = {
-            "bleu4": _corpus_metric("sacrebleu", hyp_p, [[r] for r in ref_p], key="score"),
+            "bleu4": _corpus_metric("sacrebleu", hyp_p, [[r] for r in ref_p], key="score", tokenize=sacrebleu_tokenize),
             "rougeL": float(np.mean([_rouge_l([h], [r]) for h, r in zip(hyp_p, ref_p)])),
             "bleurt": float(np.mean(_bleurt_scores(hyps, refs, bleurt_checkpoint))),
             "cider": _cider_corpus(hyp_p, ref_p),
@@ -388,9 +442,10 @@ def densevid_text_metrics(
         row["meteor"] = float(np.mean([
             meteor.compute(predictions=[h], references=[r])["meteor"] for h, r in zip(hyp_p, ref_p)
         ])) if meteor is not None else 0.0
-        per_video.append(row)
-    if not per_video: return {f"{prefix}_{k}": 0.0 for k in _DVC_KEYS}
-    return {f"{prefix}_{k}": float(np.mean([r[k] for r in per_video])) for k in _DVC_KEYS}
+        out[vid] = row
+    if per_video: return out  # 1 row per gold video, the rows the mean below is taken over
+    if not out: return {f"{prefix}_{k}": 0.0 for k in _DVC_KEYS}
+    return {f"{prefix}_{k}": float(np.mean([r[k] for r in out.values()])) for k in _DVC_KEYS}
 
 
 def compute_text_metrics(

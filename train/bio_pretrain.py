@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data.windowing import BIO
 from data.batch import WindowCollator
 from data.loader import StreamingWindowDataset, assert_pool_safe, resolve_pretrain_records, sentence_p99_s, streaming_loader
 from backbones import UniSignPoseEncoder
@@ -30,7 +29,7 @@ from models.checkpointing import _load_state
 from train import distributed as dist
 from train.helpers import build_optimizer, eval_mode, mean_logs, run_epoch_loop
 from train.losses import bio_class_weight_tensor, bio_nll_dice_loss, resolve_bio_class_weights
-from metrics import bio_frame_metrics, moryossef_segment_metrics
+from metrics import bio_frame_metrics, CompleteSpanMetrics
 from utils import checkpoint_dir, load_yaml, pool_key, pretrained_checkpoint, resolve_inference
 
 PRETRAIN_CONTEXT_MARGIN_S = 1.0  # a deployed cap adds delta/fps to p99 + stride; one second covers any delta up to fps frames
@@ -183,46 +182,27 @@ def build_bio_s1(
 def evaluate_bio_s1( # Evaluate frame losses and the untuned legal-path monitor before duration calibration.
     model: BioS1Model, loader: DataLoader, device: torch.device, dice_weight: float, class_weights: torch.Tensor | None, 
 ) -> dict[str, float]:
-    rows = []
+    rows, per_mode = [], {}
+    spans = CompleteSpanMetrics()
     with eval_mode(model):
         for batch in loader:
-            poses = batch["poses"].to(device)
-            mask = batch["frame_mask"].to(device)
-            ts = batch["timestamps_s"].to(device)
-            labels = batch["bio_labels"].to(device)
+            poses, mask = batch["poses"].to(device), batch["frame_mask"].to(device)
+            ts, labels = batch["timestamps_s"].to(device), batch["bio_labels"].to(device)
             out = model(poses, mask, timestamps_s=ts)
-            # S1 checkpoint selection uses an untuned legal-path monitor; deployment is calibrated afterwards.
-            # Raw frame diagnostics remain independent of the selected duration decoder.
-            tags = DurationDecoder().decode(out.logits, mask.long().sum(1))
-            seg_logits = torch.nn.functional.one_hot(tags.clamp(min=0), num_classes=out.logits.shape[-1]).to(out.logits.dtype)
+            lengths = mask.long().sum(1)
+            tags = DurationDecoder().decode(out.logits, lengths)
             row = {"bio_loss": float(bio_nll_dice_loss(out.logits, labels, dice_weight=dice_weight, class_weights=class_weights))}
             row.update(bio_frame_metrics(out.logits, labels, prefix="bio"))
-            row.update(moryossef_segment_metrics(seg_logits, labels, prefix="phrase"))
-            # Collapse floor: same segment metric on a CONSTANT all-I prediction. Under the symmetric run-decode any
-            # single-span window is near-free, so a monitor within noise of this floor measures the window mix, not
-            # the head. Logged every epoch so saturation is visible mid-run.
-            alli = torch.zeros_like(seg_logits); alli[..., BIO["I"]] = 1.0
-            row["alli_tiou_f1"] = moryossef_segment_metrics(alli, labels, prefix="alli")["alli_tiou_f1"]
-            # Per-mode tIoU: a SEGMENTATION metric (predicted vs GT BIO spans), valid for EVERY mode since the head
-            # is supervised on all modes' bio_labels — independent of translation supervision, which only some modes
-            # carry (OPUT on 1/3, CB on 2a, none on 2b/2c/4). Only the INTERPRETATION differs:
-            #   mode1/3 = span boundary quality; mode2 = truncated-fragment localization;
-            #   mode4 (gaps) = PHANTOM-AVOIDANCE — gold has 0 spans (all-O; long all-UNK gaps skipped), so tiou_f1
-            #                  is 1.0 iff the head stays silent, 0.0 if it fires. Scores ABSENCE, not overlap.
-            # The headline average needs this split: a low val_phrase_tiou_f1 driven by mode2 fragments is metric
-            # granularity on misaligned windows, not head incompetence.
-            modes = batch.get("mode_names") or []
-            for mode in set(modes):
-                idx = [i for i, m in enumerate(modes) if m == mode]
-                sub = moryossef_segment_metrics(seg_logits[idx], labels[idx], prefix=mode)
-                row[f"{mode}_tiou_f1"] = sub[f"{mode}_tiou_f1"]
-                # Per-mode floor. The POOLED alli above cannot interpret a per-mode number: the floors differ by a factor of ~4 
-                # across modes because they are set by gold-span COUNT, not by difficulty (an all-I tagger emits ONE span, so 
-                # F1 = 2/(N+1) when that span covers >half the window). The head can sit BELOW a constant on the majority slices 
-                # while looking healthy pooled. Every slice must carry its own floor or none of these numbers is interpretable.
-                row[f"{mode}_alli_tiou_f1"] = moryossef_segment_metrics(alli[idx], labels[idx], prefix=mode)[f"{mode}_tiou_f1"]
             rows.append(row)
-    return mean_logs(rows, prefix="val")
+            spans.update(tags, labels, lengths)
+            modes = batch.get("mode_names") or []
+            for mode in set(modes) - {"mode4"}:
+                idx = [i for i, m in enumerate(modes) if m == mode]
+                per_mode.setdefault(mode, CompleteSpanMetrics()).update(tags[idx], labels[idx], lengths[idx])
+    result = mean_logs(rows, prefix="val")
+    result.update(spans.compute(prefix="val_phrase"))
+    for mode, score in per_mode.items(): result[f"val_{mode}_tiou_f1"] = score.compute()["phrase_tiou_f1"]
+    return result
 
 
 def train_bio_s1_epochs(
@@ -233,7 +213,8 @@ def train_bio_s1_epochs(
     class_weights = bio_class_weight_tensor(cfg.get("bio_class_weights"))
     if class_weights is not None: class_weights = class_weights.to(device)
     # Frozen encoder → head only. Unfrozen → head at learning_rate, the pretrained encoder at backbone_lr.
-    print("bio_s1 | monitor: BIO Viterbi without duration scores; deployment: calibrated semi-Markov Viterbi", flush=True)
+    print("bio_s1 | monitor: complete-span F1@0.5, pooled window counts, BIO Viterbi without duration scores; " \
+          "deployment: calibrated semi-Markov Viterbi", flush=True)
     if model.freeze_encoder: optimizer = build_optimizer(cfg, model.bio_head.parameters())
     else: optimizer = build_optimizer(cfg, model.bio_head.parameters(), backbone_params=model.pose_encoder.parameters())
 
@@ -244,7 +225,8 @@ def train_bio_s1_epochs(
 
     # Save the trained context and monitor decode with the S1 weights.
     training_cap_s = float(cfg["training_buffer_cap_s"])
-    meta = {"monitor_decode": "bio_viterbi", "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s,
+    meta = {"monitor_decode": "bio_viterbi", "monitor_protocol": "complete_spans_micro_at_0.5", 
+            "rope_eval_chunk_s": training_cap_s, "buffer_cap_s": training_cap_s,
             "initialization": pretrained_checkpoint(cfg, default="checkpoints/openasl_pose_only_slt.pth"),
             "bio_class_weights": cfg.get("bio_class_weights"), "language": cfg.get("language"),
             "pretrain_pool": pool_key(cfg), "pretrain_mix": cfg.get("pretrain_mix"), "pretrain_dev_mix": cfg.get("pretrain_dev_mix")}
